@@ -17,7 +17,7 @@ export SMOKE_SUPPORT_GROUP_SIZE=16
 export SMOKE_QUERY_GROUP_SIZE=16
 export SMOKE_INNER_ITERATIONS=2
 export SMOKE_OUTER_ITERATIONS=2
-export SMOKE_GENERATION_MICRO_BATCH_SIZE=4
+export SMOKE_GENERATION_MICRO_BATCH_SIZE=16
 export SMOKE_POLICY_MICRO_BATCH_SIZE=1
 export SMOKE_CONFIDENCE_MICRO_BATCH_SIZE=1
 export SMOKE_LOG_ROLLOUTS=1
@@ -66,7 +66,7 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: max_new_tokens=3072 K=16 inner=2 outer=2 generation_microbatch=4 gpus=${SMOKE_GPUS}"
+echo "configuration: max_new_tokens=3072 K=16 inner=2 outer=2 generation_microbatch=16 gpus=${SMOKE_GPUS}"
 echo "stdout: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
 echo "queue: squeue -j ${job_id}"

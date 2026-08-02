@@ -244,8 +244,8 @@ bash scripts/submit_rollout_test.sh
 
 This generates support K=16, performs two confidence-guided inner updates and
 generates query K=16, then exits before outer backward, checkpointing and
-validation. Each rank generates four responses concurrently, so four H100s
-decode 16 sequences at once globally. Autoregressive generation explicitly
+validation. Each rank generates all 16 responses concurrently, so four H100s
+decode 64 sequences at once globally. Autoregressive generation explicitly
 uses the KV cache; replicated policy ranks decode independently, while the
 confidence model remains FSDP-sharded. Full responses and strict-box verifier
 predictions are written to per-rank JSONL files under
