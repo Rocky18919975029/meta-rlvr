@@ -65,6 +65,9 @@ nvidia-smi
 python - <<'PY'
 import platform
 import sys
+from importlib.metadata import PackageNotFoundError, version
+
+from packaging.version import Version
 
 import accelerate
 import datasets
@@ -82,6 +85,18 @@ print(f"transformers={transformers.__version__}")
 print(f"peft={peft.__version__}")
 print(f"accelerate={accelerate.__version__}")
 print(f"datasets={datasets.__version__}")
+try:
+    torchao_version = version("torchao")
+except PackageNotFoundError:
+    print("torchao=not installed (expected for BF16 LoRA)")
+else:
+    print(f"torchao={torchao_version}")
+    if Version(torchao_version) < Version("0.16.0"):
+        raise RuntimeError(
+            "PEFT 0.19 requires torchao >= 0.16 when torchao is installed. "
+            "This BF16 LoRA run does not use torchao; remove it from the "
+            "dedicated Meta-RLVR environment."
+        )
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available inside the Slurm allocation")
 PY

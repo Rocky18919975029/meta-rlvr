@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export META_RLVR_PROJECT_DIR="${META_RLVR_PROJECT_DIR:-${HOME}/meta-rlvr}"
-export META_RLVR_CONDA_ENV="${META_RLVR_CONDA_ENV:-verl}"
+export META_RLVR_CONDA_ENV="${META_RLVR_CONDA_ENV:-meta-rlvr-hpc}"
 export META_RLVR_MODEL_PATH="${META_RLVR_MODEL_PATH:-/data/user/zhongal/.cache/qwen2.5-math-7b-local}"
 export META_RLVR_TRAIN_PARQUET="${META_RLVR_TRAIN_PARQUET:-/data/user/zhongal/data/reschedule/DAPO-Math-17k.filtered.seed42.sample1536.parquet}"
 export META_RLVR_VALIDATION_PARQUET="${META_RLVR_VALIDATION_PARQUET:-/data/user/zhongal/data/reschedule/aime24.parquet}"
