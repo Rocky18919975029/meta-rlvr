@@ -25,6 +25,7 @@ meta-rlvr-inspect-prompt = "meta_rlvr.inspect_prompt:main"
 [project.optional-dependencies]
 test = ["pytest>=7.4"]
 baselines = ["trl>=0.17"]
+rollout = ["vllm>=0.11,<0.12"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

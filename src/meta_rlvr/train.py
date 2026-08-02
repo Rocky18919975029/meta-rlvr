@@ -27,7 +27,7 @@ from .data import (
     rank_shard,
 )
 from .models import load_confidence_model, load_policy_with_lora
-from .rollout import TransformersRolloutEngine
+from .rollout import TransformersRolloutEngine, VLLMHybridRolloutEngine
 from .types import RolloutGroup
 from .verifier import DAPOMathVerifier, VerificationBatch
 
@@ -62,6 +62,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, required=True)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
+    parser.add_argument(
+        "--rollout-backend",
+        choices=["transformers", "vllm"],
+        default="transformers",
+    )
+    parser.add_argument(
+        "--vllm-base-urls",
+        help="Comma-separated colocated vLLM server URLs, one per process rank.",
+    )
+    parser.add_argument("--vllm-adapter-root", type=Path, default=Path("/dev/shm"))
+    parser.add_argument("--vllm-request-timeout", type=float, default=3600.0)
 
     parser.add_argument("--inner-iterations", type=int, default=4)
     parser.add_argument(
@@ -169,6 +180,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max_grad_norm must be positive.")
     if args.confidence_learning_rate <= 0:
         raise ValueError("confidence_learning_rate must be positive.")
+    if args.rollout_backend == "vllm" and not args.vllm_base_urls:
+        raise ValueError("--vllm-base-urls is required for the vLLM backend.")
+    if args.vllm_request_timeout <= 0:
+        raise ValueError("--vllm-request-timeout must be positive.")
     if args.confidence_weight_decay < 0:
         raise ValueError("confidence_weight_decay must be non-negative.")
     if (
@@ -531,26 +546,43 @@ def main() -> None:
         policy_micro_batch_size=args.policy_micro_batch_size,
         confidence_micro_batch_size=args.confidence_micro_batch_size,
     )
-    support_rollouts = TransformersRolloutEngine(
-        policy,
-        policy_bundle.tokenizer,
-        group_size=args.support_group_size,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        generation_micro_batch_size=args.generation_micro_batch_size,
-        logprob_micro_batch_size=args.policy_micro_batch_size,
-    )
-    query_rollouts = TransformersRolloutEngine(
-        policy,
-        policy_bundle.tokenizer,
-        group_size=args.query_group_size,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        generation_micro_batch_size=args.generation_micro_batch_size,
-        logprob_micro_batch_size=args.policy_micro_batch_size,
-    )
+    rollout_kwargs: dict[str, object] = {}
+    rollout_engine_type = TransformersRolloutEngine
+    if args.rollout_backend == "vllm":
+        base_urls = [url.strip() for url in args.vllm_base_urls.split(",")]
+        if any(not url for url in base_urls):
+            raise ValueError("--vllm-base-urls contains an empty URL.")
+        if len(base_urls) != accelerator.num_processes:
+            raise ValueError(
+                f"Expected {accelerator.num_processes} vLLM URLs, got "
+                f"{len(base_urls)}."
+            )
+        rollout_engine_type = VLLMHybridRolloutEngine
+        rollout_kwargs = {
+            "base_url": base_urls[accelerator.process_index],
+            "adapter_root": (
+                args.vllm_adapter_root
+                / f"meta-rlvr-{args.output_dir.name}"
+                / f"rank-{accelerator.process_index}"
+            ),
+            "request_timeout": args.vllm_request_timeout,
+        }
+
+    def build_rollout_engine(group_size: int):
+        return rollout_engine_type(
+            policy,
+            policy_bundle.tokenizer,
+            group_size=group_size,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            generation_micro_batch_size=args.generation_micro_batch_size,
+            logprob_micro_batch_size=args.policy_micro_batch_size,
+            **rollout_kwargs,
+        )
+
+    support_rollouts = build_rollout_engine(args.support_group_size)
+    query_rollouts = build_rollout_engine(args.query_group_size)
     verifier = DAPOMathVerifier(
         strict_box_verify=args.verifier_mode == "strict_box"
     )

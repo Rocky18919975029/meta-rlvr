@@ -52,6 +52,9 @@ fi
 echo "${submission}"
 echo "stdout: ${LOG_DIR}/smoke-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/smoke-${job_id}.err"
+if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
+  echo "vLLM throughput: ${LOG_DIR}/vllm-${job_id}/gpu-*.log"
+fi
 echo "queue: squeue -j ${job_id}"
 echo "progress: tail -f ${LOG_DIR}/smoke-${job_id}.err"
 echo "metrics: tail -f ${LOG_DIR}/smoke-${job_id}.out"

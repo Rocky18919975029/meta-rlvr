@@ -21,6 +21,11 @@ export SMOKE_GENERATION_MICRO_BATCH_SIZE=16
 export SMOKE_POLICY_MICRO_BATCH_SIZE=1
 export SMOKE_CONFIDENCE_MICRO_BATCH_SIZE=1
 export SMOKE_LOG_ROLLOUTS=1
+export SMOKE_ROLLOUT_BACKEND="${SMOKE_ROLLOUT_BACKEND:-vllm}"
+export SMOKE_LORA_RANK="${SMOKE_LORA_RANK:-8}"
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.42}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-64}"
+export VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 if [[ -z "${CONDA_EXE:-}" ]]; then
@@ -66,9 +71,10 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: max_new_tokens=3072 K=16 inner=2 outer=2 generation_microbatch=16 gpus=${SMOKE_GPUS}"
+echo "configuration: max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS}"
 echo "stdout: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
+echo "vLLM throughput: ${LOG_DIR}/vllm-${job_id}/gpu-*.log"
 echo "queue: squeue -j ${job_id}"
 echo "progress: tail -F ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
 echo "metrics: tail -F ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"

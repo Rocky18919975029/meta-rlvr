@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import json
+import shutil
+import tempfile
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import torch
 from torch import Tensor, nn
@@ -315,3 +323,250 @@ class TransformersRolloutEngine:
             ),
             texts=tuple(texts),
         )
+
+
+class VLLMHybridRolloutEngine(TransformersRolloutEngine):
+    """vLLM continuous-batching rollout with verl-style sleep/resume.
+
+    vLLM runs in a colocated server process on the same GPU.  Every generation
+    transaction wakes weights and KV cache, loads the task's detached LoRA,
+    generates the complete group, unloads the adapter, and returns the server
+    to level-1 sleep before PyTorch computes log-probabilities or gradients.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer,
+        *,
+        base_url: str,
+        adapter_root: Path,
+        request_timeout: float,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(model, tokenizer, **kwargs)
+        if not base_url.startswith(("http://", "https://")):
+            raise ValueError("vLLM base_url must start with http:// or https://.")
+        if request_timeout <= 0:
+            raise ValueError("vLLM request_timeout must be positive.")
+        self.base_url = base_url.rstrip("/")
+        self.adapter_root = adapter_root
+        self.request_timeout = request_timeout
+        self.adapter_root.mkdir(parents=True, exist_ok=True)
+        status = self._request_json("GET", "/is_sleeping")
+        if status != {"is_sleeping": True}:
+            raise RuntimeError(
+                f"vLLM server must be sleeping before training starts, got {status!r}."
+            )
+
+    def generate(
+        self,
+        problem: MathProblem,
+        fast_parameters: Mapping[str, Tensor],
+        *,
+        show_progress: bool = False,
+        progress_description: str = "rollout",
+    ) -> RolloutGroup:
+        prompt = self.tokenizer.apply_chat_template(
+            problem.conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("Chat template must return a non-empty string.")
+        encoded = self.tokenizer(prompt, add_special_tokens=False)
+        prompt_ids = encoded.get("input_ids")
+        if not isinstance(prompt_ids, list) or not prompt_ids:
+            raise ValueError("Tokenizer must return a non-empty input_ids list.")
+        if not all(isinstance(token_id, int) for token_id in prompt_ids):
+            raise TypeError("Tokenized prompt IDs must be integers.")
+        max_positions = getattr(self.model.config, "max_position_embeddings", None)
+        if not isinstance(max_positions, int):
+            raise ValueError("Policy config must define integer max_position_embeddings.")
+        if len(prompt_ids) + self.max_new_tokens > max_positions:
+            raise ValueError(
+                f"prompt_length ({len(prompt_ids)}) + max_new_tokens "
+                f"({self.max_new_tokens}) exceeds max_position_embeddings "
+                f"({max_positions})."
+            )
+
+        adapter_name = f"meta-rlvr-{uuid4().hex}"
+        adapter_dir = Path(
+            tempfile.mkdtemp(prefix=f"{adapter_name}-", dir=self.adapter_root)
+        )
+        loaded = False
+        awake = False
+        started = time.monotonic()
+        progress_bar = None
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            progress_bar = tqdm(
+                total=self.group_size,
+                desc=f"{progress_description}: vLLM generate",
+                unit="response",
+                leave=True,
+            )
+        try:
+            self._save_adapter(adapter_dir, fast_parameters)
+            self._request_json("POST", "/wake_up")
+            awake = True
+            status = self._request_json("GET", "/is_sleeping")
+            if status != {"is_sleeping": False}:
+                raise RuntimeError(f"vLLM failed to wake up: {status!r}.")
+            self._request_json(
+                "POST",
+                "/v1/load_lora_adapter",
+                {"lora_name": adapter_name, "lora_path": str(adapter_dir)},
+            )
+            loaded = True
+            response = self._request_json(
+                "POST",
+                "/v1/completions",
+                {
+                    "model": adapter_name,
+                    "prompt": prompt_ids,
+                    "n": self.group_size,
+                    "max_tokens": self.max_new_tokens,
+                    "temperature": self.temperature,
+                    "top_p": self.top_p,
+                    "stream": False,
+                    "return_token_ids": True,
+                },
+            )
+            completion_ids = self._completion_ids(response)
+            if progress_bar is not None:
+                progress_bar.update(self.group_size)
+                progress_bar.set_postfix_str(
+                    f"elapsed={time.monotonic() - started:.1f}s"
+                )
+        finally:
+            if loaded:
+                self._request_json(
+                    "POST",
+                    "/v1/unload_lora_adapter",
+                    {"lora_name": adapter_name},
+                )
+            if awake:
+                self._request_json("POST", "/sleep?level=1")
+                status = self._request_json("GET", "/is_sleeping")
+                if status != {"is_sleeping": True}:
+                    raise RuntimeError(f"vLLM failed to enter sleep mode: {status!r}.")
+            if progress_bar is not None:
+                progress_bar.close()
+            shutil.rmtree(adapter_dir)
+
+        sequences = self._sequences_from_completion_ids(prompt_ids, completion_ids)
+        group = self._build_group(sequences, len(prompt_ids))
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with materialized_fast_parameters(self.model, fast_parameters):
+                with torch.no_grad():
+                    old_logprobs = self._unadapted_logprobs(
+                        group,
+                        show_progress=show_progress,
+                        progress_description=(
+                            f"{progress_description}: old log-probabilities"
+                        ),
+                    )
+        finally:
+            self.model.train(was_training)
+        return replace(group, old_logprobs=old_logprobs)
+
+    def _save_adapter(
+        self,
+        adapter_dir: Path,
+        fast_parameters: Mapping[str, Tensor],
+    ) -> None:
+        if not fast_parameters:
+            raise ValueError("fast_parameters cannot be empty.")
+        if not hasattr(self.model, "save_pretrained"):
+            raise TypeError("The policy must implement PEFT save_pretrained().")
+        state_dict = {
+            name: value.detach().to(device="cpu").contiguous()
+            for name, value in fast_parameters.items()
+        }
+        self.model.save_pretrained(
+            adapter_dir,
+            state_dict=state_dict,
+            safe_serialization=True,
+            selected_adapters=["default"],
+        )
+        expected = {"adapter_config.json", "adapter_model.safetensors"}
+        missing = [name for name in expected if not (adapter_dir / name).is_file()]
+        if missing:
+            raise RuntimeError(f"PEFT did not write adapter files: {missing}.")
+
+    def _completion_ids(self, response: Any) -> list[list[int]]:
+        if not isinstance(response, dict) or not isinstance(response.get("choices"), list):
+            raise TypeError("vLLM completion response must contain a choices list.")
+        choices = sorted(response["choices"], key=lambda choice: choice["index"])
+        if len(choices) != self.group_size:
+            raise ValueError(
+                f"vLLM returned {len(choices)} choices, expected {self.group_size}."
+            )
+        completions: list[list[int]] = []
+        for expected_index, choice in enumerate(choices):
+            if choice.get("index") != expected_index:
+                raise ValueError("vLLM completion choice indices are not contiguous.")
+            token_ids = choice.get("token_ids")
+            if not isinstance(token_ids, list) or not token_ids:
+                raise ValueError("Every vLLM completion must contain token_ids.")
+            if not all(isinstance(token_id, int) for token_id in token_ids):
+                raise TypeError("vLLM completion token IDs must be integers.")
+            completions.append(token_ids)
+        return completions
+
+    def _sequences_from_completion_ids(
+        self,
+        prompt_ids: list[int],
+        completion_ids: list[list[int]],
+    ) -> Tensor:
+        max_completion = max(len(tokens) for tokens in completion_ids)
+        sequences = torch.full(
+            (self.group_size, len(prompt_ids) + max_completion),
+            self.tokenizer.pad_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
+        sequences[:, : len(prompt_ids)] = prompt_tensor
+        for row, tokens in enumerate(completion_ids):
+            sequences[row, len(prompt_ids) : len(prompt_ids) + len(tokens)] = torch.tensor(
+                tokens,
+                dtype=torch.long,
+                device=self.device,
+            )
+        return sequences
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Any:
+        data = None
+        headers: dict[str, str] = {}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+                body = response.read()
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"vLLM {method} {path} failed with HTTP {error.code}: {body}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"vLLM {method} {path} failed: {error}") from error
+        if not body:
+            return None
+        return json.loads(body)

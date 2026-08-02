@@ -13,7 +13,7 @@ from meta_rlvr.data import (
     rank_shard,
 )
 from meta_rlvr.functional import trainable_parameter_state
-from meta_rlvr.rollout import TransformersRolloutEngine
+from meta_rlvr.rollout import TransformersRolloutEngine, VLLMHybridRolloutEngine
 from meta_rlvr.verifier import DAPOMathVerifier
 
 
@@ -153,3 +153,35 @@ def test_transformers_rollout_builds_aligned_masks_and_old_logprobs() -> None:
     assert torch.all(~group.completion_mask[:, :1])
     assert group.old_logprobs.shape == group.completion_mask.shape
     assert group.texts == ("response", "response", "response")
+
+
+def test_vllm_rollout_preserves_returned_token_ids_and_choice_order() -> None:
+    policy = ToyGeneratingPolicy()
+    engine = object.__new__(VLLMHybridRolloutEngine)
+    TransformersRolloutEngine.__init__(
+        engine,
+        policy,
+        ToyTokenizer(),
+        group_size=2,
+        max_new_tokens=3,
+        temperature=1.0,
+        top_p=0.7,
+        generation_micro_batch_size=2,
+    )
+    completion_ids = engine._completion_ids(
+        {
+            "choices": [
+                {"index": 1, "token_ids": [5, 6]},
+                {"index": 0, "token_ids": [3, 4, 6]},
+            ]
+        }
+    )
+    assert completion_ids == [[3, 4, 6], [5, 6]]
+
+    sequences = engine._sequences_from_completion_ids([1, 2], completion_ids)
+    assert sequences.tolist() == [[1, 2, 3, 4, 6], [1, 2, 5, 6, 0]]
+    group = engine._build_group(sequences, prompt_length=2)
+    assert group.completion_mask.tolist() == [
+        [False, True, True, True],
+        [False, True, True, False],
+    ]

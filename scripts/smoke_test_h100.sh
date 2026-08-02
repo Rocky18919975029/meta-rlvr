@@ -65,6 +65,7 @@ echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi
 python - <<'PY'
 import platform
+import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
 
@@ -86,6 +87,16 @@ print(f"transformers={transformers.__version__}")
 print(f"peft={peft.__version__}")
 print(f"accelerate={accelerate.__version__}")
 print(f"datasets={datasets.__version__}")
+if os.environ.get("SMOKE_ROLLOUT_BACKEND", "transformers") == "vllm":
+    import vllm
+
+    vllm_version = Version(vllm.__version__)
+    print(f"vllm={vllm_version}")
+    if not (Version("0.11.0") <= vllm_version < Version("0.12.0")):
+        raise RuntimeError(
+            "The hybrid rollout backend is validated against vLLM 0.11.x, "
+            f"got {vllm_version}."
+        )
 try:
     torchao_version = version("torchao")
 except PackageNotFoundError:
@@ -104,6 +115,20 @@ PY
 
 echo "[$(date --iso-8601=seconds)] launching ${SMOKE_GPUS} distributed workers"
 EXTRA_TRAIN_ARGS=()
+if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
+  source scripts/vllm_hybrid_servers.sh
+  trap stop_meta_rlvr_vllm_servers EXIT
+  start_meta_rlvr_vllm_servers
+  EXTRA_TRAIN_ARGS+=(
+    --rollout-backend vllm
+    --vllm-base-urls "${META_RLVR_VLLM_BASE_URLS}"
+    --vllm-adapter-root "${VLLM_ADAPTER_ROOT:-/dev/shm}"
+    --vllm-request-timeout "${VLLM_REQUEST_TIMEOUT:-3600}"
+  )
+elif [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" != "transformers" ]]; then
+  echo "SMOKE_ROLLOUT_BACKEND must be transformers or vllm." >&2
+  exit 2
+fi
 if [[ "${SMOKE_LOG_ROLLOUTS:-0}" == "1" ]]; then
   EXTRA_TRAIN_ARGS+=(--log-rollouts)
 fi

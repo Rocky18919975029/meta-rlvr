@@ -12,6 +12,7 @@ from meta_rlvr.config import (
     MetaLossConfig,
 )
 from meta_rlvr.functional import token_logprobs, trainable_parameter_state
+from meta_rlvr.rollout import VLLMHybridRolloutEngine
 from meta_rlvr.types import RolloutGroup
 
 
@@ -117,3 +118,24 @@ def test_tiny_qwen_peft_supports_differentiable_bilevel_update() -> None:
 
     assert confidence.score[-1].weight.grad is not None
     assert torch.isfinite(confidence.score[-1].weight.grad).all()
+
+
+def test_task_fast_parameters_export_as_peft_adapter(tmp_path) -> None:
+    policy = get_peft_model(
+        Qwen2ForCausalLM(tiny_qwen_config()),
+        LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=2,
+            lora_alpha=4,
+            lora_dropout=0.0,
+            target_modules=["q_proj", "v_proj"],
+            bias="none",
+        ),
+    )
+    fast = trainable_parameter_state(policy, required_name_substring="lora_")
+    engine = object.__new__(VLLMHybridRolloutEngine)
+    engine.model = policy
+    engine._save_adapter(tmp_path, fast)
+
+    assert (tmp_path / "adapter_config.json").is_file()
+    assert (tmp_path / "adapter_model.safetensors").is_file()

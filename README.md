@@ -244,12 +244,35 @@ bash scripts/submit_rollout_test.sh
 
 This generates support K=16, performs two confidence-guided inner updates and
 generates query K=16, then exits before outer backward, checkpointing and
-validation. Each rank generates all 16 responses concurrently, so four H100s
-decode 64 sequences at once globally. Autoregressive generation explicitly
-uses the KV cache; replicated policy ranks decode independently, while the
-confidence model remains FSDP-sharded. Full responses and strict-box verifier
-predictions are written to per-rank JSONL files under
+validation. The HPC meaningful and rollout-only jobs default to four colocated
+TP=1 vLLM replicas. Each replica continuously batches a full K=16 group, uses
+the exact task-dependent LoRA for both support and query, and returns generated
+token IDs to PyTorch for old-log-probability computation. Full responses and
+strict-box verifier predictions are written to per-rank JSONL files under
 `outputs/rollout-test-$SLURM_JOB_ID`.
+
+The vLLM lifecycle follows verl's hybrid engine design. Servers start first and
+enter level-1 sleep. Every rollout wakes `weights` and `kv_cache`, dynamically
+loads the detached task LoRA from node-local `/dev/shm`, generates with
+continuous batching, unloads the adapter and sleeps before PyTorch performs
+inner/outer gradient work. The Transformers backend remains available for CPU
+tests via `SMOKE_ROLLOUT_BACKEND=transformers`; it is not the default for the
+H100 meaningful tests. Per-replica vLLM logs and throughput metrics are under
+`logs/vllm-$SLURM_JOB_ID/gpu-*.log`.
+
+The conservative colocated allocation is 42% of each H100 for vLLM. Override it
+only after measuring peak training memory:
+
+```bash
+export SMOKE_GPUS=4
+bash scripts/submit_vllm_smoke_test.sh
+
+# Only after the short hybrid lifecycle test succeeds:
+export VLLM_GPU_MEMORY_UTILIZATION=0.42
+export VLLM_MAX_NUM_SEQS=64
+export VLLM_MAX_LORAS=1
+bash scripts/submit_rollout_test.sh
+```
 
 After the rollout-only test passes, submit a one-step test that can carry a
 nonzero meta signal with 3,072 generated tokens, support/query group size 16,
