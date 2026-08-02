@@ -1,0 +1,12 @@
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+outputs/
+checkpoints/
+wandb/
+
+# Local ChatGPT project mirror metadata/reference material.
+/AGENTS.md
+/sources/

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meta-rlvr"
+version = "0.1.0"
+description = "Bilevel confidence-guided test-time adaptation for RLVR"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=1.0",
+    "datasets>=3.0",
+    "peft>=0.13",
+    "pyarrow>=17.0",
+    "safetensors>=0.4",
+    "torch>=2.4",
+    "transformers>=4.46",
+    "trl>=0.17",
+]
+
+[project.scripts]
+meta-rlvr-train = "meta_rlvr.train:main"
+
+[project.optional-dependencies]
+test = ["pytest>=7.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
