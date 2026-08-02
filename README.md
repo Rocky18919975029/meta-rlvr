@@ -34,6 +34,9 @@ lambda_meta * query_verifier_GRPO
 Support verifier labels are used only by the two confidence supervision terms.
 The inner update never consumes them. `adapt_task(...,
 supervise_confidence=False)` is the inference path and requires no verifier.
+The verifier's official `-1/+1` score is kept separately from its `0/1`
+correctness label: outer GRPO consumes the former, while BCE, ranking and
+accuracy metrics consume the latter.
 
 ## Code structure
 
@@ -186,6 +189,16 @@ python -m pip install --no-index \
 
 The smoke test uses PyTorch SDPA, so `flash-attn` is not required for this
 first distributed check.
+
+Inspect the exact dataset messages, tokenizer-owned Jinja template and rendered
+prompt used by training with:
+
+```bash
+python -m meta_rlvr.inspect_prompt \
+  --parquet /data/user/zhongal/data/reschedule/DAPO-Math-17k.filtered.seed42.sample1536.parquet \
+  --model /data/user/zhongal/.cache/qwen2.5-math-7b-local \
+  --row 0
+```
 
 ## Slurm smoke test
 

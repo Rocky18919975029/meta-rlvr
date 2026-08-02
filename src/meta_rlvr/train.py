@@ -296,12 +296,12 @@ def _evaluate(
                 progress_description=f"{progress_prefix} adapted",
             )
             del generation_adaptation
-            base_rewards = verifier(
+            base_verification = verifier(
                 support.texts,
                 problem.ground_truth,
                 device=accelerator.device,
             )
-            adapted_rewards = verifier(
+            adapted_verification = verifier(
                 query.texts,
                 problem.ground_truth,
                 device=accelerator.device,
@@ -309,12 +309,12 @@ def _evaluate(
             if valid:
                 local_metrics += torch.tensor(
                     (
-                        base_rewards.sum().item(),
-                        float(base_rewards.numel()),
-                        adapted_rewards.sum().item(),
-                        float(adapted_rewards.numel()),
-                        float(torch.any(base_rewards == 1).item()),
-                        float(torch.any(adapted_rewards == 1).item()),
+                        base_verification.correctness.sum().item(),
+                        float(base_verification.correctness.numel()),
+                        adapted_verification.correctness.sum().item(),
+                        float(adapted_verification.correctness.numel()),
+                        float(torch.any(base_verification.correctness == 1).item()),
+                        float(torch.any(adapted_verification.correctness == 1).item()),
                     ),
                     device=accelerator.device,
                     dtype=torch.float64,
@@ -488,12 +488,15 @@ def main() -> None:
             show_progress=accelerator.is_main_process,
             progress_description=f"{progress_prefix} support",
         )
-        support_rewards = verifier(
+        support_verification = verifier(
             support.texts,
             problem.ground_truth,
             device=accelerator.device,
         )
-        support = support.with_rewards(support_rewards)
+        support = support.with_verification(
+            support_verification.rewards,
+            support_verification.correctness,
+        )
         if args.inner_kl_coefficient > 0:
             support = support.with_reference_logprobs(support.old_logprobs)
 
@@ -524,12 +527,15 @@ def main() -> None:
                     progress_description=f"{progress_prefix} query",
                 )
                 del generation_adaptation
-                query_rewards = verifier(
+                query_verification = verifier(
                     cached_query.texts,
                     problem.ground_truth,
                     device=accelerator.device,
                 )
-                cached_query = cached_query.with_rewards(query_rewards)
+                cached_query = cached_query.with_verification(
+                    query_verification.rewards,
+                    query_verification.correctness,
+                )
                 if args.outer_kl_coefficient > 0:
                     cached_query = query_rollouts.add_reference_logprobs(
                         cached_query,
@@ -571,6 +577,8 @@ def main() -> None:
                     output.adaptation.inner_losses[-1].clip_fraction.detach(),
                     support.verifier_rewards.mean(),
                     cached_query.verifier_rewards.mean(),
+                    support.correctness_labels.mean(),
+                    cached_query.correctness_labels.mean(),
                     gradient_norm.detach(),
                 )
             )
@@ -587,9 +595,11 @@ def main() -> None:
                             "ranking": metrics[3].item(),
                             "outer_clip_fraction": metrics[4].item(),
                             "inner_clip_fraction": metrics[5].item(),
-                            "support_accuracy": metrics[6].item(),
-                            "query_accuracy": metrics[7].item(),
-                            "confidence_gradient_norm": metrics[8].item(),
+                            "support_reward": metrics[6].item(),
+                            "query_reward": metrics[7].item(),
+                            "support_accuracy": metrics[8].item(),
+                            "query_accuracy": metrics[9].item(),
+                            "confidence_gradient_norm": metrics[10].item(),
                         },
                         sort_keys=True,
                     ),

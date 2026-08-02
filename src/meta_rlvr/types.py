@@ -20,6 +20,7 @@ class RolloutGroup:
     old_logprobs: Tensor
     texts: tuple[str, ...]
     verifier_rewards: Tensor | None = None
+    correctness_labels: Tensor | None = None
     reference_logprobs: Tensor | None = None
 
     def __post_init__(self) -> None:
@@ -65,9 +66,29 @@ class RolloutGroup:
                 "verifier_rewards", self.verifier_rewards
             )
             if torch.any(
-                (self.verifier_rewards != 0) & (self.verifier_rewards != 1)
+                (self.verifier_rewards != -1) & (self.verifier_rewards != 1)
             ):
-                raise ValueError("verifier_rewards must contain only 0 and 1.")
+                raise ValueError("verifier_rewards must contain only -1 and 1.")
+        if self.correctness_labels is not None:
+            if self.correctness_labels.shape != (k,):
+                raise ValueError("correctness_labels must have shape [K].")
+            self._validate_floating_tensor(
+                "correctness_labels", self.correctness_labels
+            )
+            if torch.any(
+                (self.correctness_labels != 0) & (self.correctness_labels != 1)
+            ):
+                raise ValueError("correctness_labels must contain only 0 and 1.")
+        if (self.verifier_rewards is None) != (self.correctness_labels is None):
+            raise ValueError(
+                "verifier_rewards and correctness_labels must be set together."
+            )
+        if self.verifier_rewards is not None and not torch.equal(
+            self.verifier_rewards, 2.0 * self.correctness_labels - 1.0
+        ):
+            raise ValueError(
+                "verifier_rewards must equal 2 * correctness_labels - 1."
+            )
 
         devices = {
             self.input_ids.device,
@@ -79,6 +100,8 @@ class RolloutGroup:
             devices.add(self.reference_logprobs.device)
         if self.verifier_rewards is not None:
             devices.add(self.verifier_rewards.device)
+        if self.correctness_labels is not None:
+            devices.add(self.correctness_labels.device)
         if len(devices) != 1:
             raise ValueError("All rollout tensors must be on the same device.")
 
@@ -93,9 +116,16 @@ class RolloutGroup:
     def group_size(self) -> int:
         return self.input_ids.shape[0]
 
-    def with_rewards(self, verifier_rewards: Tensor) -> "RolloutGroup":
-        return replace(self, verifier_rewards=verifier_rewards)
+    def with_verification(
+        self,
+        verifier_rewards: Tensor,
+        correctness_labels: Tensor,
+    ) -> "RolloutGroup":
+        return replace(
+            self,
+            verifier_rewards=verifier_rewards,
+            correctness_labels=correctness_labels,
+        )
 
     def with_reference_logprobs(self, reference_logprobs: Tensor) -> "RolloutGroup":
         return replace(self, reference_logprobs=reference_logprobs)
-

@@ -53,6 +53,8 @@ class ToyConfidenceBackbone(nn.Module):
 
 
 def make_group(policy: nn.Module, rewards: torch.Tensor) -> RolloutGroup:
+    correctness = rewards
+    verifier_rewards = 2.0 * correctness - 1.0
     input_ids = torch.tensor(
         [
             [1, 2, 3, 4],
@@ -74,7 +76,8 @@ def make_group(policy: nn.Module, rewards: torch.Tensor) -> RolloutGroup:
         completion_mask=completion_mask,
         old_logprobs=torch.zeros((3, 3)),
         texts=("a", "b", "c"),
-        verifier_rewards=rewards,
+        verifier_rewards=verifier_rewards,
+        correctness_labels=correctness,
     )
     old_logprobs = token_logprobs(policy, provisional).detach()
     return RolloutGroup(
@@ -84,7 +87,8 @@ def make_group(policy: nn.Module, rewards: torch.Tensor) -> RolloutGroup:
         old_logprobs=old_logprobs,
         reference_logprobs=old_logprobs,
         texts=("a", "b", "c"),
-        verifier_rewards=rewards,
+        verifier_rewards=verifier_rewards,
+        correctness_labels=correctness,
     )
 
 
@@ -250,6 +254,7 @@ def test_inference_adaptation_does_not_require_verifier_labels() -> None:
     support = replace(
         make_group(policy, torch.tensor([1.0, 0.0, 0.0])),
         verifier_rewards=None,
+        correctness_labels=None,
     )
     algorithm = BilevelGRPO(
         policy=policy,

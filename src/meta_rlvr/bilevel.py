@@ -297,9 +297,9 @@ class BilevelGRPO:
         show_progress: bool = False,
         progress_prefix: str = "adaptation",
     ) -> TaskAdaptation:
-        if supervise_confidence and support.verifier_rewards is None:
+        if supervise_confidence and support.correctness_labels is None:
             raise ValueError(
-                "Support verifier rewards are required for BCE/ranking supervision."
+                "Support correctness labels are required for BCE/ranking supervision."
             )
 
         confidence_logits = self._confidence_logits(
@@ -310,7 +310,7 @@ class BilevelGRPO:
         if supervise_confidence:
             confidence_loss = confidence_losses(
                 confidence_logits,
-                support.verifier_rewards,
+                support.correctness_labels,
                 self.meta_config.confidence,
             )
         adaptation_rewards = (

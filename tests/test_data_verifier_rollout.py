@@ -68,14 +68,17 @@ def test_evaluation_loader_collapses_replicated_prompts(
     assert [problem.ground_truth for problem in problems] == ["1", "2"]
 
 
-def test_official_dapo_verifier_wrapper_returns_binary_rewards() -> None:
+def test_official_dapo_verifier_wrapper_separates_rewards_and_correctness() -> None:
     verifier = DAPOMathVerifier()
-    rewards = verifier(
+    verification = verifier(
         ("Reasoning. Answer: 42", "Reasoning. Answer: 41"),
         "42",
         device=torch.device("cpu"),
     )
-    torch.testing.assert_close(rewards, torch.tensor([1.0, 0.0]))
+    torch.testing.assert_close(verification.rewards, torch.tensor([1.0, -1.0]))
+    torch.testing.assert_close(
+        verification.correctness, torch.tensor([1.0, 0.0])
+    )
 
 
 class ToyTokenizer:

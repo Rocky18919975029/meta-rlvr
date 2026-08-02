@@ -32,6 +32,8 @@ def tiny_qwen_config() -> Qwen2Config:
 
 
 def make_group(policy, rewards) -> RolloutGroup:
+    correctness = rewards
+    verifier_rewards = 2.0 * correctness - 1.0
     input_ids = torch.tensor(
         [
             [1, 4, 5, 6, 7, 2],
@@ -53,7 +55,8 @@ def make_group(policy, rewards) -> RolloutGroup:
         completion_mask=completion_mask,
         old_logprobs=torch.zeros((3, 5)),
         texts=("a", "b", "c"),
-        verifier_rewards=rewards,
+        verifier_rewards=verifier_rewards,
+        correctness_labels=correctness,
     )
     old = token_logprobs(policy, provisional).detach()
     return RolloutGroup(
@@ -62,7 +65,8 @@ def make_group(policy, rewards) -> RolloutGroup:
         completion_mask=completion_mask,
         old_logprobs=old,
         texts=("a", "b", "c"),
-        verifier_rewards=rewards,
+        verifier_rewards=verifier_rewards,
+        correctness_labels=correctness,
     )
 
 
