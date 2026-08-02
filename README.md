@@ -150,14 +150,13 @@ then synchronize it to `meta-rlvr/artifacts/wheelhouse`.
 
 The existing conda environment `verl` has been verified with Python 3.12,
 PyTorch 2.8.0+cu128, Transformers 4.56.1, PEFT 0.19.1, Accelerate 1.14.0,
-Datasets 5.0.0 and tqdm 4.68.3. However, it also contains torchao 0.9.0, which
-PEFT 0.19.1 rejects during LoRA injection. Preserve the original VERL
-environment: clone it offline, remove the unused optional torchao backend only
-from the clone, and install the local project there:
+Datasets 5.0.0 and tqdm 4.68.3. Its old torchao 0.9.0 installation is
+incompatible with PEFT 0.19.1 during LoRA injection and is unused by this BF16
+experiment. After confirming that no installed package requires torchao, remove
+it and install the local project directly in `verl`:
 
 ```bash
-conda create -n meta-rlvr-hpc --clone verl
-conda activate meta-rlvr-hpc
+conda activate verl
 python -m pip uninstall -y torchao
 cd "$HOME/meta-rlvr"
 python -m pip install --no-deps --no-build-isolation -e .
@@ -200,7 +199,7 @@ model:         /data/user/zhongal/.cache/qwen2.5-math-7b-local
 ```
 
 The smoke submitter uses the 1,536-problem subset by default. These paths,
-`$HOME/meta-rlvr`, conda environment `meta-rlvr-hpc` and the output directory are already
+`$HOME/meta-rlvr`, conda environment `verl` and the output directory are already
 encoded as overridable defaults. The detected Slurm defaults are partition
 `acd_u` and generic GRES `gpu:4`; `debug` is deliberately not used because its
 30-minute limit is too short for a reliable first run. `SLURM_ACCOUNT` and
@@ -208,7 +207,7 @@ encoded as overridable defaults. The detected Slurm defaults are partition
 
 ```bash
 cd "$HOME/meta-rlvr"
-export META_RLVR_CONDA_ENV=meta-rlvr-hpc
+export META_RLVR_CONDA_ENV=verl
 export SMOKE_GPUS=4
 
 bash scripts/submit_smoke_test.sh
@@ -332,3 +331,9 @@ confidence model changes.
 The first query generation uses a non-differentiable copy of the inner update;
 the differentiable inner loop is then recomputed for the outer loss. This
 avoids retaining the unrolled graph during autoregressive generation.
+
+The functional AdamW update uses the standard forward formula. For bilevel
+backpropagation only, `sqrt(0)` is assigned the zero subgradient; this prevents
+the exact-zero initial confidence advantage from producing `0 * inf = NaN`.
+The trainer also rejects a non-finite confidence gradient norm before the
+optimizer step, so it cannot save a newly corrupted checkpoint.

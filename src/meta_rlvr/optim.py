@@ -10,6 +10,37 @@ from .config import FastOptimizerConfig
 from .functional import ParameterDict
 
 
+class _StableSqrt(torch.autograd.Function):
+    """Square root with a finite subgradient at zero.
+
+    The forward is exactly ``sqrt(x)``. At ``x == 0`` the backward returns
+    zero instead of evaluating ``0 / sqrt(0)``, which otherwise creates NaNs
+    when differentiating through an Adam update whose gradient is exactly zero.
+    """
+
+    @staticmethod
+    def forward(ctx, value: Tensor) -> Tensor:
+        root = torch.sqrt(value)
+        ctx.save_for_backward(root)
+        return root
+
+    @staticmethod
+    def backward(ctx, gradient_output: Tensor) -> tuple[Tensor]:
+        (root,) = ctx.saved_tensors
+        positive = root > 0
+        denominator = torch.where(
+            positive,
+            2.0 * root,
+            torch.ones_like(root),
+        )
+        gradient = torch.where(
+            positive,
+            gradient_output / denominator,
+            torch.zeros_like(gradient_output),
+        )
+        return (gradient,)
+
+
 @dataclass(frozen=True)
 class FastOptimizerState:
     step: int
@@ -88,7 +119,7 @@ def fast_optimizer_step(
         second_hat = second / (1.0 - config.beta2**step)
         decayed = parameter * (1.0 - config.learning_rate * config.weight_decay)
         updated[name] = decayed - config.learning_rate * first_hat / (
-            torch.sqrt(second_hat) + config.epsilon
+            _StableSqrt.apply(second_hat) + config.epsilon
         )
 
     return updated, FastOptimizerState(
@@ -96,4 +127,3 @@ def fast_optimizer_step(
         first_moment=first_moment,
         second_moment=second_moment,
     )
-

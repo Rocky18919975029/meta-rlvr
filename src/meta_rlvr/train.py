@@ -550,7 +550,14 @@ def main() -> None:
             )
             outer_iterations.set_postfix_str("stage=meta-backward")
             accelerator.backward(output.loss)
-            accelerator.clip_grad_norm_(confidence_model.parameters(), args.max_grad_norm)
+            gradient_norm = accelerator.clip_grad_norm_(
+                confidence_model.parameters(), args.max_grad_norm
+            )
+            if not torch.isfinite(gradient_norm):
+                raise FloatingPointError(
+                    "Confidence gradient norm is non-finite; refusing to update "
+                    "or save a corrupted checkpoint."
+                )
             confidence_optimizer.step()
             outer_iterations.set_postfix_str("stage=metrics")
 
@@ -564,6 +571,7 @@ def main() -> None:
                     output.adaptation.inner_losses[-1].clip_fraction.detach(),
                     support.verifier_rewards.mean(),
                     cached_query.verifier_rewards.mean(),
+                    gradient_norm.detach(),
                 )
             )
             metrics = accelerator.reduce(metrics, reduction="mean")
@@ -581,6 +589,7 @@ def main() -> None:
                             "inner_clip_fraction": metrics[5].item(),
                             "support_accuracy": metrics[6].item(),
                             "query_accuracy": metrics[7].item(),
+                            "confidence_gradient_norm": metrics[8].item(),
                         },
                         sort_keys=True,
                     ),
