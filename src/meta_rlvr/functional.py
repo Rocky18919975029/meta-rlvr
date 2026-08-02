@@ -131,20 +131,35 @@ def chunked_token_logprobs(
     fast_parameters: Mapping[str, Tensor],
     micro_batch_size: int,
     activation_checkpointing: bool,
+    show_progress: bool = False,
+    progress_description: str = "policy log-probabilities",
 ) -> Tensor:
     if micro_batch_size <= 0:
         raise ValueError("micro_batch_size must be positive.")
-    chunks = [
-        token_logprobs(
-            model,
-            group,
-            fast_parameters=fast_parameters,
-            row_start=start,
-            row_end=min(start + micro_batch_size, group.group_size),
-            activation_checkpointing=activation_checkpointing,
+    starts = range(0, group.group_size, micro_batch_size)
+    if show_progress:
+        from tqdm.auto import tqdm
+
+        starts = tqdm(
+            starts,
+            total=(group.group_size + micro_batch_size - 1)
+            // micro_batch_size,
+            desc=progress_description,
+            unit="microbatch",
+            leave=True,
         )
-        for start in range(0, group.group_size, micro_batch_size)
-    ]
+    chunks = []
+    for start in starts:
+        chunks.append(
+            token_logprobs(
+                model,
+                group,
+                fast_parameters=fast_parameters,
+                row_start=start,
+                row_end=min(start + micro_batch_size, group.group_size),
+                activation_checkpointing=activation_checkpointing,
+            )
+        )
     return torch.cat(chunks, dim=0)
 
 

@@ -114,6 +114,86 @@ rank can maintain one independent fast adapter. With 4 or 8 GPUs, the global
 meta-batch therefore contains 4 or 8 different problems without keeping
 multiple task adapters on one device.
 
+## Offline HPC synchronization
+
+The target login node is `zhongal@hpc3login.hpc.hkust-gz.edu.cn`. From the
+local machine, synchronize code and offline artifacts without deleting
+anything already present on the server:
+
+```bash
+export META_RLVR_LOCAL=/Users/zeshenghong/.codex/.chatgpt-projects/g-p-6a6eba58defc8191bd0fd7798dc974b8
+export META_RLVR_HPC=zhongal@hpc3login.hpc.hkust-gz.edu.cn
+
+ssh "${META_RLVR_HPC}" \
+  'mkdir -p meta-rlvr/artifacts/data meta-rlvr/artifacts/models meta-rlvr/artifacts/wheelhouse meta-rlvr/logs meta-rlvr/outputs'
+
+rsync -azP \
+  --exclude '.pytest_cache/' \
+  --exclude '__pycache__/' \
+  --exclude '*.egg-info/' \
+  --exclude 'outputs/' \
+  "${META_RLVR_LOCAL}/" \
+  "${META_RLVR_HPC}:meta-rlvr/"
+
+rsync -ahP /local/path/DAPO-17k.parquet \
+  "${META_RLVR_HPC}:meta-rlvr/artifacts/data/DAPO-17k.parquet"
+rsync -ahP /local/path/AIME24.parquet \
+  "${META_RLVR_HPC}:meta-rlvr/artifacts/data/AIME24.parquet"
+rsync -ahP /local/path/Qwen2.5-Math-7B/ \
+  "${META_RLVR_HPC}:meta-rlvr/artifacts/models/Qwen2.5-Math-7B/"
+```
+
+A macOS virtual environment cannot be copied to the Linux HPC. Either use a
+cluster-provided PyTorch/CUDA environment, or build a wheelhouse on an
+internet-connected Linux x86_64 machine with matching Python/CUDA versions,
+then synchronize it to `meta-rlvr/artifacts/wheelhouse`. On the HPC:
+
+```bash
+module load python cuda  # replace with the cluster's actual module names
+python -m venv --system-site-packages "$HOME/venvs/meta-rlvr"
+source "$HOME/venvs/meta-rlvr/bin/activate"
+python -m pip install --no-index \
+  --no-build-isolation \
+  --find-links "$HOME/meta-rlvr/artifacts/wheelhouse" \
+  -e "$HOME/meta-rlvr[test]"
+```
+
+The smoke test uses PyTorch SDPA, so `flash-attn` is not required for this
+first distributed check.
+
+## Slurm smoke test
+
+On the HPC, set the cluster-specific partition and paths. `SLURM_ACCOUNT` and
+`SLURM_QOS` are optional; override `SLURM_GRES` if this cluster names H100s
+differently from `gpu:h100:4`.
+
+```bash
+cd "$HOME/meta-rlvr"
+export META_RLVR_PROJECT_DIR="$HOME/meta-rlvr"
+export META_RLVR_VENV="$HOME/venvs/meta-rlvr"
+export META_RLVR_MODEL_PATH="$HOME/meta-rlvr/artifacts/models/Qwen2.5-Math-7B"
+export META_RLVR_TRAIN_PARQUET="$HOME/meta-rlvr/artifacts/data/DAPO-17k.parquet"
+export META_RLVR_VALIDATION_PARQUET="$HOME/meta-rlvr/artifacts/data/AIME24.parquet"
+export META_RLVR_OUTPUT_DIR="$HOME/meta-rlvr/outputs"
+export SLURM_PARTITION=YOUR_H100_PARTITION
+export SLURM_ACCOUNT=YOUR_ACCOUNT  # omit if the cluster does not require it
+export SMOKE_GPUS=4
+
+bash scripts/submit_smoke_test.sh
+```
+
+The submitter prints the job id and exact monitoring commands. Slurm stdout
+contains environment diagnostics, NCCL information and JSON training metrics;
+stderr contains nested progress bars for generation, old/reference
+log-probabilities, inner adapter updates, query forwards, outer updates and
+validation. Monitor them with:
+
+```bash
+squeue -j JOB_ID
+tail -f "$HOME/meta-rlvr/logs/smoke-JOB_ID.err"
+tail -f "$HOME/meta-rlvr/logs/smoke-JOB_ID.out"
+```
+
 ## Launch
 
 The generation length is deliberately required rather than inferred. It must

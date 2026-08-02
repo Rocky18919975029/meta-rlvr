@@ -149,6 +149,9 @@ class BilevelGRPO:
         support: RolloutGroup,
         advantages: Tensor,
         fast_parameters: Mapping[str, Tensor],
+        *,
+        show_progress: bool,
+        progress_description: str,
     ) -> tuple[ParameterDict, GRPOLossOutput]:
         """Differentiate rewards while stopping the policy-gradient Jacobian.
 
@@ -173,7 +176,18 @@ class BilevelGRPO:
         }
 
         response_outputs: list[GRPOLossOutput] = []
-        for response_index in range(advantages.numel()):
+        response_indices = range(advantages.numel())
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            response_indices = tqdm(
+                response_indices,
+                total=advantages.numel(),
+                desc=progress_description,
+                unit="response",
+                leave=True,
+            )
+        for response_index in response_indices:
             current_logprobs = token_logprobs(
                 self.policy,
                 support,
@@ -280,6 +294,8 @@ class BilevelGRPO:
         *,
         differentiable: bool = True,
         supervise_confidence: bool = True,
+        show_progress: bool = False,
+        progress_prefix: str = "adaptation",
     ) -> TaskAdaptation:
         if supervise_confidence and support.verifier_rewards is None:
             raise ValueError(
@@ -314,7 +330,7 @@ class BilevelGRPO:
         )
         inner_outputs: list[GRPOLossOutput] = []
 
-        for _ in range(self.inner_config.num_iterations):
+        for inner_iteration in range(self.inner_config.num_iterations):
             names = tuple(fast_parameters)
             if (
                 not differentiable
@@ -324,6 +340,11 @@ class BilevelGRPO:
                     support,
                     advantages,
                     fast_parameters,
+                    show_progress=show_progress,
+                    progress_description=(
+                        f"{progress_prefix}: inner "
+                        f"{inner_iteration + 1}/{self.inner_config.num_iterations}"
+                    ),
                 )
             else:
                 current_logprobs = chunked_token_logprobs(
@@ -332,6 +353,11 @@ class BilevelGRPO:
                     fast_parameters=fast_parameters,
                     micro_batch_size=self.policy_micro_batch_size,
                     activation_checkpointing=True,
+                    show_progress=show_progress,
+                    progress_description=(
+                        f"{progress_prefix}: exact inner forward "
+                        f"{inner_iteration + 1}/{self.inner_config.num_iterations}"
+                    ),
                 )
                 inner_output = grpo_policy_loss(
                     current_logprobs,
@@ -388,11 +414,18 @@ class BilevelGRPO:
         initial_fast_parameters: Mapping[str, Tensor],
         *,
         adaptation: TaskAdaptation | None = None,
+        show_progress: bool = False,
+        progress_prefix: str = "outer",
     ) -> TaskOuterLoss:
         if query.verifier_rewards is None:
             raise ValueError("Query verifier rewards are required for the meta loss.")
         if adaptation is None:
-            adaptation = self.adapt_task(support, initial_fast_parameters)
+            adaptation = self.adapt_task(
+                support,
+                initial_fast_parameters,
+                show_progress=show_progress,
+                progress_prefix=progress_prefix,
+            )
         if adaptation.confidence_loss is None:
             raise ValueError(
                 "Outer training requires an adaptation with confidence supervision."
@@ -404,6 +437,8 @@ class BilevelGRPO:
             fast_parameters=adaptation.fast_parameters,
             micro_batch_size=self.policy_micro_batch_size,
             activation_checkpointing=True,
+            show_progress=show_progress,
+            progress_description=f"{progress_prefix}: query forward",
         )
         query_advantages = group_advantages(
             query.verifier_rewards.detach(),

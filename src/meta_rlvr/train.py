@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import torch
+from tqdm.auto import tqdm
 
 from .bilevel import BilevelGRPO
 from .config import (
@@ -258,7 +259,14 @@ def _evaluate(
     confidence_model.eval()
     local_metrics = torch.zeros(6, device=accelerator.device, dtype=torch.float64)
     try:
-        for round_index in range(rounds):
+        round_indices = tqdm(
+            range(rounds),
+            desc=f"validation step {step}",
+            unit="round",
+            leave=True,
+            disable=not accelerator.is_main_process,
+        )
+        for round_index in round_indices:
             problem_index = (
                 round_index * accelerator.num_processes
                 + accelerator.process_index
@@ -266,16 +274,26 @@ def _evaluate(
             valid = problem_index < len(problems)
             problem = problems[problem_index] if valid else problems[0]
 
-            support = support_rollouts.generate(problem, initial_fast)
+            progress_prefix = f"validation {problem.uid}"
+            support = support_rollouts.generate(
+                problem,
+                initial_fast,
+                show_progress=accelerator.is_main_process,
+                progress_description=f"{progress_prefix} base",
+            )
             generation_adaptation = algorithm.adapt_task(
                 support,
                 initial_fast,
                 differentiable=False,
                 supervise_confidence=False,
+                show_progress=accelerator.is_main_process,
+                progress_prefix=f"{progress_prefix} adaptation",
             )
             query = query_rollouts.generate(
                 problem,
                 generation_adaptation.fast_parameters,
+                show_progress=accelerator.is_main_process,
+                progress_description=f"{progress_prefix} adapted",
             )
             del generation_adaptation
             base_rewards = verifier(
@@ -450,9 +468,26 @@ def main() -> None:
         for name, value in policy_bundle.initial_fast_parameters.items()
     }
 
-    for step in range(start_step, args.max_steps):
+    step_indices = tqdm(
+        range(start_step, args.max_steps),
+        total=args.max_steps - start_step,
+        desc="meta-training",
+        unit="step",
+        leave=True,
+        disable=not accelerator.is_main_process,
+    )
+    for step in step_indices:
         problem = _next_problem(local_problems, step=step, seed=args.seed)
-        support = support_rollouts.generate(problem, initial_fast)
+        step_indices.set_postfix_str(
+            f"problem={problem.uid} stage=support-rollout"
+        )
+        progress_prefix = f"train step {step + 1} problem {problem.uid}"
+        support = support_rollouts.generate(
+            problem,
+            initial_fast,
+            show_progress=accelerator.is_main_process,
+            progress_description=f"{progress_prefix} support",
+        )
         support_rewards = verifier(
             support.texts,
             problem.ground_truth,
@@ -463,7 +498,14 @@ def main() -> None:
             support = support.with_reference_logprobs(support.old_logprobs)
 
         cached_query = None
-        for outer_iteration in range(args.outer_iterations):
+        outer_iterations = tqdm(
+            range(args.outer_iterations),
+            desc=f"train step {step + 1}: outer updates",
+            unit="update",
+            leave=True,
+            disable=not accelerator.is_main_process,
+        )
+        for outer_iteration in outer_iterations:
             confidence_optimizer.zero_grad(set_to_none=True)
 
             if cached_query is None:
@@ -472,10 +514,14 @@ def main() -> None:
                     initial_fast,
                     differentiable=False,
                     supervise_confidence=False,
+                    show_progress=accelerator.is_main_process,
+                    progress_prefix=f"{progress_prefix} generation adaptation",
                 )
                 cached_query = query_rollouts.generate(
                     problem,
                     generation_adaptation.fast_parameters,
+                    show_progress=accelerator.is_main_process,
+                    progress_description=f"{progress_prefix} query",
                 )
                 del generation_adaptation
                 query_rewards = verifier(
@@ -488,16 +534,25 @@ def main() -> None:
                     cached_query = query_rollouts.add_reference_logprobs(
                         cached_query,
                         initial_fast,
+                        show_progress=accelerator.is_main_process,
+                        progress_description=f"{progress_prefix} query reference",
                     )
 
+            outer_iterations.set_postfix_str("stage=meta-forward")
             output = algorithm.outer_loss(
                 support,
                 cached_query,
                 initial_fast,
+                show_progress=accelerator.is_main_process,
+                progress_prefix=(
+                    f"{progress_prefix} outer {outer_iteration + 1}"
+                ),
             )
+            outer_iterations.set_postfix_str("stage=meta-backward")
             accelerator.backward(output.loss)
             accelerator.clip_grad_norm_(confidence_model.parameters(), args.max_grad_norm)
             confidence_optimizer.step()
+            outer_iterations.set_postfix_str("stage=metrics")
 
             metrics = torch.stack(
                 (

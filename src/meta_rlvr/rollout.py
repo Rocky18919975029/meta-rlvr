@@ -78,6 +78,9 @@ class TransformersRolloutEngine:
         self,
         problem: MathProblem,
         fast_parameters: Mapping[str, Tensor],
+        *,
+        show_progress: bool = False,
+        progress_description: str = "rollout",
     ) -> RolloutGroup:
         prompt = self.tokenizer.apply_chat_template(
             problem.conversation,
@@ -120,7 +123,22 @@ class TransformersRolloutEngine:
         try:
             with materialized_fast_parameters(self.model, fast_parameters):
                 with torch.no_grad():
-                    for start in range(0, self.group_size, self.generation_micro_batch_size):
+                    starts = range(
+                        0,
+                        self.group_size,
+                        self.generation_micro_batch_size,
+                    )
+                    progress_bar = None
+                    if show_progress:
+                        from tqdm.auto import tqdm
+
+                        progress_bar = tqdm(
+                            total=self.group_size,
+                            desc=f"{progress_description}: generate",
+                            unit="response",
+                            leave=True,
+                        )
+                    for start in starts:
                         batch_size = min(
                             self.generation_micro_batch_size,
                             self.group_size - start,
@@ -145,11 +163,21 @@ class TransformersRolloutEngine:
                         if sequences.shape[0] != batch_size:
                             raise ValueError("model.generate returned an unexpected batch size.")
                         generated_batches.append(sequences)
+                        if progress_bar is not None:
+                            progress_bar.update(batch_size)
+                    if progress_bar is not None:
+                        progress_bar.close()
 
                 sequences = self._right_pad_and_concatenate(generated_batches)
                 group = self._build_group(sequences, prompt_length)
                 with torch.no_grad():
-                    old_logprobs = self._unadapted_logprobs(group)
+                    old_logprobs = self._unadapted_logprobs(
+                        group,
+                        show_progress=show_progress,
+                        progress_description=(
+                            f"{progress_description}: old log-probabilities"
+                        ),
+                    )
                 group = replace(group, old_logprobs=old_logprobs)
         finally:
             self.model.train(was_training)
@@ -159,32 +187,56 @@ class TransformersRolloutEngine:
         self,
         group: RolloutGroup,
         reference_fast_parameters: Mapping[str, Tensor],
+        *,
+        show_progress: bool = False,
+        progress_description: str = "reference log-probabilities",
     ) -> RolloutGroup:
         was_training = self.model.training
         self.model.eval()
         try:
             with materialized_fast_parameters(self.model, reference_fast_parameters):
                 with torch.no_grad():
-                    reference = self._unadapted_logprobs(group)
+                    reference = self._unadapted_logprobs(
+                        group,
+                        show_progress=show_progress,
+                        progress_description=progress_description,
+                    )
         finally:
             self.model.train(was_training)
         return group.with_reference_logprobs(reference)
 
-    def _unadapted_logprobs(self, group: RolloutGroup) -> Tensor:
-        chunks = [
-            token_logprobs(
-                self.model,
-                group,
-                row_start=start,
-                row_end=min(
-                    start + self.logprob_micro_batch_size,
-                    group.group_size,
-                ),
-            ).detach()
-            for start in range(
-                0, group.group_size, self.logprob_micro_batch_size
+    def _unadapted_logprobs(
+        self,
+        group: RolloutGroup,
+        *,
+        show_progress: bool,
+        progress_description: str,
+    ) -> Tensor:
+        starts = range(0, group.group_size, self.logprob_micro_batch_size)
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            starts = tqdm(
+                starts,
+                total=(group.group_size + self.logprob_micro_batch_size - 1)
+                // self.logprob_micro_batch_size,
+                desc=progress_description,
+                unit="microbatch",
+                leave=True,
             )
-        ]
+        chunks = []
+        for start in starts:
+            chunks.append(
+                token_logprobs(
+                    self.model,
+                    group,
+                    row_start=start,
+                    row_end=min(
+                        start + self.logprob_micro_batch_size,
+                        group.group_size,
+                    ),
+                ).detach()
+            )
         return torch.cat(chunks, dim=0)
 
     def _right_pad_and_concatenate(self, batches: list[Tensor]) -> Tensor:
