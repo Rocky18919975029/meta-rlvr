@@ -92,7 +92,6 @@ def test_tiny_qwen_peft_supports_differentiable_bilevel_update() -> None:
     confidence = SequenceConfidenceModel(
         Qwen2Model(config),
         hidden_size=config.hidden_size,
-        zero_init_output=False,
     )
     initial_fast = trainable_parameter_state(
         policy, required_name_substring="lora_"

@@ -10,7 +10,8 @@ The policy and confidence model both initialize from
   adapter is updated in the inner loop;
 - the confidence model is a trainable Qwen backbone with the released Qwen
   reward-model head structure: `Linear -> ReLU -> Linear -> scalar` on the
-  last non-padding token;
+  last non-padding token; both Linear layers use Qwen's normal initialization
+  with `config.initializer_range` and zero biases;
 - there is no separate confidence pre-training stage.
 
 ## Objective

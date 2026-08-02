@@ -13,8 +13,6 @@ class SequenceConfidenceModel(nn.Module):
         self,
         backbone: nn.Module,
         hidden_size: int,
-        *,
-        zero_init_output: bool = True,
     ) -> None:
         super().__init__()
         if hidden_size <= 0:
@@ -29,16 +27,29 @@ class SequenceConfidenceModel(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size, 1),
         )
-        if zero_init_output:
-            nn.init.zeros_(self.score[-1].weight)
-            nn.init.zeros_(self.score[-1].bias)
+        initializer_range = getattr(self.config, "initializer_range", None)
+        if (
+            not isinstance(initializer_range, (int, float))
+            or initializer_range <= 0
+        ):
+            raise ValueError(
+                "Confidence backbone config must define a positive "
+                "initializer_range."
+            )
+        for module in self.score.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(
+                    module.weight,
+                    mean=0.0,
+                    std=float(initializer_range),
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     @classmethod
     def from_pretrained(
         cls,
         model_name_or_path: str,
-        *,
-        zero_init_output: bool = True,
         **model_kwargs: Any,
     ) -> "SequenceConfidenceModel":
         if not model_name_or_path:
@@ -52,7 +63,6 @@ class SequenceConfidenceModel(nn.Module):
         model = cls(
             backbone,
             hidden_size,
-            zero_init_output=zero_init_output,
         )
         try:
             reference_parameter = next(backbone.parameters())

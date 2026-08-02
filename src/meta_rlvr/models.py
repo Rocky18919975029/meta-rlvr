@@ -106,7 +106,6 @@ def load_confidence_model(
     model_name_or_path: str,
     *,
     dtype: str = "bfloat16",
-    zero_init_output: bool = True,
     gradient_checkpointing: bool = True,
     trust_remote_code: bool = False,
     model_kwargs: dict[str, Any] | None = None,
@@ -117,7 +116,6 @@ def load_confidence_model(
         raise ValueError(f"model_kwargs contains reserved keys: {sorted(forbidden)}")
     model = SequenceConfidenceModel.from_pretrained(
         model_name_or_path,
-        zero_init_output=zero_init_output,
         torch_dtype=_torch_dtype(dtype),
         trust_remote_code=trust_remote_code,
         **kwargs,

@@ -380,7 +380,6 @@ def main() -> None:
     confidence_model = load_confidence_model(
         args.confidence_model,
         dtype=args.dtype,
-        zero_init_output=True,
         trust_remote_code=args.trust_remote_code,
         model_kwargs=model_kwargs,
     )

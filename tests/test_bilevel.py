@@ -45,7 +45,10 @@ class ToyConfidenceBackbone(nn.Module):
     def __init__(self, vocabulary_size: int = 7, hidden_size: int = 5) -> None:
         super().__init__()
         self.embedding = nn.Embedding(vocabulary_size, hidden_size)
-        self.config = SimpleNamespace(hidden_size=hidden_size)
+        self.config = SimpleNamespace(
+            hidden_size=hidden_size,
+            initializer_range=0.02,
+        )
 
     def forward(self, input_ids, attention_mask, return_dict):
         assert return_dict
@@ -98,7 +101,6 @@ def test_meta_loss_backpropagates_through_inner_update_to_confidence() -> None:
     confidence = SequenceConfidenceModel(
         ToyConfidenceBackbone(),
         hidden_size=5,
-        zero_init_output=False,
     )
     initial_fast = trainable_parameter_state(policy)
     support = make_group(policy, torch.tensor([1.0, 0.0, 0.0]))
@@ -138,45 +140,11 @@ def test_meta_loss_backpropagates_through_inner_update_to_confidence() -> None:
     )
 
 
-def test_meta_gradient_is_live_at_zero_initialized_confidence_output() -> None:
-    torch.manual_seed(14)
-    policy = ToyPolicy()
-    confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5, zero_init_output=True
-    )
-    algorithm = BilevelGRPO(
-        policy=policy,
-        confidence_model=confidence,
-        inner_config=InnerLoopConfig(
-            num_iterations=1,
-            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
-        ),
-        meta_config=MetaLossConfig(
-            confidence=ConfidenceLossConfig(
-                bce_coefficient=0.0,
-                ranking_coefficient=0.0,
-            )
-        ),
-        query_advantage_config=AdvantageConfig(),
-        query_grpo_config=GRPOLossConfig(),
-    )
-    output = algorithm.outer_loss(
-        make_group(policy, torch.tensor([1.0, 0.0, 0.0])),
-        make_group(policy, torch.tensor([1.0, 0.0, 1.0])),
-        trainable_parameter_state(policy),
-    )
-    gradient = torch.autograd.grad(
-        output.loss, confidence.score[-1].weight
-    )[0]
-    assert torch.isfinite(gradient).all()
-    assert torch.any(gradient != 0)
-
-
 def test_first_order_inner_update_has_same_value_as_direct_policy_gradient() -> None:
     torch.manual_seed(9)
     policy = ToyPolicy()
     confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5, zero_init_output=False
+        ToyConfidenceBackbone(), hidden_size=5
     )
     initial_fast = trainable_parameter_state(policy)
     support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
@@ -249,7 +217,7 @@ def test_task_adapters_start_from_independent_fast_parameter_copies() -> None:
 def test_inference_adaptation_does_not_require_verifier_labels() -> None:
     policy = ToyPolicy()
     confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5, zero_init_output=False
+        ToyConfidenceBackbone(), hidden_size=5
     )
     support = replace(
         make_group(policy, torch.tensor([1.0, 0.0, 0.0])),
