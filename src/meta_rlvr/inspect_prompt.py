@@ -13,7 +13,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--parquet", type=Path, required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--row", type=int, default=0)
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--row", type=int)
+    selector.add_argument("--uid")
     parser.add_argument("--trust-remote-code", action="store_true")
     return parser.parse_args()
 
@@ -22,7 +24,7 @@ def main() -> None:
     args = parse_args()
     if not args.parquet.is_file():
         raise FileNotFoundError(args.parquet)
-    if args.row < 0:
+    if args.row is not None and args.row < 0:
         raise ValueError("row must be non-negative.")
 
     from datasets import load_dataset
@@ -33,11 +35,21 @@ def main() -> None:
         data_files=str(args.parquet),
         split="train",
     )
-    if args.row >= len(dataset):
+    row_index = 0 if args.row is None else args.row
+    if args.uid is not None:
+        matching_rows = [
+            index
+            for index, row in enumerate(dataset)
+            if str(row["extra_info"]["index"]) == args.uid
+        ]
+        if not matching_rows:
+            raise KeyError(f"No dataset row has uid={args.uid!r}.")
+        row_index = matching_rows[0]
+    if row_index >= len(dataset):
         raise IndexError(
-            f"row {args.row} is outside a dataset with {len(dataset)} rows."
+            f"row {row_index} is outside a dataset with {len(dataset)} rows."
         )
-    problem = parse_dapo_row(dataset[args.row])
+    problem = parse_dapo_row(dataset[row_index])
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
         local_files_only=True,
@@ -58,7 +70,7 @@ def main() -> None:
     )
 
     print("=== DATASET ROW ===")
-    print(f"row: {args.row}")
+    print(f"row: {row_index}")
     print(f"uid: {problem.uid}")
     print(f"data_source: {problem.data_source}")
     print(f"ground_truth: {problem.ground_truth}")

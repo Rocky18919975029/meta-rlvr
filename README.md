@@ -200,6 +200,9 @@ python -m meta_rlvr.inspect_prompt \
   --row 0
 ```
 
+Use `--uid <extra_info.index>` instead of `--row` to inspect the exact problem
+identifier printed in a training progress line.
+
 ## Slurm smoke test
 
 The configured HPC artifacts are:
