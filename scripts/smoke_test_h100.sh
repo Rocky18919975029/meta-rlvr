@@ -37,8 +37,9 @@ if [[ ! -f "${ACCELERATE_CONFIG}" ]]; then
   exit 2
 fi
 
+RUN_LABEL="${META_RLVR_RUN_LABEL:-smoke}"
 RUN_TAG="${SLURM_JOB_ID:-manual-$(date +%Y%m%d-%H%M%S)}"
-RUN_DIR="${META_RLVR_OUTPUT_DIR%/}/smoke-${RUN_TAG}"
+RUN_DIR="${META_RLVR_OUTPUT_DIR%/}/${RUN_LABEL}-${RUN_TAG}"
 mkdir -p "${RUN_DIR}"
 
 export HF_HUB_OFFLINE=1
@@ -50,7 +51,7 @@ export TQDM_MININTERVAL="${TQDM_MININTERVAL:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-echo "[$(date --iso-8601=seconds)] starting Meta-RLVR distributed smoke test"
+echo "[$(date --iso-8601=seconds)] starting Meta-RLVR ${RUN_LABEL} test"
 echo "job_id=${SLURM_JOB_ID:-manual}"
 echo "host=$(hostname)"
 echo "project=${META_RLVR_PROJECT_DIR}"
@@ -112,17 +113,17 @@ accelerate launch \
   --policy-model "${META_RLVR_MODEL_PATH}" \
   --confidence-model "${META_RLVR_MODEL_PATH}" \
   --attn-implementation sdpa \
-  --max-steps 1 \
-  --save-steps 1 \
-  --support-group-size 2 \
-  --query-group-size 2 \
-  --generation-micro-batch-size 1 \
-  --policy-micro-batch-size 1 \
-  --confidence-micro-batch-size 1 \
+  --max-steps "${SMOKE_MAX_STEPS:-1}" \
+  --save-steps "${SMOKE_SAVE_STEPS:-1}" \
+  --support-group-size "${SMOKE_SUPPORT_GROUP_SIZE:-2}" \
+  --query-group-size "${SMOKE_QUERY_GROUP_SIZE:-2}" \
+  --generation-micro-batch-size "${SMOKE_GENERATION_MICRO_BATCH_SIZE:-1}" \
+  --policy-micro-batch-size "${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}" \
+  --confidence-micro-batch-size "${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}" \
   --max-new-tokens "${SMOKE_MAX_NEW_TOKENS:-128}" \
-  --inner-iterations 1 \
-  --outer-iterations 1 \
+  --inner-iterations "${SMOKE_INNER_ITERATIONS:-1}" \
+  --outer-iterations "${SMOKE_OUTER_ITERATIONS:-1}" \
   "$@"
 
-echo "[$(date --iso-8601=seconds)] smoke test completed successfully"
+echo "[$(date --iso-8601=seconds)] ${RUN_LABEL} test completed successfully"
 echo "output=${RUN_DIR}"

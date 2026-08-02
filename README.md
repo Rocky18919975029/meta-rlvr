@@ -229,6 +229,24 @@ export SMOKE_GPUS=4
 bash scripts/submit_smoke_test.sh
 ```
 
+After the minimal smoke test passes, submit a one-step test that can carry a
+nonzero meta signal with 3,072 generated tokens, support/query group size 16,
+two inner updates and two outer updates:
+
+```bash
+cd "$HOME/meta-rlvr"
+conda activate verl
+export SMOKE_GPUS=4
+bash scripts/submit_meta_meaningful_test.sh
+```
+
+This job defaults to an eight-hour Slurm limit and writes to
+`outputs/meta-meaningful-$SLURM_JOB_ID`, with progress and metrics in matching
+`logs/meta-meaningful-$SLURM_JOB_ID.{err,out}` files. It still performs only one
+meta-step; its purpose is to observe mixed verifier rewards, nonzero ranking and
+meta losses, two finite confidence-gradient updates, checkpoint saving and
+post-adaptation validation before launching a long training run.
+
 The equivalent explicit settings are:
 
 ```bash
