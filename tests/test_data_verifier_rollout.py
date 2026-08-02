@@ -71,7 +71,7 @@ def test_evaluation_loader_collapses_replicated_prompts(
 def test_official_dapo_verifier_wrapper_separates_rewards_and_correctness() -> None:
     verifier = DAPOMathVerifier()
     verification = verifier(
-        ("Reasoning. Answer: 42", "Reasoning. Answer: 41"),
+        ("Reasoning. \\boxed{42}", "Reasoning. \\boxed{41}"),
         "42",
         device=torch.device("cpu"),
     )

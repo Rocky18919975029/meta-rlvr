@@ -119,8 +119,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--meta-coefficient", type=float, default=1.0)
     parser.add_argument("--bce-coefficient", type=float, default=1.0)
     parser.add_argument("--ranking-coefficient", type=float, default=1.0)
-    parser.add_argument("--strict-box-verify", action="store_true")
+    parser.add_argument(
+        "--verifier-mode",
+        choices=["strict_box", "minerva"],
+        default="strict_box",
+    )
     parser.add_argument("--log-rollouts", action="store_true")
+    parser.add_argument("--rollout-only", action="store_true")
 
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--save-steps", type=int, default=50)
@@ -546,7 +551,9 @@ def main() -> None:
         generation_micro_batch_size=args.generation_micro_batch_size,
         logprob_micro_batch_size=args.policy_micro_batch_size,
     )
-    verifier = DAPOMathVerifier(strict_box_verify=args.strict_box_verify)
+    verifier = DAPOMathVerifier(
+        strict_box_verify=args.verifier_mode == "strict_box"
+    )
 
     all_problems = load_unique_dapo_problems(args.train_parquet)
     validation_problems = load_semantically_unique_dapo_problems(
@@ -668,6 +675,61 @@ def main() -> None:
                     max_new_tokens=query_rollouts.max_new_tokens,
                     eos_token_id=query_rollouts.tokenizer.eos_token_id,
                 )
+                if args.rollout_only:
+                    rollout_totals = torch.stack(
+                        (
+                            support.verifier_rewards.sum(),
+                            support.correctness_labels.sum(),
+                            torch.tensor(
+                                support.group_size,
+                                dtype=torch.float32,
+                                device=accelerator.device,
+                            ),
+                            cached_query.verifier_rewards.sum(),
+                            cached_query.correctness_labels.sum(),
+                            torch.tensor(
+                                cached_query.group_size,
+                                dtype=torch.float32,
+                                device=accelerator.device,
+                            ),
+                        )
+                    )
+                    rollout_totals = accelerator.reduce(
+                        rollout_totals, reduction="sum"
+                    )
+                    if accelerator.is_main_process:
+                        print(
+                            json.dumps(
+                                {
+                                    "rollout_only": True,
+                                    "step": step,
+                                    "support_mean_reward": (
+                                        rollout_totals[0] / rollout_totals[2]
+                                    ).item(),
+                                    "support_accuracy": (
+                                        rollout_totals[1] / rollout_totals[2]
+                                    ).item(),
+                                    "query_mean_reward": (
+                                        rollout_totals[3] / rollout_totals[5]
+                                    ).item(),
+                                    "query_accuracy": (
+                                        rollout_totals[4] / rollout_totals[5]
+                                    ).item(),
+                                    "num_problems": accelerator.num_processes,
+                                    "support_responses": int(
+                                        rollout_totals[2].item()
+                                    ),
+                                    "query_responses": int(
+                                        rollout_totals[5].item()
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                    accelerator.wait_for_everyone()
+                    accelerator.end_training()
+                    return
                 if args.outer_kl_coefficient > 0:
                     cached_query = query_rollouts.add_reference_logprobs(
                         cached_query,

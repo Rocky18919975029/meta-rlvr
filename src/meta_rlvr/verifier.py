@@ -20,7 +20,7 @@ class VerificationBatch:
 class DAPOMathVerifier:
     """Strict wrapper around the official DAPO math verifier."""
 
-    def __init__(self, *, strict_box_verify: bool = False) -> None:
+    def __init__(self, *, strict_box_verify: bool = True) -> None:
         self.strict_box_verify = strict_box_verify
 
     def __call__(

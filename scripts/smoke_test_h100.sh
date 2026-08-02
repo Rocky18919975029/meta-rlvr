@@ -107,6 +107,9 @@ EXTRA_TRAIN_ARGS=()
 if [[ "${SMOKE_LOG_ROLLOUTS:-0}" == "1" ]]; then
   EXTRA_TRAIN_ARGS+=(--log-rollouts)
 fi
+if [[ "${SMOKE_ROLLOUT_ONLY:-0}" == "1" ]]; then
+  EXTRA_TRAIN_ARGS+=(--rollout-only)
+fi
 accelerate launch \
   --config_file "${ACCELERATE_CONFIG}" \
   -m meta_rlvr.train \

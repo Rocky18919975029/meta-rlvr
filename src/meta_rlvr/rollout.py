@@ -20,6 +20,8 @@ class TransformersRolloutEngine:
         "attention_mask",
         "num_return_sequences",
         "return_dict_in_generate",
+        "synced_gpus",
+        "use_cache",
     }
 
     def __init__(
@@ -155,6 +157,11 @@ class TransformersRolloutEngine:
                             num_return_sequences=1,
                             pad_token_id=self.tokenizer.pad_token_id,
                             eos_token_id=self.tokenizer.eos_token_id,
+                            use_cache=True,
+                            # The frozen policy is replicated, not FSDP-sharded;
+                            # ranks therefore decode independently without waiting
+                            # for the longest completion on another rank.
+                            synced_gpus=False,
                             return_dict_in_generate=False,
                             **self.generation_kwargs,
                         )

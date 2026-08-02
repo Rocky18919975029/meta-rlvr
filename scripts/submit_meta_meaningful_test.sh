@@ -9,7 +9,7 @@ export META_RLVR_VALIDATION_PARQUET="${META_RLVR_VALIDATION_PARQUET:-/data/user/
 export META_RLVR_OUTPUT_DIR="${META_RLVR_OUTPUT_DIR:-${META_RLVR_PROJECT_DIR}/outputs}"
 export SLURM_PARTITION="${SLURM_PARTITION:-acd_u}"
 
-export META_RLVR_RUN_LABEL="meta-meaningful"
+export META_RLVR_RUN_LABEL="${META_RLVR_RUN_LABEL:-meta-meaningful}"
 export SMOKE_MAX_STEPS=1
 export SMOKE_SAVE_STEPS=1
 export SMOKE_MAX_NEW_TOKENS=3072
@@ -17,7 +17,7 @@ export SMOKE_SUPPORT_GROUP_SIZE=16
 export SMOKE_QUERY_GROUP_SIZE=16
 export SMOKE_INNER_ITERATIONS=2
 export SMOKE_OUTER_ITERATIONS=2
-export SMOKE_GENERATION_MICRO_BATCH_SIZE=1
+export SMOKE_GENERATION_MICRO_BATCH_SIZE=4
 export SMOKE_POLICY_MICRO_BATCH_SIZE=1
 export SMOKE_CONFIDENCE_MICRO_BATCH_SIZE=1
 export SMOKE_LOG_ROLLOUTS=1
@@ -43,12 +43,12 @@ LOG_DIR="${META_RLVR_PROJECT_DIR%/}/logs"
 mkdir -p "${LOG_DIR}" "${META_RLVR_OUTPUT_DIR}"
 
 SBATCH_ARGS=(
-  --job-name="meta-rlvr-meaningful"
+  --job-name="meta-rlvr-${META_RLVR_RUN_LABEL}"
   --partition="${SLURM_PARTITION}"
   --gres="${SLURM_GRES:-gpu:${SMOKE_GPUS}}"
   --time="${SLURM_TIME:-08:00:00}"
-  --output="${LOG_DIR}/meta-meaningful-%j.out"
-  --error="${LOG_DIR}/meta-meaningful-%j.err"
+  --output="${LOG_DIR}/${META_RLVR_RUN_LABEL}-%j.out"
+  --error="${LOG_DIR}/${META_RLVR_RUN_LABEL}-%j.err"
   --export=ALL
 )
 if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
@@ -66,9 +66,9 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: max_new_tokens=3072 K=16 inner=2 outer=2 gpus=${SMOKE_GPUS}"
-echo "stdout: ${LOG_DIR}/meta-meaningful-${job_id}.out"
-echo "stderr/progress: ${LOG_DIR}/meta-meaningful-${job_id}.err"
+echo "configuration: max_new_tokens=3072 K=16 inner=2 outer=2 generation_microbatch=4 gpus=${SMOKE_GPUS}"
+echo "stdout: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"
+echo "stderr/progress: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
 echo "queue: squeue -j ${job_id}"
-echo "progress: tail -F ${LOG_DIR}/meta-meaningful-${job_id}.err"
-echo "metrics: tail -F ${LOG_DIR}/meta-meaningful-${job_id}.out"
+echo "progress: tail -F ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
+echo "metrics: tail -F ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"

@@ -230,7 +230,28 @@ export SMOKE_GPUS=4
 bash scripts/submit_smoke_test.sh
 ```
 
-After the minimal smoke test passes, submit a one-step test that can carry a
+Training defaults to the official DAPO strict-box verifier. The `minerva` path
+is retained only as an explicit `--verifier-mode minerva` ablation.
+
+Before testing outer optimization, run the two-rollout path by itself:
+
+```bash
+cd "$HOME/meta-rlvr"
+conda activate verl
+export SMOKE_GPUS=4
+bash scripts/submit_rollout_test.sh
+```
+
+This generates support K=16, performs two confidence-guided inner updates and
+generates query K=16, then exits before outer backward, checkpointing and
+validation. Each rank generates four responses concurrently, so four H100s
+decode 16 sequences at once globally. Autoregressive generation explicitly
+uses the KV cache; replicated policy ranks decode independently, while the
+confidence model remains FSDP-sharded. Full responses and strict-box verifier
+predictions are written to per-rank JSONL files under
+`outputs/rollout-test-$SLURM_JOB_ID`.
+
+After the rollout-only test passes, submit a one-step test that can carry a
 nonzero meta signal with 3,072 generated tokens, support/query group size 16,
 two inner updates and two outer updates:
 
