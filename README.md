@@ -163,23 +163,36 @@ first distributed check.
 
 ## Slurm smoke test
 
-On the HPC, set the cluster-specific partition and paths. `SLURM_ACCOUNT` and
-`SLURM_QOS` are optional; override `SLURM_GRES` if this cluster names H100s
-differently from `gpu:h100:4`.
+The configured HPC artifacts are:
+
+```text
+full training: /data/user/zhongal/data/reschedule/DAPO-Math-17k.parquet
+smoke subset:  /data/user/zhongal/data/reschedule/DAPO-Math-17k.filtered.seed42.sample1536.parquet
+validation:    /data/user/zhongal/data/reschedule/aime24.parquet
+model:         /data/user/zhongal/.cache/qwen2.5-math-7b-local
+```
+
+The smoke submitter uses the 1,536-problem subset by default. These paths,
+`$HOME/meta-rlvr`, `$HOME/venvs/meta-rlvr` and the output directory are already
+encoded as overridable defaults. Only set the cluster-specific partition.
+`SLURM_ACCOUNT` and `SLURM_QOS` are optional; override `SLURM_GRES` if this
+cluster names H100s differently from `gpu:h100:4`.
 
 ```bash
 cd "$HOME/meta-rlvr"
-export META_RLVR_PROJECT_DIR="$HOME/meta-rlvr"
-export META_RLVR_VENV="$HOME/venvs/meta-rlvr"
-export META_RLVR_MODEL_PATH="$HOME/meta-rlvr/artifacts/models/Qwen2.5-Math-7B"
-export META_RLVR_TRAIN_PARQUET="$HOME/meta-rlvr/artifacts/data/DAPO-17k.parquet"
-export META_RLVR_VALIDATION_PARQUET="$HOME/meta-rlvr/artifacts/data/AIME24.parquet"
-export META_RLVR_OUTPUT_DIR="$HOME/meta-rlvr/outputs"
 export SLURM_PARTITION=YOUR_H100_PARTITION
 export SLURM_ACCOUNT=YOUR_ACCOUNT  # omit if the cluster does not require it
 export SMOKE_GPUS=4
 
 bash scripts/submit_smoke_test.sh
+```
+
+For a full training launch, use the complete DAPO file explicitly:
+
+```bash
+export META_RLVR_TRAIN_PARQUET=/data/user/zhongal/data/reschedule/DAPO-Math-17k.parquet
+export META_RLVR_VALIDATION_PARQUET=/data/user/zhongal/data/reschedule/aime24.parquet
+export META_RLVR_MODEL_PATH=/data/user/zhongal/.cache/qwen2.5-math-7b-local
 ```
 
 The submitter prints the job id and exact monitoring commands. Slurm stdout
@@ -208,6 +221,7 @@ Example for four H100s:
 ```bash
 export META_RLVR_TRAIN_PARQUET=/path/to/DAPO-17k.parquet
 export META_RLVR_VALIDATION_PARQUET=/path/to/AIME24.parquet
+export META_RLVR_MODEL_PATH=/path/to/Qwen2.5-Math-7B
 export META_RLVR_OUTPUT_DIR=/path/to/output
 export META_RLVR_MAX_NEW_TOKENS=3072
 

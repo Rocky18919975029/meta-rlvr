@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${META_RLVR_PROJECT_DIR:?Set META_RLVR_PROJECT_DIR to the absolute HPC project directory}"
-: "${META_RLVR_VENV:?Set META_RLVR_VENV to the absolute Linux virtual environment directory}"
-: "${META_RLVR_MODEL_PATH:?Set META_RLVR_MODEL_PATH to the offline model directory}"
-: "${META_RLVR_TRAIN_PARQUET:?Set META_RLVR_TRAIN_PARQUET to DAPO-17k.parquet}"
-: "${META_RLVR_VALIDATION_PARQUET:?Set META_RLVR_VALIDATION_PARQUET to AIME24.parquet}"
-: "${META_RLVR_OUTPUT_DIR:?Set META_RLVR_OUTPUT_DIR to an output base directory}"
 : "${SLURM_PARTITION:?Set SLURM_PARTITION to the cluster's H100 partition}"
+
+export META_RLVR_PROJECT_DIR="${META_RLVR_PROJECT_DIR:-${HOME}/meta-rlvr}"
+export META_RLVR_VENV="${META_RLVR_VENV:-${HOME}/venvs/meta-rlvr}"
+export META_RLVR_MODEL_PATH="${META_RLVR_MODEL_PATH:-/data/user/zhongal/.cache/qwen2.5-math-7b-local}"
+export META_RLVR_TRAIN_PARQUET="${META_RLVR_TRAIN_PARQUET:-/data/user/zhongal/data/reschedule/DAPO-Math-17k.filtered.seed42.sample1536.parquet}"
+export META_RLVR_VALIDATION_PARQUET="${META_RLVR_VALIDATION_PARQUET:-/data/user/zhongal/data/reschedule/aime24.parquet}"
+export META_RLVR_OUTPUT_DIR="${META_RLVR_OUTPUT_DIR:-${META_RLVR_PROJECT_DIR}/outputs}"
 
 SMOKE_GPUS="${SMOKE_GPUS:-4}"
 if [[ "${SMOKE_GPUS}" != "4" && "${SMOKE_GPUS}" != "8" ]]; then
