@@ -79,6 +79,7 @@ def test_official_dapo_verifier_wrapper_separates_rewards_and_correctness() -> N
     torch.testing.assert_close(
         verification.correctness, torch.tensor([1.0, 0.0])
     )
+    assert verification.predictions == ("42", "41")
 
 
 class ToyTokenizer:

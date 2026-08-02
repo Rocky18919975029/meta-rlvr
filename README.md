@@ -248,6 +248,14 @@ meta-step; its purpose is to observe mixed verifier rewards, nonzero ranking and
 meta losses, two finite confidence-gradient updates, checkpoint saving and
 post-adaptation validation before launching a long training run.
 
+The meaningful test also writes one JSONL file per distributed rank:
+`rollouts-rank-$RANK.jsonl`. Every record contains the full response, completion
+length, length-limit flag, verifier-extracted prediction, official `-1/+1`
+reward and binary correctness label. Checkpointing drops completed rollout
+tensors and confidence gradients, synchronizes CUDA and empties the caching
+allocator before the FSDP save; stdout reports allocated, reserved and peak GPU
+memory at that boundary.
+
 The equivalent explicit settings are:
 
 ```bash

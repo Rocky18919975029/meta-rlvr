@@ -103,6 +103,10 @@ if not torch.cuda.is_available():
 PY
 
 echo "[$(date --iso-8601=seconds)] launching ${SMOKE_GPUS} distributed workers"
+EXTRA_TRAIN_ARGS=()
+if [[ "${SMOKE_LOG_ROLLOUTS:-0}" == "1" ]]; then
+  EXTRA_TRAIN_ARGS+=(--log-rollouts)
+fi
 accelerate launch \
   --config_file "${ACCELERATE_CONFIG}" \
   -m meta_rlvr.train \
@@ -123,6 +127,7 @@ accelerate launch \
   --max-new-tokens "${SMOKE_MAX_NEW_TOKENS:-128}" \
   --inner-iterations "${SMOKE_INNER_ITERATIONS:-1}" \
   --outer-iterations "${SMOKE_OUTER_ITERATIONS:-1}" \
+  "${EXTRA_TRAIN_ARGS[@]}" \
   "$@"
 
 echo "[$(date --iso-8601=seconds)] ${RUN_LABEL} test completed successfully"

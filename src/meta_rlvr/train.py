@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import random
@@ -27,7 +28,8 @@ from .data import (
 )
 from .models import load_confidence_model, load_policy_with_lora
 from .rollout import TransformersRolloutEngine
-from .verifier import DAPOMathVerifier
+from .types import RolloutGroup
+from .verifier import DAPOMathVerifier, VerificationBatch
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,6 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bce-coefficient", type=float, default=1.0)
     parser.add_argument("--ranking-coefficient", type=float, default=1.0)
     parser.add_argument("--strict-box-verify", action="store_true")
+    parser.add_argument("--log-rollouts", action="store_true")
 
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--save-steps", type=int, default=50)
@@ -240,6 +243,81 @@ def _write_run_config(args: argparse.Namespace, output_dir: Path, accelerator) -
     path.write_text(json.dumps(serializable, indent=2, sort_keys=True) + "\n")
 
 
+def _append_rollout_diagnostics(
+    path: Path | None,
+    *,
+    step: int,
+    phase: str,
+    problem: MathProblem,
+    group: RolloutGroup,
+    verification: VerificationBatch,
+    max_new_tokens: int,
+    eos_token_id: int,
+) -> None:
+    if path is None:
+        return
+    completion_lengths = group.completion_mask.sum(dim=1).tolist()
+    if len(verification.predictions) != group.group_size:
+        raise ValueError("Verifier predictions must match rollout group size.")
+    with path.open("a", encoding="utf-8") as stream:
+        for response_index, response in enumerate(group.texts):
+            completion_tokens = int(completion_lengths[response_index])
+            completion_ids = group.input_ids[response_index, 1:][
+                group.completion_mask[response_index]
+            ]
+            ended_with_eos = int(completion_ids[-1].item()) == eos_token_id
+            record = {
+                "step": step,
+                "phase": phase,
+                "problem_uid": problem.uid,
+                "data_source": problem.data_source,
+                "ground_truth": problem.ground_truth,
+                "response_index": response_index,
+                "completion_tokens": completion_tokens,
+                "ended_with_eos": ended_with_eos,
+                "hit_max_new_tokens": (
+                    completion_tokens == max_new_tokens and not ended_with_eos
+                ),
+                "prediction": verification.predictions[response_index],
+                "reward": verification.rewards[response_index].item(),
+                "correct": verification.correctness[response_index].item(),
+                "response": response,
+            }
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        stream.flush()
+
+
+def _prepare_for_checkpoint(confidence_optimizer, accelerator) -> None:
+    confidence_optimizer.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.cuda.synchronize(accelerator.device)
+    torch.cuda.empty_cache()
+    accelerator.wait_for_everyone()
+
+    memory = torch.tensor(
+        (
+            torch.cuda.memory_allocated(accelerator.device),
+            torch.cuda.memory_reserved(accelerator.device),
+            torch.cuda.max_memory_allocated(accelerator.device),
+        ),
+        dtype=torch.float64,
+        device=accelerator.device,
+    )
+    memory = accelerator.reduce(memory, reduction="max") / 1024**3
+    if accelerator.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "checkpoint/max_allocated_gib": memory[0].item(),
+                    "checkpoint/max_reserved_gib": memory[1].item(),
+                    "checkpoint/peak_allocated_gib": memory[2].item(),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
 def _evaluate(
     *,
     step: int,
@@ -251,6 +329,7 @@ def _evaluate(
     initial_fast,
     confidence_model,
     accelerator,
+    rollout_log_path: Path | None,
 ) -> None:
     if not problems:
         raise ValueError("Validation problems cannot be empty.")
@@ -307,6 +386,26 @@ def _evaluate(
                 device=accelerator.device,
             )
             if valid:
+                _append_rollout_diagnostics(
+                    rollout_log_path,
+                    step=step,
+                    phase="validation_base",
+                    problem=problem,
+                    group=support,
+                    verification=base_verification,
+                    max_new_tokens=support_rollouts.max_new_tokens,
+                    eos_token_id=support_rollouts.tokenizer.eos_token_id,
+                )
+                _append_rollout_diagnostics(
+                    rollout_log_path,
+                    step=step,
+                    phase="validation_adapted",
+                    problem=problem,
+                    group=query,
+                    verification=adapted_verification,
+                    max_new_tokens=query_rollouts.max_new_tokens,
+                    eos_token_id=query_rollouts.tokenizer.eos_token_id,
+                )
                 local_metrics += torch.tensor(
                     (
                         base_verification.correctness.sum().item(),
@@ -362,6 +461,12 @@ def main() -> None:
         )
     set_seed(args.seed, device_specific=True)
     _write_run_config(args, args.output_dir, accelerator)
+    accelerator.wait_for_everyone()
+    rollout_log_path = (
+        args.output_dir / f"rollouts-rank-{accelerator.process_index}.jsonl"
+        if args.log_rollouts
+        else None
+    )
 
     model_kwargs = {"attn_implementation": args.attn_implementation}
     target_modules = tuple(
@@ -499,6 +604,16 @@ def main() -> None:
             support_verification.rewards,
             support_verification.correctness,
         )
+        _append_rollout_diagnostics(
+            rollout_log_path,
+            step=step,
+            phase="train_support",
+            problem=problem,
+            group=support,
+            verification=support_verification,
+            max_new_tokens=support_rollouts.max_new_tokens,
+            eos_token_id=support_rollouts.tokenizer.eos_token_id,
+        )
         if args.inner_kl_coefficient > 0:
             support = support.with_reference_logprobs(support.old_logprobs)
 
@@ -542,6 +657,16 @@ def main() -> None:
                 cached_query = cached_query.with_verification(
                     query_verification.rewards,
                     query_verification.correctness,
+                )
+                _append_rollout_diagnostics(
+                    rollout_log_path,
+                    step=step,
+                    phase="train_query",
+                    problem=problem,
+                    group=cached_query,
+                    verification=query_verification,
+                    max_new_tokens=query_rollouts.max_new_tokens,
+                    eos_token_id=query_rollouts.tokenizer.eos_token_id,
                 )
                 if args.outer_kl_coefficient > 0:
                     cached_query = query_rollouts.add_reference_logprobs(
@@ -614,8 +739,10 @@ def main() -> None:
                 )
             del output
 
+        del support, cached_query, support_verification, query_verification
+
         if (step + 1) % args.save_steps == 0:
-            accelerator.wait_for_everyone()
+            _prepare_for_checkpoint(confidence_optimizer, accelerator)
             accelerator.save_state(args.output_dir / f"checkpoint-{step + 1}")
 
         if args.eval_steps > 0 and (step + 1) % args.eval_steps == 0:
@@ -629,6 +756,7 @@ def main() -> None:
                 initial_fast=initial_fast,
                 confidence_model=confidence_model,
                 accelerator=accelerator,
+                rollout_log_path=rollout_log_path,
             )
 
     if args.eval_steps == 0 or args.max_steps % args.eval_steps != 0:
@@ -642,9 +770,10 @@ def main() -> None:
             initial_fast=initial_fast,
             confidence_model=confidence_model,
             accelerator=accelerator,
+            rollout_log_path=rollout_log_path,
         )
 
-    accelerator.wait_for_everyone()
+    _prepare_for_checkpoint(confidence_optimizer, accelerator)
     accelerator.save_state(args.output_dir / "final")
 
 

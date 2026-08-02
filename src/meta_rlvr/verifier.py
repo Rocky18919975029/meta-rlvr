@@ -14,6 +14,7 @@ class VerificationBatch:
 
     rewards: Tensor
     correctness: Tensor
+    predictions: tuple[str | None, ...]
 
 
 class DAPOMathVerifier:
@@ -35,6 +36,7 @@ class DAPOMathVerifier:
             raise ValueError("ground_truth must be a non-empty string.")
         rewards = []
         correctness = []
+        predictions = []
         for response in responses:
             if not isinstance(response, str):
                 raise TypeError("Every response must be a string.")
@@ -45,11 +47,16 @@ class DAPOMathVerifier:
             )
             if set(result) != {"score", "acc", "pred"}:
                 raise ValueError("Unexpected DAPO verifier result schema.")
+            prediction = result["pred"]
+            if prediction is not None and not isinstance(prediction, str):
+                raise TypeError("DAPO verifier pred must be a string or None.")
             rewards.append(float(result["score"]))
             correctness.append(float(bool(result["acc"])))
+            predictions.append(prediction)
         return VerificationBatch(
             rewards=torch.tensor(rewards, dtype=torch.float32, device=device),
             correctness=torch.tensor(
                 correctness, dtype=torch.float32, device=device
             ),
+            predictions=tuple(predictions),
         )
