@@ -77,11 +77,29 @@ class BilevelGRPO:
         support: RolloutGroup,
         *,
         differentiable: bool,
+        show_progress: bool,
+        progress_description: str,
     ) -> Tensor:
         chunks: list[Tensor] = []
-        for start in range(
+        starts = range(
             0, support.group_size, self.confidence_micro_batch_size
-        ):
+        )
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            starts = tqdm(
+                starts,
+                total=(
+                    support.group_size
+                    + self.confidence_micro_batch_size
+                    - 1
+                )
+                // self.confidence_micro_batch_size,
+                desc=progress_description,
+                unit="microbatch",
+                leave=True,
+            )
+        for start in starts:
             end = min(
                 start + self.confidence_micro_batch_size,
                 support.group_size,
@@ -303,7 +321,10 @@ class BilevelGRPO:
             )
 
         confidence_logits = self._confidence_logits(
-            support, differentiable=differentiable
+            support,
+            differentiable=differentiable,
+            show_progress=show_progress,
+            progress_description=f"{progress_prefix}: confidence scoring",
         )
         confidence_probabilities = torch.sigmoid(confidence_logits)
         confidence_loss = None

@@ -488,6 +488,9 @@ def main() -> None:
             show_progress=accelerator.is_main_process,
             progress_description=f"{progress_prefix} support",
         )
+        step_indices.set_postfix_str(
+            f"problem={problem.uid} stage=support-verifier"
+        )
         support_verification = verifier(
             support.texts,
             problem.ground_truth,
@@ -512,6 +515,9 @@ def main() -> None:
             confidence_optimizer.zero_grad(set_to_none=True)
 
             if cached_query is None:
+                outer_iterations.set_postfix_str(
+                    "stage=generation-adaptation"
+                )
                 generation_adaptation = algorithm.adapt_task(
                     support,
                     initial_fast,
@@ -520,6 +526,7 @@ def main() -> None:
                     show_progress=accelerator.is_main_process,
                     progress_prefix=f"{progress_prefix} generation adaptation",
                 )
+                outer_iterations.set_postfix_str("stage=query-rollout")
                 cached_query = query_rollouts.generate(
                     problem,
                     generation_adaptation.fast_parameters,
@@ -527,6 +534,7 @@ def main() -> None:
                     progress_description=f"{progress_prefix} query",
                 )
                 del generation_adaptation
+                outer_iterations.set_postfix_str("stage=query-verifier")
                 query_verification = verifier(
                     cached_query.texts,
                     problem.ground_truth,
