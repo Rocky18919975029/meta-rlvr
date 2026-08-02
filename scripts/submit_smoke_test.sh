@@ -2,12 +2,21 @@
 set -euo pipefail
 
 export META_RLVR_PROJECT_DIR="${META_RLVR_PROJECT_DIR:-${HOME}/meta-rlvr}"
-export META_RLVR_VENV="${META_RLVR_VENV:-${HOME}/venvs/meta-rlvr}"
+export META_RLVR_CONDA_ENV="${META_RLVR_CONDA_ENV:-verl}"
 export META_RLVR_MODEL_PATH="${META_RLVR_MODEL_PATH:-/data/user/zhongal/.cache/qwen2.5-math-7b-local}"
 export META_RLVR_TRAIN_PARQUET="${META_RLVR_TRAIN_PARQUET:-/data/user/zhongal/data/reschedule/DAPO-Math-17k.filtered.seed42.sample1536.parquet}"
 export META_RLVR_VALIDATION_PARQUET="${META_RLVR_VALIDATION_PARQUET:-/data/user/zhongal/data/reschedule/aime24.parquet}"
 export META_RLVR_OUTPUT_DIR="${META_RLVR_OUTPUT_DIR:-${META_RLVR_PROJECT_DIR}/outputs}"
 export SLURM_PARTITION="${SLURM_PARTITION:-acd_u}"
+
+if [[ -n "${META_RLVR_CONDA_ENV}" && -z "${CONDA_EXE:-}" ]]; then
+  CONDA_EXE=$(type -P conda || true)
+  if [[ -z "${CONDA_EXE}" || ! -x "${CONDA_EXE}" ]]; then
+    echo "Cannot locate the conda executable in the submission shell." >&2
+    exit 2
+  fi
+  export CONDA_EXE
+fi
 
 SMOKE_GPUS="${SMOKE_GPUS:-4}"
 if [[ "${SMOKE_GPUS}" != "4" && "${SMOKE_GPUS}" != "8" ]]; then

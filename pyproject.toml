@@ -15,7 +15,6 @@ dependencies = [
     "safetensors>=0.4",
     "torch>=2.4",
     "transformers>=4.46",
-    "trl>=0.17",
     "tqdm>=4.66",
 ]
 
@@ -24,6 +23,7 @@ meta-rlvr-train = "meta_rlvr.train:main"
 
 [project.optional-dependencies]
 test = ["pytest>=7.4"]
+baselines = ["trl>=0.17"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

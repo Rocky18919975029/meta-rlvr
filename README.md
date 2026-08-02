@@ -146,7 +146,22 @@ rsync -ahP /local/path/Qwen2.5-Math-7B/ \
 A macOS virtual environment cannot be copied to the Linux HPC. Either use a
 cluster-provided PyTorch/CUDA environment, or build a wheelhouse on an
 internet-connected Linux x86_64 machine with matching Python/CUDA versions,
-then synchronize it to `meta-rlvr/artifacts/wheelhouse`. On the HPC:
+then synchronize it to `meta-rlvr/artifacts/wheelhouse`.
+
+The existing conda environment `verl` has been verified with Python 3.12,
+PyTorch 2.8.0+cu128, Transformers 4.56.1, PEFT 0.19.1, Accelerate 1.14.0,
+Datasets 5.0.0 and tqdm 4.68.3. It is the default HPC environment. Activate it
+without nesting it inside the temporary `meta-rlvr` venv, then install only the
+local package metadata:
+
+```bash
+conda activate verl
+cd "$HOME/meta-rlvr"
+python -m pip install --no-deps --no-build-isolation -e .
+```
+
+The optional TRL baseline extra is not needed by this custom bilevel trainer,
+which does not import `trl`. To use an offline venv instead:
 
 ```bash
 module load python cuda  # replace with the cluster's actual module names
@@ -173,7 +188,7 @@ model:         /data/user/zhongal/.cache/qwen2.5-math-7b-local
 ```
 
 The smoke submitter uses the 1,536-problem subset by default. These paths,
-`$HOME/meta-rlvr`, `$HOME/venvs/meta-rlvr` and the output directory are already
+`$HOME/meta-rlvr`, conda environment `verl` and the output directory are already
 encoded as overridable defaults. The detected Slurm defaults are partition
 `acd_u` and generic GRES `gpu:4`; `debug` is deliberately not used because its
 30-minute limit is too short for a reliable first run. `SLURM_ACCOUNT` and
@@ -181,6 +196,7 @@ encoded as overridable defaults. The detected Slurm defaults are partition
 
 ```bash
 cd "$HOME/meta-rlvr"
+export META_RLVR_CONDA_ENV=verl
 export SMOKE_GPUS=4
 
 bash scripts/submit_smoke_test.sh
