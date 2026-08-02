@@ -174,17 +174,23 @@ model:         /data/user/zhongal/.cache/qwen2.5-math-7b-local
 
 The smoke submitter uses the 1,536-problem subset by default. These paths,
 `$HOME/meta-rlvr`, `$HOME/venvs/meta-rlvr` and the output directory are already
-encoded as overridable defaults. Only set the cluster-specific partition.
-`SLURM_ACCOUNT` and `SLURM_QOS` are optional; override `SLURM_GRES` if this
-cluster names H100s differently from `gpu:h100:4`.
+encoded as overridable defaults. The detected Slurm defaults are partition
+`acd_u` and generic GRES `gpu:4`; `debug` is deliberately not used because its
+30-minute limit is too short for a reliable first run. `SLURM_ACCOUNT` and
+`SLURM_QOS` remain optional.
 
 ```bash
 cd "$HOME/meta-rlvr"
-export SLURM_PARTITION=YOUR_H100_PARTITION
-export SLURM_ACCOUNT=YOUR_ACCOUNT  # omit if the cluster does not require it
 export SMOKE_GPUS=4
 
 bash scripts/submit_smoke_test.sh
+```
+
+The equivalent explicit settings are:
+
+```bash
+export SLURM_PARTITION=acd_u
+export SLURM_GRES=gpu:4
 ```
 
 For a full training launch, use the complete DAPO file explicitly:
