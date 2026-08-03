@@ -106,6 +106,55 @@ echo "gpu_binding_source=${GPU_BINDING_SOURCE}"
 echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
 
 nvidia-smi
+if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
+  python - "${SMOKE_GPUS}" "${VLLM_GPU_MEMORY_UTILIZATION:-0.42}" <<'PY'
+import json
+import subprocess
+import sys
+
+expected_gpus = int(sys.argv[1])
+utilization = float(sys.argv[2])
+if not 0 < utilization < 1:
+    raise ValueError("VLLM_GPU_MEMORY_UTILIZATION must be between 0 and 1")
+
+result = subprocess.run(
+    [
+        "nvidia-smi",
+        "--query-gpu=index,memory.free,memory.total",
+        "--format=csv,noheader,nounits",
+    ],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+rows = []
+for line in result.stdout.splitlines():
+    index, free_mib, total_mib = (part.strip() for part in line.split(","))
+    rows.append(
+        {
+            "index": index,
+            "free_mib": int(free_mib),
+            "total_mib": int(total_mib),
+        }
+    )
+if len(rows) != expected_gpus:
+    raise RuntimeError(
+        f"nvidia-smi exposes {len(rows)} GPUs, expected {expected_gpus}: {rows}"
+    )
+for row in rows:
+    required_mib = utilization * row["total_mib"]
+    row["vllm_required_free_mib"] = required_mib
+    if row["free_mib"] < required_mib:
+        raise RuntimeError(
+            "Allocated GPU is already occupied before vLLM startup: "
+            f"GPU {row['index']} has {row['free_mib']} MiB free, but "
+            f"gpu_memory_utilization={utilization} requires at least "
+            f"{required_mib:.0f} MiB. Exclude this node or report it to "
+            "the cluster administrators."
+        )
+print(json.dumps({"vllm_gpu_memory_preflight": rows}, sort_keys=True), flush=True)
+PY
+fi
 python - <<'PY'
 import platform
 import os

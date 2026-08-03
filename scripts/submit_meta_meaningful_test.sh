@@ -58,6 +58,7 @@ export SLURM_CPUS_PER_TASK
 
 cd "${META_RLVR_PROJECT_DIR}"
 if [[ "${SMOKE_ROLLOUT_BACKEND}" == "vllm" ]]; then
+  export SLURM_EXCLUDE="${SLURM_EXCLUDE-ACD1-1}"
   echo "Checking vLLM environment before requesting GPUs..."
   python "${META_RLVR_PROJECT_DIR%/}/src/meta_rlvr/vllm_preflight.py"
 fi
@@ -80,6 +81,9 @@ if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
 fi
 if [[ -n "${SLURM_QOS:-}" ]]; then
   SBATCH_ARGS+=(--qos="${SLURM_QOS}")
+fi
+if [[ -n "${SLURM_EXCLUDE:-}" ]]; then
+  SBATCH_ARGS+=(--exclude="${SLURM_EXCLUDE}")
 fi
 
 submission=$(sbatch "${SBATCH_ARGS[@]}" scripts/slurm_smoke_test.sbatch)
