@@ -59,12 +59,14 @@ start_meta_rlvr_vllm_servers() {
   local replica_cache
   mkdir -p "${log_dir}"
 
-  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    IFS=',' read -r -a visible_devices <<<"${CUDA_VISIBLE_DEVICES}"
-    if [[ "${#visible_devices[@]}" -ne "${gpu_count}" ]]; then
-      echo "CUDA_VISIBLE_DEVICES exposes ${#visible_devices[@]} devices, expected ${gpu_count}." >&2
-      return 2
-    fi
+  if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    echo "CUDA_VISIBLE_DEVICES must identify the GPUs allocated by Slurm." >&2
+    return 2
+  fi
+  IFS=',' read -r -a visible_devices <<<"${CUDA_VISIBLE_DEVICES}"
+  if [[ "${#visible_devices[@]}" -ne "${gpu_count}" ]]; then
+    echo "CUDA_VISIBLE_DEVICES exposes ${#visible_devices[@]} devices, expected ${gpu_count}." >&2
+    return 2
   fi
 
   python - "${first_port}" "${gpu_count}" <<'PY'
@@ -89,7 +91,7 @@ PY
     port=$((first_port + gpu))
     url="http://127.0.0.1:${port}"
     urls+=("${url}")
-    cuda_device="${visible_devices[${gpu}]:-${gpu}}"
+    cuda_device="${visible_devices[${gpu}]}"
     replica_cache="${TMPDIR:-/tmp}/meta-rlvr-vllm-${SLURM_JOB_ID:-manual}/gpu-${gpu}"
     mkdir -p "${replica_cache}"
     echo "[$(date --iso-8601=seconds)] starting vLLM replica gpu=${cuda_device} url=${url}"

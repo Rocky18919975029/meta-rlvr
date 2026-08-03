@@ -39,6 +39,28 @@ case "${SMOKE_GPUS}" in
   *) echo "SMOKE_GPUS must be 1, 4, or 8, got ${SMOKE_GPUS}" >&2; exit 2 ;;
 esac
 
+GPU_BINDING_SOURCE="CUDA_VISIBLE_DEVICES"
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  if [[ -n "${SLURM_STEP_GPUS:-}" ]]; then
+    export CUDA_VISIBLE_DEVICES="${SLURM_STEP_GPUS}"
+    GPU_BINDING_SOURCE="SLURM_STEP_GPUS"
+  elif [[ -n "${SLURM_JOB_GPUS:-}" ]]; then
+    export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS}"
+    GPU_BINDING_SOURCE="SLURM_JOB_GPUS"
+  elif [[ -n "${GPU_DEVICE_ORDINAL:-}" ]]; then
+    export CUDA_VISIBLE_DEVICES="${GPU_DEVICE_ORDINAL}"
+    GPU_BINDING_SOURCE="GPU_DEVICE_ORDINAL"
+  else
+    echo "Slurm did not expose the allocated GPU IDs; refusing to guess physical GPU indices." >&2
+    exit 2
+  fi
+fi
+IFS=',' read -r -a META_RLVR_VISIBLE_GPUS <<<"${CUDA_VISIBLE_DEVICES}"
+if [[ "${#META_RLVR_VISIBLE_GPUS[@]}" -ne "${SMOKE_GPUS}" ]]; then
+  echo "${GPU_BINDING_SOURCE} exposes ${#META_RLVR_VISIBLE_GPUS[@]} GPUs, expected ${SMOKE_GPUS}: ${CUDA_VISIBLE_DEVICES}" >&2
+  exit 2
+fi
+
 for required_path in \
   "${META_RLVR_MODEL_PATH}" \
   "${META_RLVR_TRAIN_PARQUET}" \
@@ -78,7 +100,10 @@ echo "train_data=${META_RLVR_TRAIN_PARQUET}"
 echo "validation_data=${META_RLVR_VALIDATION_PARQUET}"
 echo "output=${RUN_DIR}"
 echo "gpus=${SMOKE_GPUS}"
-echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "slurm_job_gpus=${SLURM_JOB_GPUS:-unset}"
+echo "slurm_step_gpus=${SLURM_STEP_GPUS:-unset}"
+echo "gpu_binding_source=${GPU_BINDING_SOURCE}"
+echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
 
 nvidia-smi
 python - <<'PY'
