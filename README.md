@@ -292,15 +292,15 @@ conda activate verl
 bash scripts/submit_vllm_lifecycle_test.sh
 ```
 
-The conservative colocated allocation is 42% of each H100 for vLLM. Override it
-only after the single-H100 lifecycle test succeeds and peak memory is measured:
+The conservative colocated allocation is 30% of each H100 for vLLM. This leaves
+room for the FSDP confidence model and AdamW state after the first outer update:
 
 ```bash
 export SMOKE_GPUS=4
 bash scripts/submit_vllm_smoke_test.sh
 
 # Only after the short hybrid lifecycle test succeeds:
-export VLLM_GPU_MEMORY_UTILIZATION=0.42
+export VLLM_GPU_MEMORY_UTILIZATION=0.30
 export VLLM_MAX_NUM_SEQS=64
 export VLLM_MAX_LORAS=1
 bash scripts/submit_rollout_test.sh

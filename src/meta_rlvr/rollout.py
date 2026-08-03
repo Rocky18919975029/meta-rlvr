@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
 import shutil
@@ -446,6 +447,10 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             )
         try:
             self._save_adapter(adapter_dir, fast_parameters)
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+                torch.cuda.empty_cache()
             self._request_json("POST", "/wake_up?tags=weights")
             weights_awake = True
             load_response = self._request_text(

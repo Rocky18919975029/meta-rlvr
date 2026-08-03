@@ -107,7 +107,7 @@ echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
 
 nvidia-smi
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
-  python - "${SMOKE_GPUS}" "${VLLM_GPU_MEMORY_UTILIZATION:-0.42}" <<'PY'
+  python - "${SMOKE_GPUS}" "${VLLM_GPU_MEMORY_UTILIZATION:-0.30}" <<'PY'
 import json
 import subprocess
 import sys
@@ -255,6 +255,9 @@ trainer_status=$?
 set -e
 META_RLVR_TRAINER_PID=""
 if [[ "${trainer_status}" -ne 0 ]]; then
+  if declare -F _meta_rlvr_show_vllm_logs >/dev/null 2>&1; then
+    _meta_rlvr_show_vllm_logs
+  fi
   echo "Distributed trainer exited with status ${trainer_status}." >&2
   exit "${trainer_status}"
 fi

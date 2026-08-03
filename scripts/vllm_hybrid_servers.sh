@@ -111,7 +111,7 @@ PY
         --logprobs-mode raw_logprobs \
         --load-format safetensors \
         --tensor-parallel-size 1 \
-        --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.42}" \
+        --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.30}" \
         --max-model-len "${VLLM_MAX_MODEL_LEN:-4096}" \
         --max-num-seqs "${VLLM_MAX_NUM_SEQS:-64}" \
         --enable-prefix-caching \
