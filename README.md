@@ -279,6 +279,15 @@ launcher deliberately fixes vLLM `max_model_len=4096`. Do not set
 `VLLM_ALLOW_LONG_MAX_MODEL_LEN`; the training code separately rejects any
 prompt whose prompt tokens plus `max_new_tokens` exceed the same limit.
 
+Each colocated replica receives an independent node-local vLLM, TorchInductor,
+Triton and CUDA cache. This is required because every TP=1 server otherwise
+writes the same `rank_0_0` compile-cache paths concurrently. The launcher also
+defaults `VLLM_USE_FLASHINFER_SAMPLER=0`: the cluster's default host GCC is too
+old to JIT-build FlashInfer's sampling extension, while vLLM's native PyTorch
+sampler requires no such build. This changes only the sampling kernel, not the
+temperature/top-p distribution. FlashInfer can be re-enabled later after a
+GCC 9+ toolchain is loaded and its kernels are precompiled.
+
 After the rollout-only test passes, submit a one-step test that can carry a
 nonzero meta signal with 3,072 generated tokens, support/query group size 16,
 two inner updates and two outer updates:

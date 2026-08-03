@@ -25,6 +25,7 @@ start_meta_rlvr_vllm_servers() {
   local urls=()
   local visible_devices=()
   local cuda_device
+  local replica_cache
   mkdir -p "${log_dir}"
 
   if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -43,8 +44,15 @@ start_meta_rlvr_vllm_servers() {
     url="http://127.0.0.1:${port}"
     urls+=("${url}")
     cuda_device="${visible_devices[${gpu}]:-${gpu}}"
+    replica_cache="${TMPDIR:-/tmp}/meta-rlvr-vllm-${SLURM_JOB_ID:-manual}/gpu-${gpu}"
+    mkdir -p "${replica_cache}"
     echo "[$(date --iso-8601=seconds)] starting vLLM replica gpu=${cuda_device} url=${url}"
     CUDA_VISIBLE_DEVICES="${cuda_device}" \
+      VLLM_CACHE_ROOT="${replica_cache}/vllm" \
+      TORCHINDUCTOR_CACHE_DIR="${replica_cache}/torchinductor" \
+      TRITON_CACHE_DIR="${replica_cache}/triton" \
+      CUDA_CACHE_PATH="${replica_cache}/cuda" \
+      VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}" \
       python -m vllm.entrypoints.openai.api_server \
         --model "${META_RLVR_MODEL_PATH}" \
         --served-model-name meta-rlvr-base \
