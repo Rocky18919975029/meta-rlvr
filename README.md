@@ -274,6 +274,11 @@ export VLLM_MAX_LORAS=1
 bash scripts/submit_rollout_test.sh
 ```
 
+The local Qwen checkpoint declares `max_position_embeddings=4096`, so the
+launcher deliberately fixes vLLM `max_model_len=4096`. Do not set
+`VLLM_ALLOW_LONG_MAX_MODEL_LEN`; the training code separately rejects any
+prompt whose prompt tokens plus `max_new_tokens` exceed the same limit.
+
 After the rollout-only test passes, submit a one-step test that can carry a
 nonzero meta signal with 3,072 generated tokens, support/query group size 16,
 two inner updates and two outer updates:
