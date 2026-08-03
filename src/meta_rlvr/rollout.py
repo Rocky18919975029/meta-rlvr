@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -222,6 +223,45 @@ class TransformersRolloutEngine:
             self.model.train(was_training)
         return group
 
+    def generate_batch(
+        self,
+        problems: list[MathProblem],
+        fast_parameter_groups: list[Mapping[str, Tensor]],
+        *,
+        show_progress: bool = False,
+        progress_description: str = "rollout batch",
+    ) -> tuple[RolloutGroup, ...]:
+        if not problems:
+            raise ValueError("Rollout problem batch cannot be empty.")
+        if len(problems) != len(fast_parameter_groups):
+            raise ValueError(
+                "Each rollout problem must have one fast-parameter mapping."
+            )
+        indices = range(len(problems))
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            indices = tqdm(
+                indices,
+                total=len(problems),
+                desc=progress_description,
+                unit="problem",
+                leave=True,
+            )
+        groups = []
+        for index in indices:
+            groups.append(
+                self.generate(
+                    problems[index],
+                    fast_parameter_groups[index],
+                    show_progress=False,
+                    progress_description=(
+                        f"{progress_description} problem {index + 1}"
+                    ),
+                )
+            )
+        return tuple(groups)
+
     def add_reference_logprobs(
         self,
         group: RolloutGroup,
@@ -402,107 +442,167 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         show_progress: bool = False,
         progress_description: str = "rollout",
     ) -> RolloutGroup:
-        prompt = self.tokenizer.apply_chat_template(
-            problem.conversation,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        if not isinstance(prompt, str) or not prompt:
-            raise ValueError("Chat template must return a non-empty string.")
-        encoded = self.tokenizer(prompt, add_special_tokens=False)
-        prompt_ids = encoded.get("input_ids")
-        if not isinstance(prompt_ids, list) or not prompt_ids:
-            raise ValueError("Tokenizer must return a non-empty input_ids list.")
-        if not all(isinstance(token_id, int) for token_id in prompt_ids):
-            raise TypeError("Tokenized prompt IDs must be integers.")
+        return self.generate_batch(
+            [problem],
+            [fast_parameters],
+            show_progress=show_progress,
+            progress_description=progress_description,
+        )[0]
+
+    def generate_batch(
+        self,
+        problems: list[MathProblem],
+        fast_parameter_groups: list[Mapping[str, Tensor]],
+        *,
+        show_progress: bool = False,
+        progress_description: str = "rollout batch",
+    ) -> tuple[RolloutGroup, ...]:
+        if not problems:
+            raise ValueError("Rollout problem batch cannot be empty.")
+        if len(problems) != len(fast_parameter_groups):
+            raise ValueError(
+                "Each rollout problem must have one fast-parameter mapping."
+            )
         max_positions = getattr(self.model.config, "max_position_embeddings", None)
         if not isinstance(max_positions, int):
             raise ValueError(
                 "Policy config must define integer max_position_embeddings."
             )
-        if len(prompt_ids) + self.max_new_tokens > max_positions:
-            raise ValueError(
-                f"prompt_length ({len(prompt_ids)}) + max_new_tokens "
-                f"({self.max_new_tokens}) exceeds max_position_embeddings "
-                f"({max_positions})."
+        prompt_ids_batch: list[list[int]] = []
+        for problem in problems:
+            prompt = self.tokenizer.apply_chat_template(
+                problem.conversation,
+                tokenize=False,
+                add_generation_prompt=True,
             )
+            if not isinstance(prompt, str) or not prompt:
+                raise ValueError("Chat template must return a non-empty string.")
+            encoded = self.tokenizer(prompt, add_special_tokens=False)
+            prompt_ids = encoded.get("input_ids")
+            if not isinstance(prompt_ids, list) or not prompt_ids:
+                raise ValueError("Tokenizer must return non-empty input_ids.")
+            if not all(isinstance(token_id, int) for token_id in prompt_ids):
+                raise TypeError("Tokenized prompt IDs must be integers.")
+            if len(prompt_ids) + self.max_new_tokens > max_positions:
+                raise ValueError(
+                    f"prompt_length ({len(prompt_ids)}) + max_new_tokens "
+                    f"({self.max_new_tokens}) exceeds max_position_embeddings "
+                    f"({max_positions})."
+                )
+            prompt_ids_batch.append(prompt_ids)
 
-        adapter_name = f"meta-rlvr-{uuid4().hex}"
-        adapter_dir = Path(
-            tempfile.mkdtemp(prefix=f"{adapter_name}-", dir=self.adapter_root)
-        )
-        loaded = False
-        weights_awake = False
-        kv_awake = False
+        unique_adapters: list[
+            tuple[str, Path, Mapping[str, Tensor]]
+        ] = []
+        adapter_name_by_parameter_identity: dict[int, str] = {}
+        problem_adapter_names: list[str] = []
+        for fast_parameters in fast_parameter_groups:
+            identity = id(fast_parameters)
+            adapter_name = adapter_name_by_parameter_identity.get(identity)
+            if adapter_name is None:
+                adapter_name = f"meta-rlvr-{uuid4().hex}"
+                adapter_dir = Path(
+                    tempfile.mkdtemp(
+                        prefix=f"{adapter_name}-",
+                        dir=self.adapter_root,
+                    )
+                )
+                unique_adapters.append(
+                    (adapter_name, adapter_dir, fast_parameters)
+                )
+                adapter_name_by_parameter_identity[identity] = adapter_name
+            problem_adapter_names.append(adapter_name)
+
+        loaded_adapter_names: list[str] = []
+        awake = False
         started = time.monotonic()
         progress_bar = None
         if show_progress:
             from tqdm.auto import tqdm
 
             progress_bar = tqdm(
-                total=self.group_size,
+                total=len(problems) * self.group_size,
                 desc=f"{progress_description}: vLLM generate",
                 unit="response",
                 leave=True,
             )
+        completion_results: list[
+            tuple[list[list[int]], list[list[float]]] | None
+        ] = [None] * len(problems)
         try:
-            self._save_adapter(adapter_dir, fast_parameters)
+            for _, adapter_dir, fast_parameters in unique_adapters:
+                self._save_adapter(adapter_dir, fast_parameters)
             gc.collect()
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
                 torch.cuda.empty_cache()
             self._request_json("POST", "/wake_up?tags=weights")
-            weights_awake = True
-            load_response = self._request_text(
-                "POST",
-                "/v1/load_lora_adapter",
-                {"lora_name": adapter_name, "lora_path": str(adapter_dir)},
-            )
-            loaded = True
-            expected_load_response = (
-                f"Success: LoRA adapter '{adapter_name}' added successfully."
-            )
-            if load_response != expected_load_response:
-                raise RuntimeError(
-                    "Unexpected vLLM LoRA load response: "
-                    f"{load_response!r}; expected {expected_load_response!r}."
+            awake = True
+            for adapter_name, adapter_dir, _ in unique_adapters:
+                load_response = self._request_text(
+                    "POST",
+                    "/v1/load_lora_adapter",
+                    {
+                        "lora_name": adapter_name,
+                        "lora_path": str(adapter_dir),
+                    },
                 )
+                loaded_adapter_names.append(adapter_name)
+                expected_load_response = (
+                    f"Success: LoRA adapter '{adapter_name}' added successfully."
+                )
+                if load_response != expected_load_response:
+                    raise RuntimeError(
+                        "Unexpected vLLM LoRA load response: "
+                        f"{load_response!r}; expected "
+                        f"{expected_load_response!r}."
+                    )
             models = self._request_json("GET", "/v1/models")
-            self._require_model_registration(models, adapter_name, present=True)
+            for adapter_name in loaded_adapter_names:
+                self._require_model_registration(
+                    models, adapter_name, present=True
+                )
             self._request_json("POST", "/wake_up?tags=kv_cache")
-            kv_awake = True
             status = self._request_json("GET", "/is_sleeping")
             if status != {"is_sleeping": False}:
                 raise RuntimeError(f"vLLM failed to wake up fully: {status!r}.")
-            response = self._request_json(
-                "POST",
-                "/v1/completions",
-                {
-                    "model": adapter_name,
-                    "prompt": prompt_ids,
-                    "n": self.group_size,
-                    "max_tokens": self.max_new_tokens,
-                    "temperature": self.temperature,
-                    "top_p": self.top_p,
-                    "top_k": self.top_k,
-                    "stream": False,
-                    "add_special_tokens": False,
-                    "logprobs": 0,
-                    "return_token_ids": True,
-                },
-                timeout=self.request_timeout,
-            )
-            completion_ids, completion_logprobs = self._completion_data(response)
-            if progress_bar is not None:
-                progress_bar.update(self.group_size)
-                progress_bar.set_postfix_str(
-                    f"elapsed={time.monotonic() - started:.1f}s"
-                )
+            with ThreadPoolExecutor(max_workers=len(problems)) as executor:
+                futures = {
+                    executor.submit(
+                        self._request_json,
+                        "POST",
+                        "/v1/completions",
+                        {
+                            "model": problem_adapter_names[index],
+                            "prompt": prompt_ids_batch[index],
+                            "n": self.group_size,
+                            "max_tokens": self.max_new_tokens,
+                            "temperature": self.temperature,
+                            "top_p": self.top_p,
+                            "top_k": self.top_k,
+                            "stream": False,
+                            "add_special_tokens": False,
+                            "logprobs": 0,
+                            "return_token_ids": True,
+                        },
+                        timeout=self.request_timeout,
+                    ): index
+                    for index in range(len(problems))
+                }
+                for future in as_completed(futures):
+                    index = futures[future]
+                    completion_results[index] = self._completion_data(
+                        future.result()
+                    )
+                    if progress_bar is not None:
+                        progress_bar.update(self.group_size)
+                        progress_bar.set_postfix_str(
+                            f"elapsed={time.monotonic() - started:.1f}s"
+                        )
         except BaseException as error:
             cleanup_errors = self._finish_generation_transaction(
-                adapter_name=adapter_name,
-                loaded=loaded,
-                awake=weights_awake or kv_awake,
+                adapter_names=loaded_adapter_names,
+                awake=awake,
             )
             if cleanup_errors:
                 cleanup_summary = "; ".join(str(item) for item in cleanup_errors)
@@ -513,9 +613,8 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             raise
         else:
             cleanup_errors = self._finish_generation_transaction(
-                adapter_name=adapter_name,
-                loaded=loaded,
-                awake=weights_awake or kv_awake,
+                adapter_names=loaded_adapter_names,
+                awake=awake,
             )
             if cleanup_errors:
                 error = RuntimeError("vLLM generation succeeded but cleanup failed.")
@@ -523,64 +622,111 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         finally:
             if progress_bar is not None:
                 progress_bar.close()
-            shutil.rmtree(adapter_dir)
+            for _, adapter_dir, _ in unique_adapters:
+                shutil.rmtree(adapter_dir)
 
-        sequences = self._sequences_from_completion_ids(prompt_ids, completion_ids)
-        group = self._build_group(sequences, len(prompt_ids))
-        rollout_logprobs = self._aligned_rollout_logprobs(
-            group,
-            completion_logprobs,
-        )
+        groups: list[RolloutGroup] = []
+        for index, result in enumerate(completion_results):
+            if result is None:
+                raise RuntimeError(
+                    f"vLLM returned no completion result for problem {index}."
+                )
+            completion_ids, completion_logprobs = result
+            prompt_ids = prompt_ids_batch[index]
+            sequences = self._sequences_from_completion_ids(
+                prompt_ids, completion_ids
+            )
+            group = self._build_group(sequences, len(prompt_ids))
+            groups.append(
+                replace(
+                    group,
+                    rollout_logprobs=self._aligned_rollout_logprobs(
+                        group, completion_logprobs
+                    ),
+                )
+            )
+
+        old_logprob_progress = None
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            old_logprob_progress = tqdm(
+                total=len(problems),
+                desc=f"{progress_description}: old log-probabilities",
+                unit="problem",
+                leave=True,
+            )
         was_training = self.model.training
         self.model.eval()
         try:
-            with materialized_fast_parameters(self.model, fast_parameters):
-                with torch.no_grad():
-                    old_logprobs = self._unadapted_logprobs(
-                        group,
-                        show_progress=show_progress,
-                        progress_description=(
-                            f"{progress_description}: old log-probabilities"
-                        ),
-                    )
+            for index, (group, fast_parameters) in enumerate(
+                zip(groups, fast_parameter_groups, strict=True)
+            ):
+                with materialized_fast_parameters(self.model, fast_parameters):
+                    with torch.no_grad():
+                        old_logprobs = self._unadapted_logprobs(
+                            group,
+                            show_progress=False,
+                            progress_description=(
+                                f"{progress_description} problem {index + 1}: "
+                                "old log-probabilities"
+                            ),
+                        )
+                groups[index] = replace(group, old_logprobs=old_logprobs)
+                if old_logprob_progress is not None:
+                    old_logprob_progress.update(1)
         finally:
             self.model.train(was_training)
-        group = replace(
-            group,
-            old_logprobs=old_logprobs,
-            rollout_logprobs=rollout_logprobs,
-        )
+            if old_logprob_progress is not None:
+                old_logprob_progress.close()
+
         if show_progress:
-            selected = group.completion_mask
-            delta = group.rollout_logprobs[selected] - group.old_logprobs[selected]
+            delta_sum = 0.0
+            absolute_delta_sum = 0.0
+            max_absolute_delta = 0.0
+            token_count = 0
+            for group in groups:
+                selected = group.completion_mask
+                delta = (
+                    group.rollout_logprobs[selected]
+                    - group.old_logprobs[selected]
+                )
+                delta_sum += delta.sum().item()
+                absolute_delta_sum += delta.abs().sum().item()
+                max_absolute_delta = max(
+                    max_absolute_delta, delta.abs().max().item()
+                )
+                token_count += delta.numel()
             print(
                 json.dumps(
                     {
                         "stage": progress_description,
-                        "vllm_raw_vs_pytorch_raw/mean_delta": delta.mean().item(),
+                        "problem_count": len(problems),
+                        "vllm_raw_vs_pytorch_raw/mean_delta": (
+                            delta_sum / token_count
+                        ),
                         "vllm_raw_vs_pytorch_raw/mean_absolute_delta": (
-                            delta.abs().mean().item()
+                            absolute_delta_sum / token_count
                         ),
                         "vllm_raw_vs_pytorch_raw/max_absolute_delta": (
-                            delta.abs().max().item()
+                            max_absolute_delta
                         ),
-                        "vllm_raw_vs_pytorch_raw/token_count": delta.numel(),
+                        "vllm_raw_vs_pytorch_raw/token_count": token_count,
                     },
                     sort_keys=True,
                 ),
                 flush=True,
             )
-        return group
+        return tuple(groups)
 
     def _finish_generation_transaction(
         self,
         *,
-        adapter_name: str,
-        loaded: bool,
+        adapter_names: list[str],
         awake: bool,
     ) -> list[Exception]:
         errors: list[Exception] = []
-        if loaded:
+        for adapter_name in reversed(adapter_names):
             try:
                 unload_response = self._request_text(
                     "POST",
@@ -596,12 +742,17 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                         f"{unload_response!r}; expected "
                         f"{expected_unload_response!r}."
                     )
+            except Exception as error:
+                errors.append(error)
+        if adapter_names:
+            try:
                 models = self._request_json("GET", "/v1/models")
-                self._require_model_registration(
-                    models,
-                    adapter_name,
-                    present=False,
-                )
+                for adapter_name in adapter_names:
+                    self._require_model_registration(
+                        models,
+                        adapter_name,
+                        present=False,
+                    )
             except Exception as error:
                 errors.append(error)
         if awake:

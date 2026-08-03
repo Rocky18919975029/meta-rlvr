@@ -38,6 +38,17 @@ case "${SMOKE_GPUS}" in
   8) ACCELERATE_CONFIG="configs/accelerate_fsdp_8xh100.yaml" ;;
   *) echo "SMOKE_GPUS must be 1, 4, or 8, got ${SMOKE_GPUS}" >&2; exit 2 ;;
 esac
+SMOKE_PROBLEM_BATCH_SIZE="${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}}"
+if [[ ! "${SMOKE_PROBLEM_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SMOKE_PROBLEM_BATCH_SIZE must be a positive integer." >&2
+  exit 2
+fi
+if ((SMOKE_PROBLEM_BATCH_SIZE < SMOKE_GPUS || SMOKE_PROBLEM_BATCH_SIZE % SMOKE_GPUS != 0)); then
+  echo "SMOKE_PROBLEM_BATCH_SIZE must be at least and divisible by SMOKE_GPUS." >&2
+  exit 2
+fi
+export SMOKE_PROBLEM_BATCH_SIZE
+LOCAL_PROBLEM_BATCH_SIZE=$((SMOKE_PROBLEM_BATCH_SIZE / SMOKE_GPUS))
 
 GPU_BINDING_SOURCE="CUDA_VISIBLE_DEVICES"
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -100,6 +111,8 @@ echo "train_data=${META_RLVR_TRAIN_PARQUET}"
 echo "validation_data=${META_RLVR_VALIDATION_PARQUET}"
 echo "output=${RUN_DIR}"
 echo "gpus=${SMOKE_GPUS}"
+echo "problem_batch_size=${SMOKE_PROBLEM_BATCH_SIZE}"
+echo "local_problem_batch_size=${LOCAL_PROBLEM_BATCH_SIZE}"
 echo "slurm_job_gpus=${SLURM_JOB_GPUS:-unset}"
 echo "slurm_step_gpus=${SLURM_STEP_GPUS:-unset}"
 echo "gpu_binding_source=${GPU_BINDING_SOURCE}"
@@ -107,6 +120,22 @@ echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
 
 nvidia-smi
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
+  VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-1}"
+  VLLM_MAX_CPU_LORAS="${VLLM_MAX_CPU_LORAS:-${VLLM_MAX_LORAS}}"
+  if [[ ! "${VLLM_MAX_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
+    [[ ! "${VLLM_MAX_CPU_LORAS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "VLLM_MAX_LORAS and VLLM_MAX_CPU_LORAS must be positive integers." >&2
+    exit 2
+  fi
+  if (( VLLM_MAX_LORAS < LOCAL_PROBLEM_BATCH_SIZE )); then
+    echo "VLLM_MAX_LORAS must be at least LOCAL_PROBLEM_BATCH_SIZE=${LOCAL_PROBLEM_BATCH_SIZE}." >&2
+    exit 2
+  fi
+  if (( VLLM_MAX_CPU_LORAS < VLLM_MAX_LORAS )); then
+    echo "VLLM_MAX_CPU_LORAS must be at least VLLM_MAX_LORAS." >&2
+    exit 2
+  fi
+  export VLLM_MAX_LORAS VLLM_MAX_CPU_LORAS
   python - "${SMOKE_GPUS}" "${VLLM_GPU_MEMORY_UTILIZATION:-0.30}" <<'PY'
 import json
 import subprocess
@@ -240,6 +269,7 @@ setsid accelerate launch \
   --save-steps "${SMOKE_SAVE_STEPS:-1}" \
   --support-group-size "${SMOKE_SUPPORT_GROUP_SIZE:-2}" \
   --query-group-size "${SMOKE_QUERY_GROUP_SIZE:-2}" \
+  --problem-batch-size "${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}}" \
   --generation-micro-batch-size "${SMOKE_GENERATION_MICRO_BATCH_SIZE:-1}" \
   --policy-micro-batch-size "${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}" \
   --confidence-micro-batch-size "${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}" \

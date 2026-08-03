@@ -56,6 +56,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--support-group-size", type=int, default=32)
     parser.add_argument("--query-group-size", type=int, default=32)
+    parser.add_argument(
+        "--problem-batch-size",
+        type=int,
+        help=(
+            "Global number of independent problems per confidence-model update. "
+            "Defaults to one problem per distributed rank."
+        ),
+    )
     parser.add_argument("--generation-micro-batch-size", type=int, default=4)
     parser.add_argument("--policy-micro-batch-size", type=int, default=1)
     parser.add_argument("--confidence-micro-batch-size", type=int, default=2)
@@ -179,6 +187,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max_grad_norm must be positive.")
     if args.confidence_learning_rate <= 0:
         raise ValueError("confidence_learning_rate must be positive.")
+    if args.problem_batch_size is not None and args.problem_batch_size <= 0:
+        raise ValueError("problem_batch_size must be positive.")
     if args.rollout_backend == "vllm" and not args.vllm_base_urls:
         raise ValueError("--vllm-base-urls is required for the vLLM backend.")
     if args.vllm_request_timeout <= 0:
@@ -254,6 +264,47 @@ def _next_problem(
     order = list(range(len(shard)))
     random.Random(seed + epoch).shuffle(order)
     return shard[order[offset]]
+
+
+def _problem_batch(
+    shard: list[MathProblem],
+    *,
+    step: int,
+    batch_size: int,
+    seed: int,
+) -> list[MathProblem]:
+    if not shard:
+        raise ValueError("Problem shard cannot be empty.")
+    if step < 0:
+        raise ValueError("step must be non-negative.")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    first_position = step * batch_size
+    return [
+        _next_problem(shard, step=first_position + offset, seed=seed)
+        for offset in range(batch_size)
+    ]
+
+
+def _local_problem_batch_size(
+    global_batch_size: int | None,
+    *,
+    world_size: int,
+) -> tuple[int, int]:
+    if world_size <= 0:
+        raise ValueError("world_size must be positive.")
+    effective_global_batch = (
+        world_size if global_batch_size is None else global_batch_size
+    )
+    if effective_global_batch < world_size:
+        raise ValueError(
+            "problem_batch_size must be at least the distributed world size."
+        )
+    if effective_global_batch % world_size != 0:
+        raise ValueError(
+            "problem_batch_size must be divisible by the distributed world size."
+        )
+    return effective_global_batch, effective_global_batch // world_size
 
 
 def _write_run_config(args: argparse.Namespace, output_dir: Path, accelerator) -> None:
@@ -500,6 +551,13 @@ def main() -> None:
         raise ValueError(
             "The HPC launch must configure Accelerate mixed_precision='bf16'."
         )
+    global_problem_batch_size, local_problem_batch_size = (
+        _local_problem_batch_size(
+            args.problem_batch_size,
+            world_size=accelerator.num_processes,
+        )
+    )
+    args.problem_batch_size = global_problem_batch_size
     set_seed(args.seed, device_specific=True)
     _write_run_config(args, args.output_dir, accelerator)
     accelerator.wait_for_everyone()
@@ -617,10 +675,17 @@ def main() -> None:
         rank=accelerator.process_index,
         world_size=accelerator.num_processes,
     )
+    if len(local_problems) < local_problem_batch_size:
+        raise ValueError(
+            f"Rank {accelerator.process_index} owns {len(local_problems)} "
+            f"problems, fewer than its local batch {local_problem_batch_size}."
+        )
     accelerator.print(
         f"Loaded {len(all_problems)} unique problems; "
         f"rank {accelerator.process_index} owns {len(local_problems)}; "
-        f"validation has {len(validation_problems)} semantically unique problems."
+        f"validation has {len(validation_problems)} semantically unique problems; "
+        f"global problem batch is {global_problem_batch_size} "
+        f"({local_problem_batch_size} per rank)."
     )
 
     initial_fast = {
@@ -637,39 +702,56 @@ def main() -> None:
         disable=not accelerator.is_main_process,
     )
     for step in step_indices:
-        problem = _next_problem(local_problems, step=step, seed=args.seed)
-        step_indices.set_postfix_str(f"problem={problem.uid} stage=support-rollout")
-        progress_prefix = f"train step {step + 1} problem {problem.uid}"
-        support = support_rollouts.generate(
-            problem,
-            initial_fast,
-            show_progress=accelerator.is_main_process,
-            progress_description=f"{progress_prefix} support",
-        )
-        step_indices.set_postfix_str(f"problem={problem.uid} stage=support-verifier")
-        support_verification = verifier(
-            support.texts,
-            problem.ground_truth,
-            device=accelerator.device,
-        )
-        support = support.with_verification(
-            support_verification.rewards,
-            support_verification.correctness,
-        )
-        _append_rollout_diagnostics(
-            rollout_log_path,
+        problems = _problem_batch(
+            local_problems,
             step=step,
-            phase="train_support",
-            problem=problem,
-            group=support,
-            verification=support_verification,
-            max_new_tokens=support_rollouts.max_new_tokens,
-            eos_token_id=support_rollouts.tokenizer.eos_token_id,
+            batch_size=local_problem_batch_size,
+            seed=args.seed,
         )
-        if args.inner_kl_coefficient > 0:
-            support = support.with_reference_logprobs(support.old_logprobs)
+        batch_prefix = (
+            f"train step {step + 1} local problems={local_problem_batch_size}"
+        )
+        step_indices.set_postfix_str(
+            f"problems={global_problem_batch_size} stage=support-rollout"
+        )
+        supports = list(
+            support_rollouts.generate_batch(
+                problems,
+                [initial_fast] * local_problem_batch_size,
+                show_progress=accelerator.is_main_process,
+                progress_description=f"{batch_prefix} support",
+            )
+        )
+        step_indices.set_postfix_str(
+            f"problems={global_problem_batch_size} stage=support-verifier"
+        )
+        for problem_index, (problem, support) in enumerate(
+            zip(problems, supports, strict=True)
+        ):
+            support_verification = verifier(
+                support.texts,
+                problem.ground_truth,
+                device=accelerator.device,
+            )
+            support = support.with_verification(
+                support_verification.rewards,
+                support_verification.correctness,
+            )
+            if args.inner_kl_coefficient > 0:
+                support = support.with_reference_logprobs(support.old_logprobs)
+            _append_rollout_diagnostics(
+                rollout_log_path,
+                step=step,
+                phase="train_support",
+                problem=problem,
+                group=support,
+                verification=support_verification,
+                max_new_tokens=support_rollouts.max_new_tokens,
+                eos_token_id=support_rollouts.tokenizer.eos_token_id,
+            )
+            supports[problem_index] = support
 
-        cached_query = None
+        cached_queries = None
         outer_iterations = tqdm(
             range(args.outer_iterations),
             desc=f"train step {step + 1}: outer updates",
@@ -680,63 +762,92 @@ def main() -> None:
         for outer_iteration in outer_iterations:
             confidence_optimizer.zero_grad(set_to_none=True)
 
-            if cached_query is None:
+            if cached_queries is None:
                 outer_iterations.set_postfix_str("stage=generation-adaptation")
-                generation_adaptation = algorithm.adapt_task(
-                    support,
-                    initial_fast,
-                    differentiable=False,
-                    supervise_confidence=False,
-                    show_progress=accelerator.is_main_process,
-                    progress_prefix=f"{progress_prefix} generation adaptation",
-                )
-                outer_iterations.set_postfix_str("stage=query-rollout")
-                cached_query = query_rollouts.generate(
-                    problem,
-                    generation_adaptation.fast_parameters,
-                    show_progress=accelerator.is_main_process,
-                    progress_description=f"{progress_prefix} query",
-                )
-                del generation_adaptation
-                outer_iterations.set_postfix_str("stage=query-verifier")
-                query_verification = verifier(
-                    cached_query.texts,
-                    problem.ground_truth,
-                    device=accelerator.device,
-                )
-                cached_query = cached_query.with_verification(
-                    query_verification.rewards,
-                    query_verification.correctness,
-                )
-                _append_rollout_diagnostics(
-                    rollout_log_path,
-                    step=step,
-                    phase="train_query",
-                    problem=problem,
-                    group=cached_query,
-                    verification=query_verification,
-                    max_new_tokens=query_rollouts.max_new_tokens,
-                    eos_token_id=query_rollouts.tokenizer.eos_token_id,
-                )
-                if args.rollout_only:
-                    rollout_totals = torch.stack(
-                        (
-                            support.verifier_rewards.sum(),
-                            support.correctness_labels.sum(),
-                            torch.tensor(
-                                support.group_size,
-                                dtype=torch.float32,
-                                device=accelerator.device,
-                            ),
-                            cached_query.verifier_rewards.sum(),
-                            cached_query.correctness_labels.sum(),
-                            torch.tensor(
-                                cached_query.group_size,
-                                dtype=torch.float32,
-                                device=accelerator.device,
-                            ),
-                        )
+                generation_fast_parameters = []
+                adaptation_indices = range(local_problem_batch_size)
+                if accelerator.is_main_process:
+                    adaptation_indices = tqdm(
+                        adaptation_indices,
+                        total=local_problem_batch_size,
+                        desc=f"{batch_prefix} generation adaptation",
+                        unit="problem",
+                        leave=True,
                     )
+                for problem_index in adaptation_indices:
+                    generation_adaptation = algorithm.adapt_task(
+                        supports[problem_index],
+                        initial_fast,
+                        differentiable=False,
+                        supervise_confidence=False,
+                        show_progress=False,
+                        progress_prefix=(
+                            f"{batch_prefix} problem {problem_index + 1}"
+                        ),
+                    )
+                    generation_fast_parameters.append(
+                        generation_adaptation.fast_parameters
+                    )
+                    del generation_adaptation
+                outer_iterations.set_postfix_str("stage=query-rollout")
+                cached_queries = list(
+                    query_rollouts.generate_batch(
+                        problems,
+                        generation_fast_parameters,
+                        show_progress=accelerator.is_main_process,
+                        progress_description=f"{batch_prefix} query",
+                    )
+                )
+                del generation_fast_parameters
+                outer_iterations.set_postfix_str("stage=query-verifier")
+                for problem_index, (problem, query) in enumerate(
+                    zip(problems, cached_queries, strict=True)
+                ):
+                    query_verification = verifier(
+                        query.texts,
+                        problem.ground_truth,
+                        device=accelerator.device,
+                    )
+                    query = query.with_verification(
+                        query_verification.rewards,
+                        query_verification.correctness,
+                    )
+                    _append_rollout_diagnostics(
+                        rollout_log_path,
+                        step=step,
+                        phase="train_query",
+                        problem=problem,
+                        group=query,
+                        verification=query_verification,
+                        max_new_tokens=query_rollouts.max_new_tokens,
+                        eos_token_id=query_rollouts.tokenizer.eos_token_id,
+                    )
+                    cached_queries[problem_index] = query
+                if args.rollout_only:
+                    rollout_totals = torch.zeros(
+                        6, dtype=torch.float32, device=accelerator.device
+                    )
+                    for support, query in zip(
+                        supports, cached_queries, strict=True
+                    ):
+                        rollout_totals += torch.stack(
+                            (
+                                support.verifier_rewards.sum(),
+                                support.correctness_labels.sum(),
+                                torch.tensor(
+                                    support.group_size,
+                                    dtype=torch.float32,
+                                    device=accelerator.device,
+                                ),
+                                query.verifier_rewards.sum(),
+                                query.correctness_labels.sum(),
+                                torch.tensor(
+                                    query.group_size,
+                                    dtype=torch.float32,
+                                    device=accelerator.device,
+                                ),
+                            )
+                        )
                     rollout_totals = accelerator.reduce(rollout_totals, reduction="sum")
                     if accelerator.is_main_process:
                         print(
@@ -756,7 +867,7 @@ def main() -> None:
                                     "query_accuracy": (
                                         rollout_totals[4] / rollout_totals[5]
                                     ).item(),
-                                    "num_problems": accelerator.num_processes,
+                                    "num_problems": global_problem_batch_size,
                                     "support_responses": int(rollout_totals[2].item()),
                                     "query_responses": int(rollout_totals[5].item()),
                                 },
@@ -768,23 +879,63 @@ def main() -> None:
                     accelerator.end_training()
                     return
                 if args.outer_kl_coefficient > 0:
-                    cached_query = query_rollouts.add_reference_logprobs(
-                        cached_query,
-                        initial_fast,
-                        show_progress=accelerator.is_main_process,
-                        progress_description=f"{progress_prefix} query reference",
-                    )
+                    for problem_index, query in enumerate(cached_queries):
+                        cached_queries[problem_index] = (
+                            query_rollouts.add_reference_logprobs(
+                                query,
+                                initial_fast,
+                                show_progress=False,
+                                progress_description=(
+                                    f"{batch_prefix} query reference "
+                                    f"{problem_index + 1}"
+                                ),
+                            )
+                        )
 
             outer_iterations.set_postfix_str("stage=meta-forward")
-            output = algorithm.outer_loss(
-                support,
-                cached_query,
-                initial_fast,
-                show_progress=accelerator.is_main_process,
-                progress_prefix=(f"{progress_prefix} outer {outer_iteration + 1}"),
+            local_metric_sums = torch.zeros(
+                10, dtype=torch.float32, device=accelerator.device
             )
-            outer_iterations.set_postfix_str("stage=meta-backward")
-            accelerator.backward(output.loss)
+            problem_indices = range(local_problem_batch_size)
+            if accelerator.is_main_process:
+                problem_indices = tqdm(
+                    problem_indices,
+                    total=local_problem_batch_size,
+                    desc=(
+                        f"train step {step + 1} outer {outer_iteration + 1}: "
+                        "problem gradients"
+                    ),
+                    unit="problem",
+                    leave=True,
+                )
+            for problem_index in problem_indices:
+                output = algorithm.outer_loss(
+                    supports[problem_index],
+                    cached_queries[problem_index],
+                    initial_fast,
+                    show_progress=False,
+                    progress_prefix=(
+                        f"{batch_prefix} problem {problem_index + 1} "
+                        f"outer {outer_iteration + 1}"
+                    ),
+                )
+                accelerator.backward(output.loss / local_problem_batch_size)
+                local_metric_sums += torch.stack(
+                    (
+                        output.loss.detach(),
+                        output.meta_grpo.loss.detach(),
+                        output.adaptation.confidence_loss.bce.detach(),
+                        output.adaptation.confidence_loss.ranking.detach(),
+                        output.meta_grpo.clip_fraction.detach(),
+                        output.adaptation.inner_losses[-1].clip_fraction.detach(),
+                        supports[problem_index].verifier_rewards.mean(),
+                        cached_queries[problem_index].verifier_rewards.mean(),
+                        supports[problem_index].correctness_labels.mean(),
+                        cached_queries[problem_index].correctness_labels.mean(),
+                    )
+                )
+                del output
+            outer_iterations.set_postfix_str("stage=meta-step")
             gradient_norm = accelerator.clip_grad_norm_(
                 confidence_model.parameters(), args.max_grad_norm
             )
@@ -796,28 +947,18 @@ def main() -> None:
             confidence_optimizer.step()
             outer_iterations.set_postfix_str("stage=metrics")
 
-            metrics = torch.stack(
-                (
-                    output.loss.detach(),
-                    output.meta_grpo.loss.detach(),
-                    output.adaptation.confidence_loss.bce.detach(),
-                    output.adaptation.confidence_loss.ranking.detach(),
-                    output.meta_grpo.clip_fraction.detach(),
-                    output.adaptation.inner_losses[-1].clip_fraction.detach(),
-                    support.verifier_rewards.mean(),
-                    cached_query.verifier_rewards.mean(),
-                    support.correctness_labels.mean(),
-                    cached_query.correctness_labels.mean(),
-                    gradient_norm.detach(),
-                )
+            metrics = accelerator.reduce(local_metric_sums, reduction="sum")
+            metrics = metrics / global_problem_batch_size
+            reduced_gradient_norm = accelerator.reduce(
+                gradient_norm.detach(), reduction="mean"
             )
-            metrics = accelerator.reduce(metrics, reduction="mean")
             if accelerator.is_main_process:
                 print(
                     json.dumps(
                         {
                             "step": step,
                             "outer_iteration": outer_iteration,
+                            "problem_batch_size": global_problem_batch_size,
                             "loss": metrics[0].item(),
                             "meta_loss": metrics[1].item(),
                             "bce": metrics[2].item(),
@@ -828,15 +969,20 @@ def main() -> None:
                             "query_reward": metrics[7].item(),
                             "support_accuracy": metrics[8].item(),
                             "query_accuracy": metrics[9].item(),
-                            "confidence_gradient_norm": metrics[10].item(),
+                            "confidence_gradient_norm": (
+                                reduced_gradient_norm.item()
+                            ),
                         },
                         sort_keys=True,
                     ),
-                    flush=True,
-                )
-            del output
+                        flush=True,
+                    )
 
-        del support, cached_query, support_verification, query_verification
+        del (
+            problems,
+            supports,
+            cached_queries,
+        )
 
         if (step + 1) % args.save_steps == 0:
             _prepare_for_checkpoint(confidence_optimizer, accelerator)

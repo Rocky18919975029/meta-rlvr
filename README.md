@@ -113,10 +113,13 @@ requires `--attn-implementation eager`, and is expected to be substantially
 more memory intensive.
 
 The provided Accelerate configurations use FSDP full sharding for the trainable
-confidence model. The frozen 7B policy is replicated on each GPU so that every
-rank can maintain one independent fast adapter. With 4 or 8 GPUs, the global
-meta-batch therefore contains 4 or 8 different problems without keeping
-multiple task adapters on one device.
+confidence model. The frozen 7B policy is replicated on each GPU. By default,
+the global meta-batch contains one problem per rank; `--problem-batch-size`
+increases it to any positive multiple of the world size. Each rank accumulates
+the mean gradient over its local problem batch and performs one confidence
+optimizer step only after all local problems finish. Differentiable task
+adapters are still constructed and released one problem at a time, so their
+training memory does not grow linearly with the problem batch size.
 
 ## Offline HPC synchronization
 
@@ -252,16 +255,18 @@ strict-box verifier predictions are written to per-rank JSONL files under
 `outputs/rollout-test-$SLURM_JOB_ID`.
 
 The vLLM lifecycle follows verl's hybrid engine ordering. Servers start first
-and enter level-1 sleep. Every rollout wakes only `weights`, dynamically loads
-the detached task LoRA from node-local `/dev/shm`, wakes `kv_cache`, generates
-with continuous batching, unregisters the adapter and sleeps before PyTorch
-performs inner/outer gradient work. The launcher explicitly enables vLLM's
-development lifecycle endpoints and supervises every server process. An HTTP
-500, a missing endpoint or a dead replica terminates the trainer and the Slurm
-job instead of waiting through a long timeout. The Transformers backend remains
-available for CPU tests via `SMOKE_ROLLOUT_BACKEND=transformers`; it is not the
-default for the H100 meaningful tests. Per-replica vLLM logs and throughput
-metrics are under `logs/vllm-$SLURM_JOB_ID/gpu-*.log`.
+and enter level-1 sleep. Every local problem-batch rollout wakes only `weights`,
+dynamically loads the required detached LoRAs from node-local `/dev/shm`, wakes
+`kv_cache`, submits all local prompts concurrently for continuous batching,
+unregisters the adapters and sleeps before PyTorch performs inner/outer gradient
+work. Support deduplicates the shared initial adapter; query keeps one detached
+adapter per task. The launcher explicitly enables vLLM's development lifecycle
+endpoints and supervises every server process. An HTTP 500, a missing endpoint
+or a dead replica terminates the trainer and the Slurm job instead of waiting
+through a long timeout. The Transformers backend remains available for CPU
+tests via `SMOKE_ROLLOUT_BACKEND=transformers`; it is not the default for the
+H100 meaningful tests. Per-replica vLLM logs and throughput metrics are under
+`logs/vllm-$SLURM_JOB_ID/gpu-*.log`.
 
 Recent FastAPI releases require `prometheus-fastapi-instrumentator>=8.0.1`.
 The submitters validate this on the login node before requesting any GPU. Since
@@ -305,6 +310,31 @@ export VLLM_MAX_NUM_SEQS=64
 export VLLM_MAX_LORAS=1
 bash scripts/submit_rollout_test.sh
 ```
+
+After the one-problem-per-rank smoke test passes, test a global problem batch of
+32 using short K=2, 128-token rollouts:
+
+```bash
+export SMOKE_GPUS=4
+bash scripts/submit_problem_batch_test.sh
+```
+
+This gives each rank eight independent problems. Support prompts share one
+initial LoRA and enter one vLLM continuous-batching transaction. Query prompts
+use eight task-specific LoRAs, but are submitted concurrently during the same
+wake/sleep transaction. The differentiable outer pass then processes those
+eight tasks sequentially, accumulates their gradients, clips once and performs
+one optimizer step. To test B=64 on eight GPUs with the same script:
+
+```bash
+export SMOKE_GPUS=8
+export SMOKE_PROBLEM_BATCH_SIZE=64
+bash scripts/submit_problem_batch_test.sh
+```
+
+The launcher derives `VLLM_MAX_LORAS` from the per-rank problem batch and fails
+before requesting generation if the configured vLLM adapter capacity is too
+small.
 
 The local Qwen checkpoint declares `max_position_embeddings=4096`, so the
 launcher deliberately fixes vLLM `max_model_len=4096`. Do not set
@@ -459,11 +489,13 @@ combinations raise during configuration construction.
 
 ## Multi-iteration semantics
 
-Support and query rollouts are generated once per meta-step. The task adapter
-is reset to the shared zero-LoRA initialization and re-adapted under the current
-confidence parameters before every outer optimizer iteration. Query old
-log-probabilities remain fixed, so PPO ratios and clipping become active as the
-confidence model changes.
+Support and query rollouts are generated once per meta-step and problem. The
+task adapter is reset to the shared zero-LoRA initialization and re-adapted
+under the current confidence parameters before every outer optimizer iteration.
+Query old log-probabilities remain fixed, so PPO ratios and clipping become
+active as the confidence model changes. For a problem batch, all task losses are
+scaled by the per-rank problem count and accumulated before the single outer
+optimizer step; FSDP averaging then yields the exact global problem mean.
 
 The first query generation uses a non-differentiable copy of the inner update;
 the differentiable inner loop is then recomputed for the outer loss. This

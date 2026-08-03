@@ -316,6 +316,123 @@ def test_vllm_rollout_uses_staged_hybrid_lifecycle(tmp_path) -> None:
     assert loaded_adapter is None
 
 
+@pytest.mark.parametrize(
+    ("distinct_adapters", "expected_adapter_count"),
+    ((False, 1), (True, 2)),
+)
+def test_vllm_problem_batch_uses_one_hybrid_transaction(
+    tmp_path,
+    distinct_adapters,
+    expected_adapter_count,
+) -> None:
+    policy = ToyGeneratingPolicy()
+    first_fast = trainable_parameter_state(policy)
+    second_fast = (
+        {
+            name: value.detach().clone().requires_grad_(True)
+            for name, value in first_fast.items()
+        }
+        if distinct_adapters
+        else first_fast
+    )
+    engine = object.__new__(VLLMHybridRolloutEngine)
+    TransformersRolloutEngine.__init__(
+        engine,
+        policy,
+        ToyTokenizer(),
+        group_size=2,
+        max_new_tokens=3,
+        temperature=1.0,
+        top_p=0.7,
+        top_k=0,
+        generation_micro_batch_size=2,
+    )
+    engine.adapter_root = tmp_path
+    engine.request_timeout = 30.0
+    engine.control_timeout = 5.0
+    engine._save_adapter = lambda adapter_dir, fast_parameters: None
+    engine._unadapted_logprobs = lambda group, **kwargs: torch.zeros_like(
+        group.old_logprobs
+    )
+
+    calls = []
+    sleeping = True
+    loaded_adapters = set()
+
+    def request_json(method, path, payload=None, *, timeout=None):
+        nonlocal sleeping
+        calls.append((method, path, payload, timeout))
+        if path == "/wake_up?tags=weights":
+            return None
+        if path == "/wake_up?tags=kv_cache":
+            sleeping = False
+            return None
+        if path == "/is_sleeping":
+            return {"is_sleeping": sleeping}
+        if path == "/v1/models":
+            model_ids = ["meta-rlvr-base", *sorted(loaded_adapters)]
+            return {"data": [{"id": model_id} for model_id in model_ids]}
+        if path == "/v1/completions":
+            assert payload["model"] in loaded_adapters
+            return {
+                "choices": [
+                    {
+                        "index": 0,
+                        "token_ids": [3, 6],
+                        "logprobs": {"token_logprobs": [-0.3, -0.6]},
+                    },
+                    {
+                        "index": 1,
+                        "token_ids": [5, 6],
+                        "logprobs": {"token_logprobs": [-0.5, -0.6]},
+                    },
+                ]
+            }
+        if path == "/sleep?level=1":
+            sleeping = True
+            return None
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    def request_text(method, path, payload=None, *, timeout=None):
+        calls.append((method, path, payload, timeout))
+        adapter_name = payload["lora_name"]
+        if path == "/v1/load_lora_adapter":
+            loaded_adapters.add(adapter_name)
+            return f"Success: LoRA adapter '{adapter_name}' added successfully."
+        if path == "/v1/unload_lora_adapter":
+            loaded_adapters.remove(adapter_name)
+            return f"Success: LoRA adapter '{adapter_name}' removed successfully."
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    engine._request_json = request_json
+    engine._request_text = request_text
+    problems = [
+        MathProblem(
+            uid=str(index),
+            messages=(ChatMessage(role="user", content="problem"),),
+            ground_truth="42",
+            data_source="unit_test",
+        )
+        for index in range(2)
+    ]
+    groups = engine.generate_batch(
+        problems,
+        [first_fast, second_fast],
+    )
+
+    paths = [path for _, path, _, _ in calls]
+    assert paths.count("/wake_up?tags=weights") == 1
+    assert paths.count("/wake_up?tags=kv_cache") == 1
+    assert paths.count("/v1/completions") == 2
+    assert paths.count("/v1/load_lora_adapter") == expected_adapter_count
+    assert paths.count("/v1/unload_lora_adapter") == expected_adapter_count
+    assert paths.count("/sleep?level=1") == 1
+    assert len(groups) == 2
+    assert all(group.rollout_logprobs is not None for group in groups)
+    assert sleeping
+    assert not loaded_adapters
+
+
 def test_vllm_http_500_fails_immediately() -> None:
     class FailingHandler(BaseHTTPRequestHandler):
         def do_GET(self):

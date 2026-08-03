@@ -24,6 +24,26 @@ if [[ "${SMOKE_GPUS}" != "1" && "${SMOKE_GPUS}" != "4" && "${SMOKE_GPUS}" != "8"
   exit 2
 fi
 export SMOKE_GPUS
+SMOKE_PROBLEM_BATCH_SIZE="${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}}"
+if [[ ! "${SMOKE_PROBLEM_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || \
+  (( SMOKE_PROBLEM_BATCH_SIZE < SMOKE_GPUS || SMOKE_PROBLEM_BATCH_SIZE % SMOKE_GPUS != 0 )); then
+  echo "SMOKE_PROBLEM_BATCH_SIZE must be at least and divisible by SMOKE_GPUS." >&2
+  exit 2
+fi
+export SMOKE_PROBLEM_BATCH_SIZE
+if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
+  local_problem_batch_size=$((SMOKE_PROBLEM_BATCH_SIZE / SMOKE_GPUS))
+  VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-1}"
+  VLLM_MAX_CPU_LORAS="${VLLM_MAX_CPU_LORAS:-${VLLM_MAX_LORAS}}"
+  if [[ ! "${VLLM_MAX_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
+    [[ ! "${VLLM_MAX_CPU_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
+    (( VLLM_MAX_LORAS < local_problem_batch_size )) || \
+    (( VLLM_MAX_CPU_LORAS < VLLM_MAX_LORAS )); then
+    echo "vLLM LoRA capacities must cover the per-rank problem batch ${local_problem_batch_size}." >&2
+    exit 2
+  fi
+  export VLLM_MAX_LORAS VLLM_MAX_CPU_LORAS
+fi
 
 if [[ -z "${SLURM_CPUS_PER_TASK:-}" ]]; then
   if [[ "${SMOKE_GPUS}" == "1" ]]; then
@@ -51,14 +71,16 @@ fi
 
 LOG_DIR="${META_RLVR_PROJECT_DIR%/}/logs"
 mkdir -p "${LOG_DIR}" "${META_RLVR_OUTPUT_DIR}"
+RUN_LABEL="${META_RLVR_RUN_LABEL:-smoke}"
 
 SBATCH_ARGS=(
+  --job-name="meta-rlvr-${RUN_LABEL}"
   --partition="${SLURM_PARTITION}"
   --gres="${SLURM_GRES:-gpu:${SMOKE_GPUS}}"
   --cpus-per-task="${SLURM_CPUS_PER_TASK}"
   --time="${SLURM_TIME:-02:00:00}"
-  --output="${LOG_DIR}/smoke-%j.out"
-  --error="${LOG_DIR}/smoke-%j.err"
+  --output="${LOG_DIR}/${RUN_LABEL}-%j.out"
+  --error="${LOG_DIR}/${RUN_LABEL}-%j.err"
   --export=ALL
 )
 if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
@@ -79,11 +101,12 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "stdout: ${LOG_DIR}/smoke-${job_id}.out"
-echo "stderr/progress: ${LOG_DIR}/smoke-${job_id}.err"
+echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}} K=${SMOKE_SUPPORT_GROUP_SIZE:-2}/${SMOKE_QUERY_GROUP_SIZE:-2} inner=${SMOKE_INNER_ITERATIONS:-1} outer=${SMOKE_OUTER_ITERATIONS:-1}"
+echo "stdout: ${LOG_DIR}/${RUN_LABEL}-${job_id}.out"
+echo "stderr/progress: ${LOG_DIR}/${RUN_LABEL}-${job_id}.err"
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
   echo "vLLM throughput: ${LOG_DIR}/vllm-${job_id}/gpu-*.log"
 fi
 echo "queue: squeue -j ${job_id}"
-echo "progress: tail -f ${LOG_DIR}/smoke-${job_id}.err"
-echo "metrics: tail -f ${LOG_DIR}/smoke-${job_id}.out"
+echo "progress: tail -F ${LOG_DIR}/${RUN_LABEL}-${job_id}.err"
+echo "metrics: tail -F ${LOG_DIR}/${RUN_LABEL}-${job_id}.out"

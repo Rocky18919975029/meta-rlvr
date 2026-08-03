@@ -25,8 +25,6 @@ export SMOKE_ROLLOUT_BACKEND="${SMOKE_ROLLOUT_BACKEND:-vllm}"
 export SMOKE_LORA_RANK="${SMOKE_LORA_RANK:-8}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.30}"
 export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-64}"
-export VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-1}"
-export VLLM_MAX_CPU_LORAS="${VLLM_MAX_CPU_LORAS:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 if [[ -z "${CONDA_EXE:-}" ]]; then
@@ -44,6 +42,22 @@ if [[ "${SMOKE_GPUS}" != "4" && "${SMOKE_GPUS}" != "8" ]]; then
   exit 2
 fi
 export SMOKE_GPUS
+export SMOKE_PROBLEM_BATCH_SIZE="${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}}"
+if [[ ! "${SMOKE_PROBLEM_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || \
+  (( SMOKE_PROBLEM_BATCH_SIZE < SMOKE_GPUS || SMOKE_PROBLEM_BATCH_SIZE % SMOKE_GPUS != 0 )); then
+  echo "SMOKE_PROBLEM_BATCH_SIZE must be at least and divisible by SMOKE_GPUS." >&2
+  exit 2
+fi
+local_problem_batch_size=$((SMOKE_PROBLEM_BATCH_SIZE / SMOKE_GPUS))
+export VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-${local_problem_batch_size}}"
+export VLLM_MAX_CPU_LORAS="${VLLM_MAX_CPU_LORAS:-${VLLM_MAX_LORAS}}"
+if [[ ! "${VLLM_MAX_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
+  [[ ! "${VLLM_MAX_CPU_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
+  (( VLLM_MAX_LORAS < local_problem_batch_size )) || \
+  (( VLLM_MAX_CPU_LORAS < VLLM_MAX_LORAS )); then
+  echo "vLLM LoRA capacities must cover the per-rank problem batch ${local_problem_batch_size}." >&2
+  exit 2
+fi
 
 SLURM_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 if [[ ! "${SLURM_CPUS_PER_TASK}" =~ ^[1-9][0-9]*$ ]]; then
@@ -94,7 +108,7 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS}"
+echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE} max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS}"
 echo "stdout: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
 echo "vLLM throughput: ${LOG_DIR}/vllm-${job_id}/gpu-*.log"
