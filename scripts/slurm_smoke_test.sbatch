@@ -2,7 +2,7 @@
 #SBATCH --job-name=meta-rlvr-smoke
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=12
 #SBATCH --time=02:00:00
 
 set -euo pipefail

@@ -25,6 +25,23 @@ if [[ "${SMOKE_GPUS}" != "1" && "${SMOKE_GPUS}" != "4" && "${SMOKE_GPUS}" != "8"
 fi
 export SMOKE_GPUS
 
+if [[ -z "${SLURM_CPUS_PER_TASK:-}" ]]; then
+  if [[ "${SMOKE_GPUS}" == "1" ]]; then
+    SLURM_CPUS_PER_TASK=12
+  else
+    SLURM_CPUS_PER_TASK=32
+  fi
+fi
+if [[ ! "${SLURM_CPUS_PER_TASK}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SLURM_CPUS_PER_TASK must be a positive integer." >&2
+  exit 2
+fi
+if ((SLURM_CPUS_PER_TASK > 12 * SMOKE_GPUS)); then
+  echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK} exceeds the cluster limit of 12 CPUs per GPU." >&2
+  exit 2
+fi
+export SLURM_CPUS_PER_TASK
+
 cd "${META_RLVR_PROJECT_DIR}"
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
   echo "Checking vLLM environment before requesting GPUs..."
@@ -37,6 +54,7 @@ mkdir -p "${LOG_DIR}" "${META_RLVR_OUTPUT_DIR}"
 SBATCH_ARGS=(
   --partition="${SLURM_PARTITION}"
   --gres="${SLURM_GRES:-gpu:${SMOKE_GPUS}}"
+  --cpus-per-task="${SLURM_CPUS_PER_TASK}"
   --time="${SLURM_TIME:-02:00:00}"
   --output="${LOG_DIR}/smoke-%j.out"
   --error="${LOG_DIR}/smoke-%j.err"

@@ -45,6 +45,17 @@ if [[ "${SMOKE_GPUS}" != "4" && "${SMOKE_GPUS}" != "8" ]]; then
 fi
 export SMOKE_GPUS
 
+SLURM_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
+if [[ ! "${SLURM_CPUS_PER_TASK}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SLURM_CPUS_PER_TASK must be a positive integer." >&2
+  exit 2
+fi
+if ((SLURM_CPUS_PER_TASK > 12 * SMOKE_GPUS)); then
+  echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK} exceeds the cluster limit of 12 CPUs per GPU." >&2
+  exit 2
+fi
+export SLURM_CPUS_PER_TASK
+
 cd "${META_RLVR_PROJECT_DIR}"
 if [[ "${SMOKE_ROLLOUT_BACKEND}" == "vllm" ]]; then
   echo "Checking vLLM environment before requesting GPUs..."
@@ -58,6 +69,7 @@ SBATCH_ARGS=(
   --job-name="meta-rlvr-${META_RLVR_RUN_LABEL}"
   --partition="${SLURM_PARTITION}"
   --gres="${SLURM_GRES:-gpu:${SMOKE_GPUS}}"
+  --cpus-per-task="${SLURM_CPUS_PER_TASK}"
   --time="${SLURM_TIME:-08:00:00}"
   --output="${LOG_DIR}/${META_RLVR_RUN_LABEL}-%j.out"
   --error="${LOG_DIR}/${META_RLVR_RUN_LABEL}-%j.err"
