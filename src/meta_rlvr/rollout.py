@@ -448,12 +448,20 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             self._save_adapter(adapter_dir, fast_parameters)
             self._request_json("POST", "/wake_up?tags=weights")
             weights_awake = True
-            self._request_json(
+            load_response = self._request_text(
                 "POST",
                 "/v1/load_lora_adapter",
                 {"lora_name": adapter_name, "lora_path": str(adapter_dir)},
             )
             loaded = True
+            expected_load_response = (
+                f"Success: LoRA adapter '{adapter_name}' added successfully."
+            )
+            if load_response != expected_load_response:
+                raise RuntimeError(
+                    "Unexpected vLLM LoRA load response: "
+                    f"{load_response!r}; expected {expected_load_response!r}."
+                )
             models = self._request_json("GET", "/v1/models")
             self._require_model_registration(models, adapter_name, present=True)
             self._request_json("POST", "/wake_up?tags=kv_cache")
@@ -569,11 +577,20 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         errors: list[Exception] = []
         if loaded:
             try:
-                self._request_json(
+                unload_response = self._request_text(
                     "POST",
                     "/v1/unload_lora_adapter",
                     {"lora_name": adapter_name},
                 )
+                expected_unload_response = (
+                    f"Success: LoRA adapter '{adapter_name}' removed successfully."
+                )
+                if unload_response != expected_unload_response:
+                    raise RuntimeError(
+                        "Unexpected vLLM LoRA unload response: "
+                        f"{unload_response!r}; expected "
+                        f"{expected_unload_response!r}."
+                    )
                 models = self._request_json("GET", "/v1/models")
                 self._require_model_registration(
                     models,
@@ -732,6 +749,53 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         *,
         timeout: float | None = None,
     ) -> Any:
+        body = self._request_body(
+            method,
+            path,
+            payload,
+            timeout=timeout,
+        )
+        if not body:
+            return None
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as error:
+            rendered = body.decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"vLLM {method} {path} returned non-JSON content: {rendered!r}."
+            ) from error
+
+    def _request_text(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> str:
+        body = self._request_body(
+            method,
+            path,
+            payload,
+            timeout=timeout,
+        )
+        if not body:
+            raise RuntimeError(f"vLLM {method} {path} returned an empty response.")
+        try:
+            return body.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RuntimeError(
+                f"vLLM {method} {path} returned non-UTF-8 content."
+            ) from error
+
+    def _request_body(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> bytes:
         data = None
         headers: dict[str, str] = {}
         if payload is not None:
@@ -756,6 +820,4 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             ) from error
         except urllib.error.URLError as error:
             raise RuntimeError(f"vLLM {method} {path} failed: {error}") from error
-        if not body:
-            return None
-        return json.loads(body)
+        return body

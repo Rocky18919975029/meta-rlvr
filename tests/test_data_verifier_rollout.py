@@ -241,9 +241,6 @@ def test_vllm_rollout_uses_staged_hybrid_lifecycle(tmp_path) -> None:
         calls.append((method, path, payload, timeout))
         if path == "/wake_up?tags=weights":
             return None
-        if path == "/v1/load_lora_adapter":
-            loaded_adapter = payload["lora_name"]
-            return None
         if path == "/wake_up?tags=kv_cache":
             sleeping = False
             return None
@@ -272,15 +269,25 @@ def test_vllm_rollout_uses_staged_hybrid_lifecycle(tmp_path) -> None:
                     },
                 ]
             }
-        if path == "/v1/unload_lora_adapter":
-            loaded_adapter = None
-            return None
         if path == "/sleep?level=1":
             sleeping = True
             return None
         raise AssertionError(f"Unexpected request: {method} {path}")
 
+    def request_text(method, path, payload=None, *, timeout=None):
+        nonlocal loaded_adapter
+        calls.append((method, path, payload, timeout))
+        if path == "/v1/load_lora_adapter":
+            loaded_adapter = payload["lora_name"]
+            return f"Success: LoRA adapter '{loaded_adapter}' added successfully."
+        if path == "/v1/unload_lora_adapter":
+            adapter_name = payload["lora_name"]
+            loaded_adapter = None
+            return f"Success: LoRA adapter '{adapter_name}' removed successfully."
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
     engine._request_json = request_json
+    engine._request_text = request_text
     problem = MathProblem(
         uid="1",
         messages=(ChatMessage(role="user", content="problem"),),
@@ -328,6 +335,38 @@ def test_vllm_http_500_fails_immediately() -> None:
     try:
         with pytest.raises(RuntimeError, match="HTTP 500: deliberate failure"):
             engine._request_json("GET", "/health")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_vllm_plain_text_response_is_not_parsed_as_json() -> None:
+    response_body = b"Success: LoRA adapter 'test' added successfully."
+
+    class PlainTextHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(response_body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), PlainTextHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    engine = object.__new__(VLLMHybridRolloutEngine)
+    engine.base_url = f"http://127.0.0.1:{server.server_port}"
+    engine.control_timeout = 5.0
+    try:
+        assert engine._request_text("POST", "/v1/load_lora_adapter") == (
+            response_body.decode("utf-8")
+        )
+        with pytest.raises(RuntimeError, match="returned non-JSON content"):
+            engine._request_json("POST", "/v1/load_lora_adapter")
     finally:
         server.shutdown()
         server.server_close()
