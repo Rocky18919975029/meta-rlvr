@@ -1,12 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+META_RLVR_TRAINER_PID=""
+
+cleanup_all() {
+  if [[ -n "${META_RLVR_TRAINER_PID:-}" ]] && \
+    { kill -0 -- "-${META_RLVR_TRAINER_PID}" 2>/dev/null || kill -0 "${META_RLVR_TRAINER_PID}" 2>/dev/null; }; then
+    kill -TERM -- "-${META_RLVR_TRAINER_PID}" 2>/dev/null || \
+      kill -TERM "${META_RLVR_TRAINER_PID}" 2>/dev/null || true
+    wait "${META_RLVR_TRAINER_PID}" 2>/dev/null || true
+  fi
+  if declare -F stop_meta_rlvr_vllm_servers >/dev/null 2>&1; then
+    stop_meta_rlvr_vllm_servers
+  fi
+}
+
 on_error() {
   local exit_code=$?
   echo "[$(date --iso-8601=seconds)] smoke test failed at line ${BASH_LINENO[0]} (exit ${exit_code})" >&2
   exit "${exit_code}"
 }
 trap on_error ERR
+trap cleanup_all EXIT
+trap 'echo "[$(date --iso-8601=seconds)] smoke test terminated" >&2; exit 143' TERM
+trap 'echo "[$(date --iso-8601=seconds)] smoke test interrupted" >&2; exit 130' INT
 
 : "${META_RLVR_PROJECT_DIR:?Set META_RLVR_PROJECT_DIR to the HPC project directory}"
 : "${META_RLVR_MODEL_PATH:?Set META_RLVR_MODEL_PATH to the offline Qwen2.5-Math-7B directory}"
@@ -16,9 +33,10 @@ trap on_error ERR
 
 SMOKE_GPUS="${SMOKE_GPUS:-4}"
 case "${SMOKE_GPUS}" in
+  1) ACCELERATE_CONFIG="configs/accelerate_single_h100.yaml" ;;
   4) ACCELERATE_CONFIG="configs/accelerate_fsdp_4xh100.yaml" ;;
   8) ACCELERATE_CONFIG="configs/accelerate_fsdp_8xh100.yaml" ;;
-  *) echo "SMOKE_GPUS must be 4 or 8, got ${SMOKE_GPUS}" >&2; exit 2 ;;
+  *) echo "SMOKE_GPUS must be 1, 4, or 8, got ${SMOKE_GPUS}" >&2; exit 2 ;;
 esac
 
 for required_path in \
@@ -88,15 +106,10 @@ print(f"peft={peft.__version__}")
 print(f"accelerate={accelerate.__version__}")
 print(f"datasets={datasets.__version__}")
 if os.environ.get("SMOKE_ROLLOUT_BACKEND", "transformers") == "vllm":
-    import vllm
+    from meta_rlvr.vllm_preflight import validate_vllm_environment
 
-    vllm_version = Version(vllm.__version__)
-    print(f"vllm={vllm_version}")
-    if not (Version("0.11.0") <= vllm_version < Version("0.12.0")):
-        raise RuntimeError(
-            "The hybrid rollout backend is validated against vLLM 0.11.x, "
-            f"got {vllm_version}."
-        )
+    for package, package_version in validate_vllm_environment().items():
+        print(f"{package}={package_version}")
 try:
     torchao_version = version("torchao")
 except PackageNotFoundError:
@@ -117,13 +130,13 @@ echo "[$(date --iso-8601=seconds)] launching ${SMOKE_GPUS} distributed workers"
 EXTRA_TRAIN_ARGS=()
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
   source scripts/vllm_hybrid_servers.sh
-  trap stop_meta_rlvr_vllm_servers EXIT
   start_meta_rlvr_vllm_servers
   EXTRA_TRAIN_ARGS+=(
     --rollout-backend vllm
     --vllm-base-urls "${META_RLVR_VLLM_BASE_URLS}"
     --vllm-adapter-root "${VLLM_ADAPTER_ROOT:-/dev/shm}"
-    --vllm-request-timeout "${VLLM_REQUEST_TIMEOUT:-3600}"
+    --vllm-request-timeout "${VLLM_REQUEST_TIMEOUT:-900}"
+    --vllm-control-timeout "${VLLM_CONTROL_TIMEOUT:-120}"
   )
 elif [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" != "transformers" ]]; then
   echo "SMOKE_ROLLOUT_BACKEND must be transformers or vllm." >&2
@@ -135,7 +148,11 @@ fi
 if [[ "${SMOKE_ROLLOUT_ONLY:-0}" == "1" ]]; then
   EXTRA_TRAIN_ARGS+=(--rollout-only)
 fi
-accelerate launch \
+if ! command -v setsid >/dev/null 2>&1; then
+  echo "setsid is required to supervise the distributed trainer." >&2
+  exit 2
+fi
+setsid accelerate launch \
   --config_file "${ACCELERATE_CONFIG}" \
   -m meta_rlvr.train \
   --train-parquet "${META_RLVR_TRAIN_PARQUET}" \
@@ -156,7 +173,17 @@ accelerate launch \
   --inner-iterations "${SMOKE_INNER_ITERATIONS:-1}" \
   --outer-iterations "${SMOKE_OUTER_ITERATIONS:-1}" \
   "${EXTRA_TRAIN_ARGS[@]}" \
-  "$@"
+  "$@" &
+META_RLVR_TRAINER_PID="$!"
+set +e
+wait "${META_RLVR_TRAINER_PID}"
+trainer_status=$?
+set -e
+META_RLVR_TRAINER_PID=""
+if [[ "${trainer_status}" -ne 0 ]]; then
+  echo "Distributed trainer exited with status ${trainer_status}." >&2
+  exit "${trainer_status}"
+fi
 
 echo "[$(date --iso-8601=seconds)] ${RUN_LABEL} test completed successfully"
 echo "output=${RUN_DIR}"

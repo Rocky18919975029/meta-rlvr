@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, required=True)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
+    parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument(
         "--rollout-backend",
         choices=["transformers", "vllm"],
@@ -72,7 +73,8 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated colocated vLLM server URLs, one per process rank.",
     )
     parser.add_argument("--vllm-adapter-root", type=Path, default=Path("/dev/shm"))
-    parser.add_argument("--vllm-request-timeout", type=float, default=3600.0)
+    parser.add_argument("--vllm-request-timeout", type=float, default=900.0)
+    parser.add_argument("--vllm-control-timeout", type=float, default=120.0)
 
     parser.add_argument("--inner-iterations", type=int, default=4)
     parser.add_argument(
@@ -171,10 +173,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max_steps and save_steps must be positive.")
     if args.eval_steps < 0:
         raise ValueError("eval_steps must be non-negative.")
-    if (
-        args.validation_max_problems is not None
-        and args.validation_max_problems <= 0
-    ):
+    if args.validation_max_problems is not None and args.validation_max_problems <= 0:
         raise ValueError("validation_max_problems must be positive.")
     if args.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive.")
@@ -184,6 +183,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--vllm-base-urls is required for the vLLM backend.")
     if args.vllm_request_timeout <= 0:
         raise ValueError("--vllm-request-timeout must be positive.")
+    if args.vllm_control_timeout <= 0:
+        raise ValueError("--vllm-control-timeout must be positive.")
+    if args.top_k < 0:
+        raise ValueError("--top-k must be non-negative.")
     if args.confidence_weight_decay < 0:
         raise ValueError("confidence_weight_decay must be non-negative.")
     if (
@@ -198,7 +201,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         module.strip() for module in args.lora_target_modules.split(",")
     )
     if not target_modules or any(not module for module in target_modules):
-        raise ValueError("lora_target_modules must be a non-empty comma-separated list.")
+        raise ValueError(
+            "lora_target_modules must be a non-empty comma-separated list."
+        )
 
 
 def _configs(args: argparse.Namespace):
@@ -303,6 +308,23 @@ def _append_rollout_diagnostics(
                 "correct": verification.correctness[response_index].item(),
                 "response": response,
             }
+            if group.rollout_logprobs is not None:
+                selected = group.completion_mask[response_index]
+                delta = (
+                    group.rollout_logprobs[response_index, selected]
+                    - group.old_logprobs[response_index, selected]
+                )
+                record.update(
+                    {
+                        "vllm_raw_vs_pytorch_raw_mean_delta": (delta.mean().item()),
+                        "vllm_raw_vs_pytorch_raw_mean_absolute_delta": (
+                            delta.abs().mean().item()
+                        ),
+                        "vllm_raw_vs_pytorch_raw_max_absolute_delta": (
+                            delta.abs().max().item()
+                        ),
+                    }
+                )
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
         stream.flush()
 
@@ -367,8 +389,7 @@ def _evaluate(
         )
         for round_index in round_indices:
             problem_index = (
-                round_index * accelerator.num_processes
-                + accelerator.process_index
+                round_index * accelerator.num_processes + accelerator.process_index
             )
             valid = problem_index < len(problems)
             problem = problems[problem_index] if valid else problems[0]
@@ -452,9 +473,7 @@ def _evaluate(
                     "validation/base_accuracy": base_accuracy,
                     "validation/adapted_accuracy": adapted_accuracy,
                     "validation/accuracy_delta": adapted_accuracy - base_accuracy,
-                    "validation/base_pass_at_group": (
-                        totals[4] / len(problems)
-                    ).item(),
+                    "validation/base_pass_at_group": (totals[4] / len(problems)).item(),
                     "validation/adapted_pass_at_group": (
                         totals[5] / len(problems)
                     ).item(),
@@ -469,7 +488,9 @@ def _evaluate(
 def main() -> None:
     args = parse_args()
     _validate_args(args)
-    inner_config, meta_config, query_advantage_config, query_grpo_config = _configs(args)
+    inner_config, meta_config, query_advantage_config, query_grpo_config = _configs(
+        args
+    )
 
     from accelerate import Accelerator
     from accelerate.utils import set_seed
@@ -522,9 +543,7 @@ def main() -> None:
     if args.resume_from_checkpoint is not None:
         if not args.resume_from_checkpoint.is_dir():
             raise FileNotFoundError(args.resume_from_checkpoint)
-        match = re.fullmatch(
-            r"checkpoint-(\d+)", args.resume_from_checkpoint.name
-        )
+        match = re.fullmatch(r"checkpoint-(\d+)", args.resume_from_checkpoint.name)
         if match is None:
             raise ValueError(
                 "resume_from_checkpoint must end in checkpoint-<completed_steps>."
@@ -566,6 +585,7 @@ def main() -> None:
                 / f"rank-{accelerator.process_index}"
             ),
             "request_timeout": args.vllm_request_timeout,
+            "control_timeout": args.vllm_control_timeout,
         }
 
     def build_rollout_engine(group_size: int):
@@ -576,6 +596,7 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
+            top_k=args.top_k,
             generation_micro_batch_size=args.generation_micro_batch_size,
             logprob_micro_batch_size=args.policy_micro_batch_size,
             **rollout_kwargs,
@@ -583,18 +604,14 @@ def main() -> None:
 
     support_rollouts = build_rollout_engine(args.support_group_size)
     query_rollouts = build_rollout_engine(args.query_group_size)
-    verifier = DAPOMathVerifier(
-        strict_box_verify=args.verifier_mode == "strict_box"
-    )
+    verifier = DAPOMathVerifier(strict_box_verify=args.verifier_mode == "strict_box")
 
     all_problems = load_unique_dapo_problems(args.train_parquet)
     validation_problems = load_semantically_unique_dapo_problems(
         args.validation_parquet
     )
     if args.validation_max_problems is not None:
-        validation_problems = validation_problems[
-            : args.validation_max_problems
-        ]
+        validation_problems = validation_problems[: args.validation_max_problems]
     local_problems = rank_shard(
         all_problems,
         rank=accelerator.process_index,
@@ -621,9 +638,7 @@ def main() -> None:
     )
     for step in step_indices:
         problem = _next_problem(local_problems, step=step, seed=args.seed)
-        step_indices.set_postfix_str(
-            f"problem={problem.uid} stage=support-rollout"
-        )
+        step_indices.set_postfix_str(f"problem={problem.uid} stage=support-rollout")
         progress_prefix = f"train step {step + 1} problem {problem.uid}"
         support = support_rollouts.generate(
             problem,
@@ -631,9 +646,7 @@ def main() -> None:
             show_progress=accelerator.is_main_process,
             progress_description=f"{progress_prefix} support",
         )
-        step_indices.set_postfix_str(
-            f"problem={problem.uid} stage=support-verifier"
-        )
+        step_indices.set_postfix_str(f"problem={problem.uid} stage=support-verifier")
         support_verification = verifier(
             support.texts,
             problem.ground_truth,
@@ -668,9 +681,7 @@ def main() -> None:
             confidence_optimizer.zero_grad(set_to_none=True)
 
             if cached_query is None:
-                outer_iterations.set_postfix_str(
-                    "stage=generation-adaptation"
-                )
+                outer_iterations.set_postfix_str("stage=generation-adaptation")
                 generation_adaptation = algorithm.adapt_task(
                     support,
                     initial_fast,
@@ -726,9 +737,7 @@ def main() -> None:
                             ),
                         )
                     )
-                    rollout_totals = accelerator.reduce(
-                        rollout_totals, reduction="sum"
-                    )
+                    rollout_totals = accelerator.reduce(rollout_totals, reduction="sum")
                     if accelerator.is_main_process:
                         print(
                             json.dumps(
@@ -748,12 +757,8 @@ def main() -> None:
                                         rollout_totals[4] / rollout_totals[5]
                                     ).item(),
                                     "num_problems": accelerator.num_processes,
-                                    "support_responses": int(
-                                        rollout_totals[2].item()
-                                    ),
-                                    "query_responses": int(
-                                        rollout_totals[5].item()
-                                    ),
+                                    "support_responses": int(rollout_totals[2].item()),
+                                    "query_responses": int(rollout_totals[5].item()),
                                 },
                                 sort_keys=True,
                             ),
@@ -776,9 +781,7 @@ def main() -> None:
                 cached_query,
                 initial_fast,
                 show_progress=accelerator.is_main_process,
-                progress_prefix=(
-                    f"{progress_prefix} outer {outer_iteration + 1}"
-                ),
+                progress_prefix=(f"{progress_prefix} outer {outer_iteration + 1}"),
             )
             outer_iterations.set_postfix_str("stage=meta-backward")
             accelerator.backward(output.loss)

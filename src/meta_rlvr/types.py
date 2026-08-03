@@ -22,6 +22,7 @@ class RolloutGroup:
     verifier_rewards: Tensor | None = None
     correctness_labels: Tensor | None = None
     reference_logprobs: Tensor | None = None
+    rollout_logprobs: Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.input_ids.ndim != 2:
@@ -50,7 +51,9 @@ class RolloutGroup:
         if torch.any(self.completion_mask & ~self.attention_mask[:, 1:]):
             raise ValueError("completion_mask cannot select padding tokens.")
         if torch.any(self.completion_mask.sum(dim=1) == 0):
-            raise ValueError("Every response must contain at least one completion token.")
+            raise ValueError(
+                "Every response must contain at least one completion token."
+            )
 
         self._validate_floating_tensor("old_logprobs", self.old_logprobs)
         if self.reference_logprobs is not None:
@@ -59,15 +62,15 @@ class RolloutGroup:
             self._validate_floating_tensor(
                 "reference_logprobs", self.reference_logprobs
             )
+        if self.rollout_logprobs is not None:
+            if self.rollout_logprobs.shape != (k, length - 1):
+                raise ValueError("rollout_logprobs must have shape [K, L - 1].")
+            self._validate_floating_tensor("rollout_logprobs", self.rollout_logprobs)
         if self.verifier_rewards is not None:
             if self.verifier_rewards.shape != (k,):
                 raise ValueError("verifier_rewards must have shape [K].")
-            self._validate_floating_tensor(
-                "verifier_rewards", self.verifier_rewards
-            )
-            if torch.any(
-                (self.verifier_rewards != -1) & (self.verifier_rewards != 1)
-            ):
+            self._validate_floating_tensor("verifier_rewards", self.verifier_rewards)
+            if torch.any((self.verifier_rewards != -1) & (self.verifier_rewards != 1)):
                 raise ValueError("verifier_rewards must contain only -1 and 1.")
         if self.correctness_labels is not None:
             if self.correctness_labels.shape != (k,):
@@ -86,9 +89,7 @@ class RolloutGroup:
         if self.verifier_rewards is not None and not torch.equal(
             self.verifier_rewards, 2.0 * self.correctness_labels - 1.0
         ):
-            raise ValueError(
-                "verifier_rewards must equal 2 * correctness_labels - 1."
-            )
+            raise ValueError("verifier_rewards must equal 2 * correctness_labels - 1.")
 
         devices = {
             self.input_ids.device,
@@ -98,6 +99,8 @@ class RolloutGroup:
         }
         if self.reference_logprobs is not None:
             devices.add(self.reference_logprobs.device)
+        if self.rollout_logprobs is not None:
+            devices.add(self.rollout_logprobs.device)
         if self.verifier_rewards is not None:
             devices.add(self.verifier_rewards.device)
         if self.correctness_labels is not None:

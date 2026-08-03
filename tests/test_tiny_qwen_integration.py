@@ -1,5 +1,11 @@
 import torch
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    get_peft_model_state_dict,
+)
+from safetensors.torch import load_file
 from transformers import Qwen2Config, Qwen2ForCausalLM, Qwen2Model
 
 from meta_rlvr.bilevel import BilevelGRPO
@@ -94,9 +100,7 @@ def test_tiny_qwen_peft_supports_differentiable_bilevel_update() -> None:
         Qwen2Model(config),
         hidden_size=config.hidden_size,
     )
-    initial_fast = trainable_parameter_state(
-        policy, required_name_substring="lora_"
-    )
+    initial_fast = trainable_parameter_state(policy, required_name_substring="lora_")
     support = make_group(policy, torch.tensor([1.0, 0.0, 0.0]))
     query = make_group(policy, torch.tensor([0.0, 1.0, 0.0]))
 
@@ -133,9 +137,23 @@ def test_task_fast_parameters_export_as_peft_adapter(tmp_path) -> None:
         ),
     )
     fast = trainable_parameter_state(policy, required_name_substring="lora_")
+    with torch.no_grad():
+        for index, value in enumerate(fast.values(), start=1):
+            value.copy_(
+                torch.arange(value.numel(), dtype=value.dtype).reshape_as(value) / index
+            )
     engine = object.__new__(VLLMHybridRolloutEngine)
     engine.model = policy
     engine._save_adapter(tmp_path, fast)
 
     assert (tmp_path / "adapter_config.json").is_file()
     assert (tmp_path / "adapter_model.safetensors").is_file()
+    exported = load_file(tmp_path / "adapter_model.safetensors")
+    expected = get_peft_model_state_dict(
+        policy,
+        state_dict=fast,
+        adapter_name="default",
+    )
+    assert exported.keys() == expected.keys()
+    for name, value in expected.items():
+        torch.testing.assert_close(exported[name], value.cpu())

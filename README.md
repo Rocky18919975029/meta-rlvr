@@ -251,17 +251,49 @@ token IDs to PyTorch for old-log-probability computation. Full responses and
 strict-box verifier predictions are written to per-rank JSONL files under
 `outputs/rollout-test-$SLURM_JOB_ID`.
 
-The vLLM lifecycle follows verl's hybrid engine design. Servers start first and
-enter level-1 sleep. Every rollout wakes `weights` and `kv_cache`, dynamically
-loads the detached task LoRA from node-local `/dev/shm`, generates with
-continuous batching, unloads the adapter and sleeps before PyTorch performs
-inner/outer gradient work. The Transformers backend remains available for CPU
-tests via `SMOKE_ROLLOUT_BACKEND=transformers`; it is not the default for the
-H100 meaningful tests. Per-replica vLLM logs and throughput metrics are under
-`logs/vllm-$SLURM_JOB_ID/gpu-*.log`.
+The vLLM lifecycle follows verl's hybrid engine ordering. Servers start first
+and enter level-1 sleep. Every rollout wakes only `weights`, dynamically loads
+the detached task LoRA from node-local `/dev/shm`, wakes `kv_cache`, generates
+with continuous batching, unregisters the adapter and sleeps before PyTorch
+performs inner/outer gradient work. The launcher explicitly enables vLLM's
+development lifecycle endpoints and supervises every server process. An HTTP
+500, a missing endpoint or a dead replica terminates the trainer and the Slurm
+job instead of waiting through a long timeout. The Transformers backend remains
+available for CPU tests via `SMOKE_ROLLOUT_BACKEND=transformers`; it is not the
+default for the H100 meaningful tests. Per-replica vLLM logs and throughput
+metrics are under `logs/vllm-$SLURM_JOB_ID/gpu-*.log`.
+
+Recent FastAPI releases require `prometheus-fastapi-instrumentator>=8.0.1`.
+The submitters validate this on the login node before requesting any GPU. Since
+the HPC has no network, download the universal wheel on a networked machine,
+copy it with the project wheelhouse, and install it into `verl` once:
+
+```bash
+# Networked local machine
+python -m pip download --no-deps \
+  prometheus-fastapi-instrumentator==8.0.1 \
+  -d /tmp/meta-rlvr-wheelhouse
+META_RLVR_LOCAL_WHEELHOUSE=/tmp/meta-rlvr-wheelhouse \
+  bash scripts/sync_to_hpc.sh
+
+# HPC login node
+conda activate verl
+python -m pip install --no-deps \
+  "$HOME/meta-rlvr/artifacts/wheelhouse/prometheus_fastapi_instrumentator-8.0.1-"*.whl
+```
+
+Before any four-GPU job, run the capped 30-minute, one-H100 lifecycle test. It
+uses K=2 and 32 generated tokens but still executes support rollout, confidence
+adaptation and query rollout:
+
+```bash
+cd "$HOME/meta-rlvr"
+conda activate verl
+bash scripts/submit_vllm_lifecycle_test.sh
+```
 
 The conservative colocated allocation is 42% of each H100 for vLLM. Override it
-only after measuring peak training memory:
+only after the single-H100 lifecycle test succeeds and peak memory is measured:
 
 ```bash
 export SMOKE_GPUS=4
@@ -309,10 +341,14 @@ post-adaptation validation before launching a long training run.
 The meaningful test also writes one JSONL file per distributed rank:
 `rollouts-rank-$RANK.jsonl`. Every record contains the full response, completion
 length, length-limit flag, verifier-extracted prediction, official `-1/+1`
-reward and binary correctness label. Checkpointing drops completed rollout
-tensors and confidence gradients, synchronizes CUDA and empties the caching
-allocator before the FSDP save; stdout reports allocated, reserved and peak GPU
-memory at that boundary.
+reward and binary correctness label. vLLM is pinned to return raw sampled-token
+log-probabilities, and the records contain their deltas against PyTorch's raw
+recomputation; an aggregate mean/maximum diagnostic is printed after every
+rollout. These values
+make rollout-policy mismatch observable before a long run. Checkpointing drops
+completed rollout tensors and confidence gradients, synchronizes CUDA and
+empties the caching allocator before the FSDP save; stdout reports allocated,
+reserved and peak GPU memory at that boundary.
 
 The equivalent explicit settings are:
 

@@ -11,6 +11,7 @@ dependencies = [
     "accelerate>=1.0",
     "datasets>=3.0",
     "peft>=0.13",
+    "packaging>=23.0",
     "pyarrow>=17.0",
     "safetensors>=0.4",
     "torch>=2.4",
@@ -25,7 +26,10 @@ meta-rlvr-inspect-prompt = "meta_rlvr.inspect_prompt:main"
 [project.optional-dependencies]
 test = ["pytest>=7.4"]
 baselines = ["trl>=0.17"]
-rollout = ["vllm>=0.11,<0.12"]
+rollout = [
+    "vllm>=0.11,<0.12",
+    "prometheus-fastapi-instrumentator>=8.0.1",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -26,6 +26,7 @@ export SMOKE_LORA_RANK="${SMOKE_LORA_RANK:-8}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.42}"
 export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-64}"
 export VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-1}"
+export VLLM_MAX_CPU_LORAS="${VLLM_MAX_CPU_LORAS:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 if [[ -z "${CONDA_EXE:-}" ]]; then
@@ -43,6 +44,12 @@ if [[ "${SMOKE_GPUS}" != "4" && "${SMOKE_GPUS}" != "8" ]]; then
   exit 2
 fi
 export SMOKE_GPUS
+
+cd "${META_RLVR_PROJECT_DIR}"
+if [[ "${SMOKE_ROLLOUT_BACKEND}" == "vllm" ]]; then
+  echo "Checking vLLM environment before requesting GPUs..."
+  python "${META_RLVR_PROJECT_DIR%/}/src/meta_rlvr/vllm_preflight.py"
+fi
 
 LOG_DIR="${META_RLVR_PROJECT_DIR%/}/logs"
 mkdir -p "${LOG_DIR}" "${META_RLVR_OUTPUT_DIR}"

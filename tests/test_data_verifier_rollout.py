@@ -1,4 +1,6 @@
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -35,9 +37,7 @@ def test_parse_dapo_row_and_rank_shard_are_strict() -> None:
         parse_dapo_row(malformed)
 
 
-def test_evaluation_loader_collapses_replicated_prompts(
-    tmp_path, monkeypatch
-) -> None:
+def test_evaluation_loader_collapses_replicated_prompts(tmp_path, monkeypatch) -> None:
     parquet = tmp_path / "aime24.parquet"
     parquet.touch()
     first = {
@@ -76,9 +76,7 @@ def test_official_dapo_verifier_wrapper_separates_rewards_and_correctness() -> N
         device=torch.device("cpu"),
     )
     torch.testing.assert_close(verification.rewards, torch.tensor([1.0, -1.0]))
-    torch.testing.assert_close(
-        verification.correctness, torch.tensor([1.0, 0.0])
-    )
+    torch.testing.assert_close(verification.correctness, torch.tensor([1.0, 0.0]))
     assert verification.predictions == ("42", "41")
 
 
@@ -92,10 +90,12 @@ class ToyTokenizer:
         assert add_generation_prompt
         return "prompt"
 
-    def __call__(self, text, return_tensors, add_special_tokens):
+    def __call__(self, text, return_tensors=None, add_special_tokens=False):
         assert text == "prompt"
-        assert return_tensors == "pt"
         assert not add_special_tokens
+        if return_tensors is None:
+            return {"input_ids": [1, 2]}
+        assert return_tensors == "pt"
         return {
             "input_ids": torch.tensor([[1, 2]]),
             "attention_mask": torch.tensor([[1, 1]]),
@@ -168,15 +168,24 @@ def test_vllm_rollout_preserves_returned_token_ids_and_choice_order() -> None:
         top_p=0.7,
         generation_micro_batch_size=2,
     )
-    completion_ids = engine._completion_ids(
+    completion_ids, completion_logprobs = engine._completion_data(
         {
             "choices": [
-                {"index": 1, "token_ids": [5, 6]},
-                {"index": 0, "token_ids": [3, 4, 6]},
+                {
+                    "index": 1,
+                    "token_ids": [5, 6],
+                    "logprobs": {"token_logprobs": [-0.5, -0.6]},
+                },
+                {
+                    "index": 0,
+                    "token_ids": [3, 4, 6],
+                    "logprobs": {"token_logprobs": [-0.3, -0.4, -0.6]},
+                },
             ]
         }
     )
     assert completion_ids == [[3, 4, 6], [5, 6]]
+    assert completion_logprobs == [[-0.3, -0.4, -0.6], [-0.5, -0.6]]
 
     sequences = engine._sequences_from_completion_ids([1, 2], completion_ids)
     assert sequences.tolist() == [[1, 2, 3, 4, 6], [1, 2, 5, 6, 0]]
@@ -185,3 +194,142 @@ def test_vllm_rollout_preserves_returned_token_ids_and_choice_order() -> None:
         [False, True, True, True],
         [False, True, True, False],
     ]
+    rollout_logprobs = engine._aligned_rollout_logprobs(
+        group,
+        completion_logprobs,
+    )
+    torch.testing.assert_close(
+        rollout_logprobs,
+        torch.tensor(
+            [
+                [0.0, -0.3, -0.4, -0.6],
+                [0.0, -0.5, -0.6, 0.0],
+            ]
+        ),
+    )
+
+
+def test_vllm_rollout_uses_staged_hybrid_lifecycle(tmp_path) -> None:
+    policy = ToyGeneratingPolicy()
+    fast = trainable_parameter_state(policy)
+    engine = object.__new__(VLLMHybridRolloutEngine)
+    TransformersRolloutEngine.__init__(
+        engine,
+        policy,
+        ToyTokenizer(),
+        group_size=2,
+        max_new_tokens=3,
+        temperature=1.0,
+        top_p=0.7,
+        top_k=0,
+        generation_micro_batch_size=2,
+    )
+    engine.adapter_root = tmp_path
+    engine.request_timeout = 30.0
+    engine.control_timeout = 5.0
+    engine._save_adapter = lambda adapter_dir, fast_parameters: None
+    engine._unadapted_logprobs = lambda group, **kwargs: torch.zeros_like(
+        group.old_logprobs
+    )
+
+    calls = []
+    sleeping = True
+    loaded_adapter = None
+
+    def request_json(method, path, payload=None, *, timeout=None):
+        nonlocal sleeping, loaded_adapter
+        calls.append((method, path, payload, timeout))
+        if path == "/wake_up?tags=weights":
+            return None
+        if path == "/v1/load_lora_adapter":
+            loaded_adapter = payload["lora_name"]
+            return None
+        if path == "/wake_up?tags=kv_cache":
+            sleeping = False
+            return None
+        if path == "/is_sleeping":
+            return {"is_sleeping": sleeping}
+        if path == "/v1/models":
+            model_ids = ["meta-rlvr-base"]
+            if loaded_adapter is not None:
+                model_ids.append(loaded_adapter)
+            return {"data": [{"id": model_id} for model_id in model_ids]}
+        if path == "/v1/completions":
+            assert payload["add_special_tokens"] is False
+            assert payload["logprobs"] == 0
+            assert payload["top_k"] == 0
+            return {
+                "choices": [
+                    {
+                        "index": 0,
+                        "token_ids": [3, 6],
+                        "logprobs": {"token_logprobs": [-0.3, -0.6]},
+                    },
+                    {
+                        "index": 1,
+                        "token_ids": [5, 6],
+                        "logprobs": {"token_logprobs": [-0.5, -0.6]},
+                    },
+                ]
+            }
+        if path == "/v1/unload_lora_adapter":
+            loaded_adapter = None
+            return None
+        if path == "/sleep?level=1":
+            sleeping = True
+            return None
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    engine._request_json = request_json
+    problem = MathProblem(
+        uid="1",
+        messages=(ChatMessage(role="user", content="problem"),),
+        ground_truth="42",
+        data_source="unit_test",
+    )
+    group = engine.generate(problem, fast)
+
+    paths = [path for _, path, _, _ in calls]
+    assert paths[:6] == [
+        "/wake_up?tags=weights",
+        "/v1/load_lora_adapter",
+        "/v1/models",
+        "/wake_up?tags=kv_cache",
+        "/is_sleeping",
+        "/v1/completions",
+    ]
+    assert paths[-4:] == [
+        "/v1/unload_lora_adapter",
+        "/v1/models",
+        "/sleep?level=1",
+        "/is_sleeping",
+    ]
+    assert group.rollout_logprobs is not None
+    assert sleeping
+    assert loaded_adapter is None
+
+
+def test_vllm_http_500_fails_immediately() -> None:
+    class FailingHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(b"deliberate failure")
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FailingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    engine = object.__new__(VLLMHybridRolloutEngine)
+    engine.base_url = f"http://127.0.0.1:{server.server_port}"
+    engine.control_timeout = 5.0
+    try:
+        with pytest.raises(RuntimeError, match="HTTP 500: deliberate failure"):
+            engine._request_json("GET", "/health")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert not thread.is_alive()

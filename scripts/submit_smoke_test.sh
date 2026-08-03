@@ -19,11 +19,17 @@ if [[ -n "${META_RLVR_CONDA_ENV}" && -z "${CONDA_EXE:-}" ]]; then
 fi
 
 SMOKE_GPUS="${SMOKE_GPUS:-4}"
-if [[ "${SMOKE_GPUS}" != "4" && "${SMOKE_GPUS}" != "8" ]]; then
-  echo "SMOKE_GPUS must be 4 or 8, got ${SMOKE_GPUS}" >&2
+if [[ "${SMOKE_GPUS}" != "1" && "${SMOKE_GPUS}" != "4" && "${SMOKE_GPUS}" != "8" ]]; then
+  echo "SMOKE_GPUS must be 1, 4, or 8, got ${SMOKE_GPUS}" >&2
   exit 2
 fi
 export SMOKE_GPUS
+
+cd "${META_RLVR_PROJECT_DIR}"
+if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
+  echo "Checking vLLM environment before requesting GPUs..."
+  python "${META_RLVR_PROJECT_DIR%/}/src/meta_rlvr/vllm_preflight.py"
+fi
 
 LOG_DIR="${META_RLVR_PROJECT_DIR%/}/logs"
 mkdir -p "${LOG_DIR}" "${META_RLVR_OUTPUT_DIR}"
@@ -31,6 +37,7 @@ mkdir -p "${LOG_DIR}" "${META_RLVR_OUTPUT_DIR}"
 SBATCH_ARGS=(
   --partition="${SLURM_PARTITION}"
   --gres="${SLURM_GRES:-gpu:${SMOKE_GPUS}}"
+  --time="${SLURM_TIME:-02:00:00}"
   --output="${LOG_DIR}/smoke-%j.out"
   --error="${LOG_DIR}/smoke-%j.err"
   --export=ALL
