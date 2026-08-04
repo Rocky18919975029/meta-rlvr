@@ -1,7 +1,11 @@
 import pytest
 
 from meta_rlvr.data import ChatMessage, MathProblem, rank_shard
-from meta_rlvr.train import _local_problem_batch_size, _problem_batch
+from meta_rlvr.train import (
+    _local_problem_batch_size,
+    _problem_batch,
+    _problem_batch_layout,
+)
 
 
 def _problems(count: int) -> list[MathProblem]:
@@ -26,6 +30,37 @@ def test_problem_batch_size_is_global_and_divided_across_ranks() -> None:
         _local_problem_batch_size(32, world_size=6)
     with pytest.raises(ValueError, match="at least"):
         _local_problem_batch_size(2, world_size=4)
+
+
+def test_problem_microbatch_layout_preserves_global_optimizer_batch() -> None:
+    assert _problem_batch_layout(512, 32, world_size=8) == (
+        512,
+        64,
+        32,
+        4,
+        16,
+    )
+    assert _problem_batch_layout(512, 32, world_size=4) == (
+        512,
+        128,
+        32,
+        8,
+        16,
+    )
+    assert _problem_batch_layout(32, None, world_size=8) == (
+        32,
+        4,
+        32,
+        4,
+        1,
+    )
+
+    with pytest.raises(ValueError, match="cannot exceed"):
+        _problem_batch_layout(32, 64, world_size=8)
+    with pytest.raises(ValueError, match="world size"):
+        _problem_batch_layout(32, 12, world_size=8)
+    with pytest.raises(ValueError, match="divisible by problem_micro"):
+        _problem_batch_layout(96, 64, world_size=8)
 
 
 def test_problem_batches_are_deterministic_and_advance_by_local_batch() -> None:

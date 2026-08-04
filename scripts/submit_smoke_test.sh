@@ -31,15 +31,25 @@ if [[ ! "${SMOKE_PROBLEM_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || \
   exit 2
 fi
 export SMOKE_PROBLEM_BATCH_SIZE
+SMOKE_PROBLEM_MICRO_BATCH_SIZE="${SMOKE_PROBLEM_MICRO_BATCH_SIZE:-${SMOKE_PROBLEM_BATCH_SIZE}}"
+if [[ ! "${SMOKE_PROBLEM_MICRO_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || \
+  (( SMOKE_PROBLEM_MICRO_BATCH_SIZE < SMOKE_GPUS || \
+     SMOKE_PROBLEM_MICRO_BATCH_SIZE > SMOKE_PROBLEM_BATCH_SIZE || \
+     SMOKE_PROBLEM_MICRO_BATCH_SIZE % SMOKE_GPUS != 0 || \
+     SMOKE_PROBLEM_BATCH_SIZE % SMOKE_PROBLEM_MICRO_BATCH_SIZE != 0 )); then
+  echo "SMOKE_PROBLEM_MICRO_BATCH_SIZE must divide the problem batch and be divisible by SMOKE_GPUS." >&2
+  exit 2
+fi
+export SMOKE_PROBLEM_MICRO_BATCH_SIZE
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
-  local_problem_batch_size=$((SMOKE_PROBLEM_BATCH_SIZE / SMOKE_GPUS))
+  local_problem_micro_batch_size=$((SMOKE_PROBLEM_MICRO_BATCH_SIZE / SMOKE_GPUS))
   VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-1}"
   VLLM_MAX_CPU_LORAS="${VLLM_MAX_CPU_LORAS:-${VLLM_MAX_LORAS}}"
   if [[ ! "${VLLM_MAX_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
     [[ ! "${VLLM_MAX_CPU_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
-    (( VLLM_MAX_LORAS < local_problem_batch_size )) || \
+    (( VLLM_MAX_LORAS < local_problem_micro_batch_size )) || \
     (( VLLM_MAX_CPU_LORAS < VLLM_MAX_LORAS )); then
-    echo "vLLM LoRA capacities must cover the per-rank problem batch ${local_problem_batch_size}." >&2
+    echo "vLLM LoRA capacities must cover the per-rank problem microbatch ${local_problem_micro_batch_size}." >&2
     exit 2
   fi
   export VLLM_MAX_LORAS VLLM_MAX_CPU_LORAS
@@ -104,7 +114,7 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}} K=${SMOKE_SUPPORT_GROUP_SIZE:-2}/${SMOKE_QUERY_GROUP_SIZE:-2} inner=${SMOKE_INNER_ITERATIONS:-1} outer=${SMOKE_OUTER_ITERATIONS:-1} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0} component_gradient_norms=${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}"
+echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}} problem_microbatch=${SMOKE_PROBLEM_MICRO_BATCH_SIZE} K=${SMOKE_SUPPORT_GROUP_SIZE:-2}/${SMOKE_QUERY_GROUP_SIZE:-2} inner=${SMOKE_INNER_ITERATIONS:-1} outer=${SMOKE_OUTER_ITERATIONS:-1} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0} component_gradient_norms=${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}"
 echo "stdout: ${LOG_DIR}/${RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${RUN_LABEL}-${job_id}.err"
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then

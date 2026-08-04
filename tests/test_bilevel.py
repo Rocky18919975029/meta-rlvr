@@ -14,8 +14,13 @@ from meta_rlvr.config import (
     InnerLoopConfig,
     MetaLossConfig,
 )
+from meta_rlvr.data import ChatMessage, MathProblem
 from meta_rlvr.functional import token_logprobs, trainable_parameter_state
-from meta_rlvr.train import _measure_component_gradient_norms
+from meta_rlvr.train import (
+    CachedRolloutMicrobatch,
+    _accumulate_outer_batch,
+    _measure_component_gradient_norms,
+)
 from meta_rlvr.types import RolloutGroup
 
 
@@ -267,6 +272,15 @@ class CPUAccelerator:
         return None
 
 
+def _problem(uid: str) -> MathProblem:
+    return MathProblem(
+        uid=uid,
+        messages=(ChatMessage(role="user", content=f"problem {uid}"),),
+        ground_truth="0",
+        data_source="unit_test",
+    )
+
+
 def _parameter_gradient_norm(
     loss: torch.Tensor,
     parameters: tuple[nn.Parameter, ...],
@@ -326,11 +340,18 @@ def test_component_gradient_norms_are_exact_and_leave_no_gradients() -> None:
         ),
     }
     optimizer = torch.optim.AdamW(confidence.parameters(), lr=1e-3)
+    rollout_microbatches = [
+        CachedRolloutMicrobatch(
+            problems=(_problem("0"),),
+            supports=(support,),
+            queries=(query,),
+        )
+    ]
 
     measured = _measure_component_gradient_norms(
         algorithm=algorithm,
-        supports=[support],
-        queries=[query],
+        rollout_microbatches=rollout_microbatches,
+        local_problem_batch_size=1,
         initial_fast=initial_fast,
         confidence_model=confidence,
         confidence_optimizer=optimizer,
@@ -354,3 +375,85 @@ def test_component_gradient_norms_are_exact_and_leave_no_gradients() -> None:
         torch.testing.assert_close(parameter, initial_parameter)
     assert not optimizer.state
     assert all(parameter.grad is None for parameter in confidence.parameters())
+
+
+def test_problem_microbatch_accumulation_matches_full_batch_gradient() -> None:
+    torch.manual_seed(16)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(), hidden_size=5
+    )
+    initial_fast = trainable_parameter_state(policy)
+    supports = (
+        make_group(policy, torch.tensor([1.0, 0.0, 1.0])),
+        make_group(policy, torch.tensor([0.0, 1.0, 0.0])),
+        make_group(policy, torch.tensor([1.0, 1.0, 0.0])),
+        make_group(policy, torch.tensor([0.0, 0.0, 1.0])),
+    )
+    queries = (
+        make_group(policy, torch.tensor([0.0, 1.0, 0.0])),
+        make_group(policy, torch.tensor([1.0, 0.0, 1.0])),
+        make_group(policy, torch.tensor([0.0, 1.0, 1.0])),
+        make_group(policy, torch.tensor([1.0, 0.0, 0.0])),
+    )
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(
+            num_iterations=1,
+            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+        ),
+        meta_config=MetaLossConfig(),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+    )
+    parameters = tuple(confidence.parameters())
+    expected_metrics = torch.zeros(10)
+    for support, query in zip(supports, queries, strict=True):
+        output = algorithm.outer_loss(support, query, initial_fast)
+        (output.loss / len(supports)).backward()
+        expected_metrics += torch.stack(
+            (
+                output.loss.detach(),
+                output.meta_grpo.loss.detach(),
+                output.adaptation.confidence_loss.bce.detach(),
+                output.adaptation.confidence_loss.ranking.detach(),
+                output.meta_grpo.clip_fraction.detach(),
+                output.adaptation.inner_losses[-1].clip_fraction.detach(),
+                support.verifier_rewards.mean(),
+                query.verifier_rewards.mean(),
+                support.correctness_labels.mean(),
+                query.correctness_labels.mean(),
+            )
+        )
+    expected_gradients = tuple(
+        parameter.grad.detach().clone() for parameter in parameters
+    )
+    confidence.zero_grad(set_to_none=True)
+    rollout_microbatches = [
+        CachedRolloutMicrobatch(
+            problems=(_problem("0"), _problem("1")),
+            supports=supports[:2],
+            queries=queries[:2],
+        ),
+        CachedRolloutMicrobatch(
+            problems=(_problem("2"), _problem("3")),
+            supports=supports[2:],
+            queries=queries[2:],
+        ),
+    ]
+
+    actual_metrics = _accumulate_outer_batch(
+        algorithm=algorithm,
+        rollout_microbatches=rollout_microbatches,
+        local_problem_batch_size=4,
+        initial_fast=initial_fast,
+        accelerator=CPUAccelerator(),
+        progress_description="test",
+    )
+
+    torch.testing.assert_close(actual_metrics, expected_metrics)
+    for parameter, expected_gradient in zip(
+        parameters, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(parameter.grad, expected_gradient)

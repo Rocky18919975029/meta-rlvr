@@ -16,6 +16,8 @@ from meta_rlvr.data import (
 )
 from meta_rlvr.functional import trainable_parameter_state
 from meta_rlvr.rollout import TransformersRolloutEngine, VLLMHybridRolloutEngine
+from meta_rlvr.train import _cache_rollout_group
+from meta_rlvr.types import RolloutGroup
 from meta_rlvr.verifier import DAPOMathVerifier
 
 
@@ -153,6 +155,47 @@ def test_transformers_rollout_builds_aligned_masks_and_old_logprobs() -> None:
     assert torch.all(~group.completion_mask[:, :1])
     assert group.old_logprobs.shape == group.completion_mask.shape
     assert group.texts == ("response", "response", "response")
+
+
+def test_rollout_group_device_transfer_preserves_all_fields_and_aliases() -> None:
+    input_ids = torch.tensor([[1, 2, 3], [1, 3, 4]])
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    completion_mask = torch.tensor([[False, True], [False, True]], dtype=torch.bool)
+    old_logprobs = torch.tensor([[0.0, -0.2], [0.0, -0.3]])
+    group = RolloutGroup(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        completion_mask=completion_mask,
+        old_logprobs=old_logprobs,
+        texts=("first", "second"),
+        verifier_rewards=torch.tensor([1.0, -1.0]),
+        correctness_labels=torch.tensor([1.0, 0.0]),
+        reference_logprobs=old_logprobs,
+        rollout_logprobs=torch.tensor([[0.0, -0.1], [0.0, -0.4]]),
+    )
+
+    moved = group.to("cpu")
+
+    assert moved.device.type == "cpu"
+    assert moved.reference_logprobs is moved.old_logprobs
+    assert moved.texts == group.texts
+    for field in (
+        "input_ids",
+        "attention_mask",
+        "completion_mask",
+        "old_logprobs",
+        "verifier_rewards",
+        "correctness_labels",
+        "rollout_logprobs",
+    ):
+        torch.testing.assert_close(getattr(moved, field), getattr(group, field))
+
+    cached = _cache_rollout_group(group)
+    assert cached.device.type == "cpu"
+    assert cached.texts == ("", "")
+    assert cached.rollout_logprobs is None
+    assert cached.reference_logprobs is cached.old_logprobs
+    torch.testing.assert_close(cached.correctness_labels, group.correctness_labels)
 
 
 def test_vllm_rollout_preserves_returned_token_ids_and_choice_order() -> None:

@@ -119,16 +119,51 @@ class RolloutGroup:
     def group_size(self) -> int:
         return self.input_ids.shape[0]
 
+    @property
+    def device(self) -> torch.device:
+        return self.input_ids.device
+
+    def to(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = False,
+    ) -> RolloutGroup:
+        target = torch.device(device)
+
+        def move(value: Tensor | None) -> Tensor | None:
+            if value is None:
+                return None
+            return value.detach().to(target, non_blocking=non_blocking)
+
+        old_logprobs = move(self.old_logprobs)
+        reference_logprobs = (
+            old_logprobs
+            if self.reference_logprobs is self.old_logprobs
+            else move(self.reference_logprobs)
+        )
+        return RolloutGroup(
+            input_ids=move(self.input_ids),
+            attention_mask=move(self.attention_mask),
+            completion_mask=move(self.completion_mask),
+            old_logprobs=old_logprobs,
+            texts=self.texts,
+            verifier_rewards=move(self.verifier_rewards),
+            correctness_labels=move(self.correctness_labels),
+            reference_logprobs=reference_logprobs,
+            rollout_logprobs=move(self.rollout_logprobs),
+        )
+
     def with_verification(
         self,
         verifier_rewards: Tensor,
         correctness_labels: Tensor,
-    ) -> "RolloutGroup":
+    ) -> RolloutGroup:
         return replace(
             self,
             verifier_rewards=verifier_rewards,
             correctness_labels=correctness_labels,
         )
 
-    def with_reference_logprobs(self, reference_logprobs: Tensor) -> "RolloutGroup":
+    def with_reference_logprobs(self, reference_logprobs: Tensor) -> RolloutGroup:
         return replace(self, reference_logprobs=reference_logprobs)
