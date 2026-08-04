@@ -111,7 +111,7 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE} max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0}"
+echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE} max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0} component_gradient_norms=${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}"
 echo "stdout: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
 echo "vLLM throughput: ${LOG_DIR}/vllm-${job_id}/gpu-*.log"

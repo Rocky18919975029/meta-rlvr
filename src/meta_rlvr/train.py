@@ -109,6 +109,20 @@ def parse_args() -> argparse.Namespace:
             "move them to the GPU only for optimizer.step()."
         ),
     )
+    parser.add_argument(
+        "--log-component-gradient-norms",
+        action="store_true",
+        help=(
+            "Measure exact confidence-parameter gradient norms for the meta, BCE, "
+            "and ranking losses using diagnostic backward passes."
+        ),
+    )
+    parser.add_argument(
+        "--component-gradient-norm-interval",
+        type=int,
+        default=1,
+        help="Measure component gradient norms every N outer updates.",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
 
     parser.add_argument(
@@ -196,6 +210,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max_grad_norm must be positive.")
     if args.confidence_learning_rate <= 0:
         raise ValueError("confidence_learning_rate must be positive.")
+    if args.component_gradient_norm_interval <= 0:
+        raise ValueError("component_gradient_norm_interval must be positive.")
     if args.problem_batch_size is not None and args.problem_batch_size <= 0:
         raise ValueError("problem_batch_size must be positive.")
     if args.rollout_backend == "vllm" and not args.vllm_base_urls:
@@ -517,6 +533,88 @@ def _transfer_confidence_optimizer_moments(
             flush=True,
         )
     return moment_bytes
+
+
+def _measure_component_gradient_norms(
+    *,
+    algorithm: BilevelGRPO,
+    supports: list[RolloutGroup],
+    queries: list[RolloutGroup],
+    initial_fast,
+    confidence_model,
+    confidence_optimizer,
+    accelerator,
+    progress_prefix: str,
+) -> dict[str, float]:
+    if not supports or len(supports) != len(queries):
+        raise ValueError(
+            "Component gradient norms require equal non-empty support/query batches."
+        )
+    batch_size = len(supports)
+    coefficients = {
+        "meta": algorithm.meta_config.meta_coefficient,
+        "bce": algorithm.meta_config.confidence.bce_coefficient,
+        "ranking": algorithm.meta_config.confidence.ranking_coefficient,
+    }
+    norms: dict[str, float] = {}
+    measurement_start = time.perf_counter()
+    components = tqdm(
+        tuple(coefficients),
+        desc=f"{progress_prefix}: component gradient norms",
+        unit="component",
+        leave=True,
+        disable=not accelerator.is_main_process,
+    )
+    for component in components:
+        confidence_optimizer.zero_grad(set_to_none=True)
+        for problem_index in range(batch_size):
+            if component == "meta":
+                output = algorithm.outer_loss(
+                    supports[problem_index],
+                    queries[problem_index],
+                    initial_fast,
+                    show_progress=False,
+                    progress_prefix=(
+                        f"{progress_prefix} diagnostic problem {problem_index + 1}"
+                    ),
+                )
+                component_loss = output.meta_grpo.loss
+            else:
+                confidence_loss = algorithm.confidence_supervision_loss(
+                    supports[problem_index]
+                )
+                component_loss = getattr(confidence_loss, component)
+            accelerator.backward(component_loss / batch_size)
+            del component_loss
+            if component == "meta":
+                del output
+            else:
+                del confidence_loss
+
+        raw_norm = accelerator.clip_grad_norm_(
+            confidence_model.parameters(),
+            math.inf,
+        )
+        if not torch.isfinite(raw_norm):
+            raise FloatingPointError(
+                f"{component} confidence gradient norm is non-finite."
+            )
+        raw_norm = accelerator.reduce(raw_norm.detach(), reduction="mean")
+        raw_value = raw_norm.item()
+        norms[f"gradient_norm/{component}_raw"] = raw_value
+        norms[f"gradient_norm/{component}_weighted"] = (
+            coefficients[component] * raw_value
+        )
+        confidence_optimizer.zero_grad(set_to_none=True)
+        del raw_norm
+        if accelerator.device.type == "cuda":
+            torch.cuda.synchronize(accelerator.device)
+            torch.cuda.empty_cache()
+
+    accelerator.wait_for_everyone()
+    elapsed = time.perf_counter() - measurement_start
+    norms["gradient_norm/measurement_seconds"] = elapsed
+    return norms
 
 
 def _evaluate(
@@ -875,6 +973,7 @@ def main() -> None:
         )
         for outer_iteration in outer_iterations:
             confidence_optimizer.zero_grad(set_to_none=True)
+            component_gradient_norms: dict[str, float] = {}
 
             if cached_queries is None:
                 outer_iterations.set_postfix_str("stage=generation-adaptation")
@@ -1002,6 +1101,44 @@ def main() -> None:
                             )
                         )
 
+            global_outer_iteration = step * args.outer_iterations + outer_iteration
+            if (
+                args.log_component_gradient_norms
+                and global_outer_iteration % args.component_gradient_norm_interval == 0
+            ):
+                outer_iterations.set_postfix_str("stage=component-gradient-norms")
+                rng_devices = (
+                    [accelerator.device]
+                    if accelerator.device.type == "cuda"
+                    else []
+                )
+                with torch.random.fork_rng(devices=rng_devices):
+                    component_gradient_norms = _measure_component_gradient_norms(
+                        algorithm=algorithm,
+                        supports=supports,
+                        queries=cached_queries,
+                        initial_fast=initial_fast,
+                        confidence_model=confidence_model,
+                        confidence_optimizer=confidence_optimizer,
+                        accelerator=accelerator,
+                        progress_prefix=(
+                            f"train step {step + 1} outer {outer_iteration + 1}"
+                        ),
+                    )
+                if accelerator.is_main_process:
+                    print(
+                        json.dumps(
+                            {
+                                "diagnostic": "component_gradient_norms",
+                                "step": step,
+                                "outer_iteration": outer_iteration,
+                                **component_gradient_norms,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+
             outer_iterations.set_postfix_str("stage=meta-forward")
             local_metric_sums = torch.zeros(
                 10, dtype=torch.float32, device=accelerator.device
@@ -1099,6 +1236,7 @@ def main() -> None:
                             "support_accuracy": metrics[8].item(),
                             "query_accuracy": metrics[9].item(),
                             "confidence_gradient_norm": (reduced_gradient_norm.item()),
+                            **component_gradient_norms,
                         },
                         sort_keys=True,
                     ),

@@ -539,10 +539,34 @@ Important configurable ablations include:
 --meta-coefficient 0
 --meta-gradient-mode first_order|second_order
 --offload-confidence-optimizer
+--log-component-gradient-norms
+--component-gradient-norm-interval N
 ```
 
 For `floored_group_std`, `--inner-std-floor` is mandatory. Incompatible
 combinations raise during configuration construction.
+
+`--log-component-gradient-norms` measures the exact parameter-gradient norm of
+the meta, BCE and ranking objectives with respect to the confidence model at
+the start of the selected outer update. The JSON metrics contain both raw
+norms (`gradient_norm/meta_raw`, `gradient_norm/bce_raw`, and
+`gradient_norm/ranking_raw`) and coefficient-weighted norms with the matching
+`_weighted` suffix. The existing `confidence_gradient_norm` remains the norm
+of their summed, coefficient-weighted gradient immediately before clipping.
+The diagnostic clears its gradients before the real total-loss backward and
+therefore does not alter the update. It is intentionally opt-in: an exact meta
+norm repeats one complete bilevel forward/backward, while BCE and ranking each
+repeat a confidence-only forward/backward. Use
+`--component-gradient-norm-interval N` to sample every N outer updates.
+The trainer restores the per-rank CPU/CUDA RNG state after diagnostics, so the
+extra forwards do not change the random stream used by the real update.
+
+The HPC smoke launcher exposes the same controls as environment variables:
+
+```bash
+export SMOKE_LOG_COMPONENT_GRADIENT_NORMS=1
+export SMOKE_COMPONENT_GRADIENT_NORM_INTERVAL=1
+```
 
 ## Multi-iteration semantics
 

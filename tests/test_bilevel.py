@@ -1,5 +1,5 @@
-from types import SimpleNamespace
 from dataclasses import replace
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -15,6 +15,7 @@ from meta_rlvr.config import (
     MetaLossConfig,
 )
 from meta_rlvr.functional import token_logprobs, trainable_parameter_state
+from meta_rlvr.train import _measure_component_gradient_norms
 from meta_rlvr.types import RolloutGroup
 
 
@@ -242,3 +243,114 @@ def test_inference_adaptation_does_not_require_verifier_labels() -> None:
         supervise_confidence=False,
     )
     assert adaptation.confidence_loss is None
+
+
+class CPUAccelerator:
+    device = torch.device("cpu")
+    is_main_process = False
+
+    @staticmethod
+    def backward(loss: torch.Tensor) -> None:
+        loss.backward()
+
+    @staticmethod
+    def clip_grad_norm_(parameters, max_norm: float) -> torch.Tensor:
+        return torch.nn.utils.clip_grad_norm_(tuple(parameters), max_norm)
+
+    @staticmethod
+    def reduce(value: torch.Tensor, *, reduction: str) -> torch.Tensor:
+        assert reduction == "mean"
+        return value
+
+    @staticmethod
+    def wait_for_everyone() -> None:
+        return None
+
+
+def _parameter_gradient_norm(
+    loss: torch.Tensor,
+    parameters: tuple[nn.Parameter, ...],
+) -> torch.Tensor:
+    gradients = torch.autograd.grad(loss, parameters, allow_unused=True)
+    squared_norms = [
+        gradient.float().square().sum()
+        for gradient in gradients
+        if gradient is not None
+    ]
+    if not squared_norms:
+        raise AssertionError("Expected at least one confidence parameter gradient.")
+    return torch.stack(squared_norms).sum().sqrt()
+
+
+def test_component_gradient_norms_are_exact_and_leave_no_gradients() -> None:
+    torch.manual_seed(12)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(), hidden_size=5
+    )
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    query = make_group(policy, torch.tensor([0.0, 1.0, 0.0]))
+    coefficients = {"meta": 2.0, "bce": 3.0, "ranking": 4.0}
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(
+            num_iterations=1,
+            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+        ),
+        meta_config=MetaLossConfig(
+            meta_coefficient=coefficients["meta"],
+            confidence=ConfidenceLossConfig(
+                bce_coefficient=coefficients["bce"],
+                ranking_coefficient=coefficients["ranking"],
+            ),
+        ),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+    )
+    parameters = tuple(confidence.parameters())
+    initial_parameters = tuple(parameter.detach().clone() for parameter in parameters)
+    expected = {
+        "meta": _parameter_gradient_norm(
+            algorithm.outer_loss(support, query, initial_fast).meta_grpo.loss,
+            parameters,
+        ),
+        "bce": _parameter_gradient_norm(
+            algorithm.confidence_supervision_loss(support).bce,
+            parameters,
+        ),
+        "ranking": _parameter_gradient_norm(
+            algorithm.confidence_supervision_loss(support).ranking,
+            parameters,
+        ),
+    }
+    optimizer = torch.optim.AdamW(confidence.parameters(), lr=1e-3)
+
+    measured = _measure_component_gradient_norms(
+        algorithm=algorithm,
+        supports=[support],
+        queries=[query],
+        initial_fast=initial_fast,
+        confidence_model=confidence,
+        confidence_optimizer=optimizer,
+        accelerator=CPUAccelerator(),
+        progress_prefix="test",
+    )
+
+    for component, expected_norm in expected.items():
+        torch.testing.assert_close(
+            torch.tensor(measured[f"gradient_norm/{component}_raw"]),
+            expected_norm,
+        )
+        torch.testing.assert_close(
+            torch.tensor(measured[f"gradient_norm/{component}_weighted"]),
+            coefficients[component] * expected_norm,
+        )
+    assert measured["gradient_norm/measurement_seconds"] >= 0.0
+    for parameter, initial_parameter in zip(
+        confidence.parameters(), initial_parameters, strict=True
+    ):
+        torch.testing.assert_close(parameter, initial_parameter)
+    assert not optimizer.state
+    assert all(parameter.grad is None for parameter in confidence.parameters())

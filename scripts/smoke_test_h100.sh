@@ -257,6 +257,22 @@ elif [[ "${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0}" != "0" ]]; then
   echo "SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER must be 0 or 1." >&2
   exit 2
 fi
+if [[ "${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}" == "1" ]]; then
+  EXTRA_TRAIN_ARGS+=(--log-component-gradient-norms)
+elif [[ "${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}" != "0" ]]; then
+  echo "SMOKE_LOG_COMPONENT_GRADIENT_NORMS must be 0 or 1." >&2
+  exit 2
+fi
+if [[ -n "${SMOKE_COMPONENT_GRADIENT_NORM_INTERVAL:-}" ]]; then
+  if [[ ! "${SMOKE_COMPONENT_GRADIENT_NORM_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SMOKE_COMPONENT_GRADIENT_NORM_INTERVAL must be a positive integer." >&2
+    exit 2
+  fi
+  EXTRA_TRAIN_ARGS+=(
+    --component-gradient-norm-interval
+    "${SMOKE_COMPONENT_GRADIENT_NORM_INTERVAL}"
+  )
+fi
 if ! command -v setsid >/dev/null 2>&1; then
   echo "setsid is required to supervise the distributed trainer." >&2
   exit 2

@@ -22,8 +22,8 @@ from .losses import (
     ConfidenceLossOutput,
     GRPOLossOutput,
     confidence_losses,
-    grpo_policy_loss,
     group_advantages,
+    grpo_policy_loss,
 )
 from .optim import fast_optimizer_step, initial_fast_optimizer_state
 from .types import RolloutGroup
@@ -117,6 +117,29 @@ class BilevelGRPO:
                     )
             chunks.append(logits)
         return torch.cat(chunks, dim=0)
+
+    def confidence_supervision_loss(
+        self,
+        support: RolloutGroup,
+        *,
+        show_progress: bool = False,
+        progress_description: str = "confidence supervision",
+    ) -> ConfidenceLossOutput:
+        if support.correctness_labels is None:
+            raise ValueError(
+                "Support correctness labels are required for confidence supervision."
+            )
+        logits = self._confidence_logits(
+            support,
+            differentiable=True,
+            show_progress=show_progress,
+            progress_description=progress_description,
+        )
+        return confidence_losses(
+            logits,
+            support.correctness_labels,
+            self.meta_config.confidence,
+        )
 
     def _group_normalization_weight(
         self,
