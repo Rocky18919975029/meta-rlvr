@@ -154,11 +154,14 @@ export META_RLVR_HPC=zhongal@hpc3login.hpc.hkust-gz.edu.cn
 ssh "${META_RLVR_HPC}" \
   'mkdir -p meta-rlvr/artifacts/data meta-rlvr/artifacts/models meta-rlvr/artifacts/wheelhouse meta-rlvr/logs meta-rlvr/outputs'
 
-rsync -azP \
+rsync -azP --delete-delay \
+  --exclude '.git/' \
   --exclude '.pytest_cache/' \
   --exclude '__pycache__/' \
   --exclude '*.egg-info/' \
+  --exclude 'artifacts/' \
   --exclude 'outputs/' \
+  --exclude 'logs/' \
   "${META_RLVR_LOCAL}/" \
   "${META_RLVR_HPC}:meta-rlvr/"
 
