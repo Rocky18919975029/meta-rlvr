@@ -16,6 +16,7 @@ from .functional import (
     ParameterDict,
     chunked_token_logprobs,
     clone_fast_parameters,
+    sequence_microbatches,
     token_logprobs,
 )
 from .losses import (
@@ -60,6 +61,8 @@ class BilevelGRPO:
         *,
         policy_micro_batch_size: int = 4,
         confidence_micro_batch_size: int = 4,
+        policy_max_tokens_per_micro_batch: int | None = None,
+        confidence_max_tokens_per_micro_batch: int | None = None,
     ) -> None:
         if policy_micro_batch_size <= 0 or confidence_micro_batch_size <= 0:
             raise ValueError("Micro-batch sizes must be positive.")
@@ -71,6 +74,148 @@ class BilevelGRPO:
         self.query_grpo_config = query_grpo_config
         self.policy_micro_batch_size = policy_micro_batch_size
         self.confidence_micro_batch_size = confidence_micro_batch_size
+        self.policy_max_tokens_per_micro_batch = policy_max_tokens_per_micro_batch
+        self.confidence_max_tokens_per_micro_batch = (
+            confidence_max_tokens_per_micro_batch
+        )
+
+    @staticmethod
+    def _equalize_distributed_batch_count(
+        batches: list[list[tuple[int, int, int]]],
+        *,
+        device: torch.device,
+    ) -> list[list[tuple[int, int, int]]]:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            count = torch.tensor(len(batches), dtype=torch.int64, device=device)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX)
+            target_count = int(count.item())
+        else:
+            target_count = len(batches)
+        while len(batches) < target_count:
+            split_index = max(range(len(batches)), key=lambda index: len(batches[index]))
+            selected = batches[split_index]
+            if len(selected) < 2:
+                raise RuntimeError(
+                    "Distributed confidence batching requires more non-empty "
+                    "microbatches than local sequences can provide."
+                )
+            midpoint = len(selected) // 2
+            batches[split_index : split_index + 1] = [
+                selected[:midpoint],
+                selected[midpoint:],
+            ]
+        return batches
+
+    def _confidence_row_batches(
+        self,
+        supports: tuple[RolloutGroup, ...],
+    ) -> list[list[tuple[int, int, int]]]:
+        entries: list[tuple[int, int, int]] = []
+        for problem_index, support in enumerate(supports):
+            lengths = support.attention_mask.sum(dim=1).tolist()
+            entries.extend(
+                (problem_index, response_index, int(length))
+                for response_index, length in enumerate(lengths)
+            )
+        entries.sort(key=lambda item: item[2], reverse=True)
+        batches: list[list[tuple[int, int, int]]] = []
+        current: list[tuple[int, int, int]] = []
+        current_max_length = 0
+        for entry in entries:
+            candidate_max_length = max(current_max_length, entry[2])
+            candidate_size = len(current) + 1
+            token_limit_exceeded = (
+                self.confidence_max_tokens_per_micro_batch is not None
+                and candidate_max_length * candidate_size
+                > self.confidence_max_tokens_per_micro_batch
+            )
+            if current and (
+                candidate_size > self.confidence_micro_batch_size
+                or token_limit_exceeded
+            ):
+                batches.append(current)
+                current = []
+                current_max_length = 0
+            if (
+                self.confidence_max_tokens_per_micro_batch is not None
+                and entry[2] > self.confidence_max_tokens_per_micro_batch
+            ):
+                raise ValueError(
+                    f"Confidence sequence length {entry[2]} exceeds token budget "
+                    f"{self.confidence_max_tokens_per_micro_batch}."
+                )
+            current.append(entry)
+            current_max_length = max(current_max_length, entry[2])
+        if current:
+            batches.append(current)
+        return self._equalize_distributed_batch_count(
+            batches,
+            device=supports[0].input_ids.device,
+        )
+
+    def _confidence_logits_batch(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        *,
+        differentiable: bool,
+        show_progress: bool,
+        progress_description: str,
+    ) -> tuple[Tensor, ...]:
+        if not supports:
+            raise ValueError("Confidence scoring requires at least one support group.")
+        devices = {support.device for support in supports}
+        if len(devices) != 1:
+            raise ValueError("Batched confidence groups must share one device.")
+        batches = self._confidence_row_batches(supports)
+        batch_indices = range(len(batches))
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            batch_indices = tqdm(
+                batch_indices,
+                total=len(batches),
+                desc=progress_description,
+                unit="microbatch",
+                leave=True,
+            )
+        logits_by_problem: list[list[Tensor | None]] = [
+            [None] * support.group_size for support in supports
+        ]
+        for batch_index in batch_indices:
+            entries = batches[batch_index]
+            max_length = max(entry[2] for entry in entries)
+            input_rows = []
+            mask_rows = []
+            for problem_index, response_index, length in entries:
+                support = supports[problem_index]
+                input_row = support.input_ids[response_index, :length]
+                mask_row = support.attention_mask[response_index, :length]
+                if length < max_length:
+                    input_row = torch.nn.functional.pad(
+                        input_row, (0, max_length - length), value=0
+                    )
+                    mask_row = torch.nn.functional.pad(
+                        mask_row, (0, max_length - length), value=False
+                    )
+                input_rows.append(input_row)
+                mask_rows.append(mask_row)
+            input_ids = torch.stack(input_rows)
+            attention_mask = torch.stack(mask_rows)
+            if differentiable:
+                batch_logits = self.confidence_model(input_ids, attention_mask)
+            else:
+                with torch.no_grad():
+                    batch_logits = self.confidence_model(input_ids, attention_mask)
+            for offset, (problem_index, response_index, _) in enumerate(entries):
+                logits_by_problem[problem_index][response_index] = batch_logits[
+                    offset : offset + 1
+                ]
+        outputs = []
+        for rows in logits_by_problem:
+            if any(row is None for row in rows):
+                raise RuntimeError("Confidence token batching returned incomplete logits.")
+            outputs.append(torch.cat([row for row in rows if row is not None]))
+        return tuple(outputs)
 
     def _confidence_logits(
         self,
@@ -80,43 +225,12 @@ class BilevelGRPO:
         show_progress: bool,
         progress_description: str,
     ) -> Tensor:
-        chunks: list[Tensor] = []
-        starts = range(
-            0, support.group_size, self.confidence_micro_batch_size
-        )
-        if show_progress:
-            from tqdm.auto import tqdm
-
-            starts = tqdm(
-                starts,
-                total=(
-                    support.group_size
-                    + self.confidence_micro_batch_size
-                    - 1
-                )
-                // self.confidence_micro_batch_size,
-                desc=progress_description,
-                unit="microbatch",
-                leave=True,
-            )
-        for start in starts:
-            end = min(
-                start + self.confidence_micro_batch_size,
-                support.group_size,
-            )
-            if differentiable:
-                logits = self.confidence_model(
-                    support.input_ids[start:end],
-                    support.attention_mask[start:end],
-                )
-            else:
-                with torch.no_grad():
-                    logits = self.confidence_model(
-                        support.input_ids[start:end],
-                        support.attention_mask[start:end],
-                    )
-            chunks.append(logits)
-        return torch.cat(chunks, dim=0)
+        return self._confidence_logits_batch(
+            (support,),
+            differentiable=differentiable,
+            show_progress=show_progress,
+            progress_description=progress_description,
+        )[0]
 
     def confidence_supervision_loss(
         self,
@@ -216,102 +330,125 @@ class BilevelGRPO:
             for name, value in fast_parameters.items()
         }
 
-        response_outputs: list[GRPOLossOutput] = []
-        response_indices = range(advantages.numel())
+        response_outputs: list[GRPOLossOutput | None] = [None] * support.group_size
+        row_batches = sequence_microbatches(
+            support,
+            max_sequences=self.policy_micro_batch_size,
+            max_tokens=self.policy_max_tokens_per_micro_batch,
+        )
+        response_batches = range(len(row_batches))
         if show_progress:
             from tqdm.auto import tqdm
 
-            response_indices = tqdm(
-                response_indices,
-                total=advantages.numel(),
+            response_batches = tqdm(
+                response_batches,
+                total=len(row_batches),
                 desc=progress_description,
-                unit="response",
+                unit="microbatch",
                 leave=True,
             )
-        for response_index in response_indices:
+        for batch_index in response_batches:
+            row_indices = row_batches[batch_index]
             current_logprobs = token_logprobs(
                 self.policy,
                 support,
                 fast_parameters=fast_parameters,
-                row_start=response_index,
-                row_end=response_index + 1,
+                row_indices=row_indices,
                 activation_checkpointing=False,
             )
-            old_logprobs = support.old_logprobs[
-                response_index : response_index + 1
-            ]
-            completion_mask = support.completion_mask[
-                response_index : response_index + 1
-            ]
-            reference_logprobs = (
-                None
-                if support.reference_logprobs is None
-                else support.reference_logprobs[
+            unit_losses = []
+            kl_losses = []
+            for offset, response_index in enumerate(row_indices):
+                old_logprobs = support.old_logprobs[
                     response_index : response_index + 1
                 ]
-            )
-            response_advantage = advantages[
-                response_index : response_index + 1
-            ]
-            response_output = grpo_policy_loss(
-                current_logprobs,
-                old_logprobs,
-                completion_mask,
-                response_advantage,
-                self.inner_config.grpo,
-                reference_logprobs=reference_logprobs,
-            )
-            response_outputs.append(
-                GRPOLossOutput(
+                completion_mask = support.completion_mask[
+                    response_index : response_index + 1
+                ]
+                reference_logprobs = (
+                    None
+                    if support.reference_logprobs is None
+                    else support.reference_logprobs[
+                        response_index : response_index + 1
+                    ]
+                )
+                response_advantage = advantages[
+                    response_index : response_index + 1
+                ]
+                response_current = current_logprobs[offset : offset + 1]
+                response_output = grpo_policy_loss(
+                    response_current,
+                    old_logprobs,
+                    completion_mask,
+                    response_advantage,
+                    self.inner_config.grpo,
+                    reference_logprobs=reference_logprobs,
+                )
+                response_outputs[response_index] = GRPOLossOutput(
                     loss=response_output.loss.detach(),
                     policy_loss=response_output.policy_loss.detach(),
                     mean_kl=response_output.mean_kl.detach(),
                     clip_fraction=response_output.clip_fraction.detach(),
                 )
+                normalization_weight = self._group_normalization_weight(
+                    support, response_index
+                ).to(response_output.loss.dtype)
+                unit_loss = grpo_policy_loss(
+                    response_current,
+                    old_logprobs,
+                    completion_mask,
+                    signs[response_index : response_index + 1],
+                    self.inner_config.grpo,
+                    reference_logprobs=reference_logprobs,
+                ).policy_loss
+                unit_losses.append(unit_loss * normalization_weight)
+                if self.inner_config.grpo.kl_coefficient > 0:
+                    zero_advantage = torch.zeros_like(response_advantage)
+                    kl_loss = grpo_policy_loss(
+                        response_current,
+                        old_logprobs,
+                        completion_mask,
+                        zero_advantage,
+                        self.inner_config.grpo,
+                        reference_logprobs=reference_logprobs,
+                    ).loss
+                    kl_losses.append(kl_loss * normalization_weight)
+
+            unit_loss_vector = torch.stack(unit_losses)
+            identity = torch.eye(
+                len(row_indices),
+                dtype=unit_loss_vector.dtype,
+                device=unit_loss_vector.device,
             )
-            unit_advantages = signs[response_index : response_index + 1]
-            unit_loss = grpo_policy_loss(
-                current_logprobs,
-                old_logprobs,
-                completion_mask,
-                unit_advantages,
-                self.inner_config.grpo,
-                reference_logprobs=reference_logprobs,
-            ).policy_loss
-            normalization_weight = self._group_normalization_weight(
-                support, response_index
-            ).to(unit_loss.dtype)
             unit_gradient_values = torch.autograd.grad(
-                unit_loss * normalization_weight,
+                unit_loss_vector,
                 parameter_values,
+                grad_outputs=identity,
                 create_graph=False,
                 retain_graph=self.inner_config.grpo.kl_coefficient > 0,
                 allow_unused=False,
+                is_grads_batched=True,
             )
-            magnitude = torch.where(
-                nonnegative[response_index],
-                advantages[response_index],
-                -advantages[response_index],
+            batch_indices = torch.tensor(
+                row_indices,
+                dtype=torch.long,
+                device=advantages.device,
             )
+            magnitudes = advantages.abs().index_select(0, batch_indices)
             for name, unit_gradient in zip(
                 names, unit_gradient_values, strict=True
             ):
+                view_shape = (len(row_indices),) + (1,) * (
+                    unit_gradient.ndim - 1
+                )
                 accumulated[name] = (
-                    accumulated[name] + magnitude * unit_gradient.detach()
+                    accumulated[name]
+                    + (magnitudes.view(view_shape) * unit_gradient.detach()).sum(dim=0)
                 )
 
             if self.inner_config.grpo.kl_coefficient > 0:
-                zero_advantage = torch.zeros_like(response_advantage)
-                kl_loss = grpo_policy_loss(
-                    current_logprobs,
-                    old_logprobs,
-                    completion_mask,
-                    zero_advantage,
-                    self.inner_config.grpo,
-                    reference_logprobs=reference_logprobs,
-                ).loss
                 kl_gradient_values = torch.autograd.grad(
-                    kl_loss * normalization_weight,
+                    torch.stack(kl_losses).sum(),
                     parameter_values,
                     create_graph=False,
                     retain_graph=False,
@@ -324,8 +461,95 @@ class BilevelGRPO:
                         accumulated[name] + kl_gradient.detach()
                     )
 
+        if any(output is None for output in response_outputs):
+            raise RuntimeError("Inner token batching returned incomplete metrics.")
         return accumulated, self._aggregate_inner_outputs(
-            support, response_outputs
+            support,
+            [output for output in response_outputs if output is not None],
+        )
+
+    def _nondifferentiable_inner_gradients(
+        self,
+        support: RolloutGroup,
+        advantages: Tensor,
+        fast_parameters: Mapping[str, Tensor],
+        *,
+        show_progress: bool,
+        progress_description: str,
+    ) -> tuple[ParameterDict, GRPOLossOutput]:
+        names = tuple(fast_parameters)
+        parameter_values = tuple(fast_parameters[name] for name in names)
+        accumulated = {
+            name: torch.zeros_like(value) for name, value in fast_parameters.items()
+        }
+        response_outputs: list[GRPOLossOutput | None] = [None] * support.group_size
+        row_batches = sequence_microbatches(
+            support,
+            max_sequences=self.policy_micro_batch_size,
+            max_tokens=self.policy_max_tokens_per_micro_batch,
+        )
+        batch_indices = range(len(row_batches))
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            batch_indices = tqdm(
+                batch_indices,
+                total=len(row_batches),
+                desc=progress_description,
+                unit="microbatch",
+                leave=True,
+            )
+        for batch_index in batch_indices:
+            row_indices = row_batches[batch_index]
+            current_logprobs = token_logprobs(
+                self.policy,
+                support,
+                fast_parameters=fast_parameters,
+                row_indices=row_indices,
+                activation_checkpointing=False,
+            )
+            weighted_losses = []
+            for offset, response_index in enumerate(row_indices):
+                output = grpo_policy_loss(
+                    current_logprobs[offset : offset + 1],
+                    support.old_logprobs[response_index : response_index + 1],
+                    support.completion_mask[response_index : response_index + 1],
+                    advantages[response_index : response_index + 1],
+                    self.inner_config.grpo,
+                    reference_logprobs=(
+                        None
+                        if support.reference_logprobs is None
+                        else support.reference_logprobs[
+                            response_index : response_index + 1
+                        ]
+                    ),
+                )
+                response_outputs[response_index] = GRPOLossOutput(
+                    loss=output.loss.detach(),
+                    policy_loss=output.policy_loss.detach(),
+                    mean_kl=output.mean_kl.detach(),
+                    clip_fraction=output.clip_fraction.detach(),
+                )
+                weighted_losses.append(
+                    output.loss
+                    * self._group_normalization_weight(support, response_index).to(
+                        output.loss.dtype
+                    )
+                )
+            gradient_values = torch.autograd.grad(
+                torch.stack(weighted_losses).sum(),
+                parameter_values,
+                create_graph=False,
+                retain_graph=False,
+                allow_unused=False,
+            )
+            for name, gradient in zip(names, gradient_values, strict=True):
+                accumulated[name] = accumulated[name] + gradient.detach()
+        if any(output is None for output in response_outputs):
+            raise RuntimeError("Inner token batching returned incomplete metrics.")
+        return accumulated, self._aggregate_inner_outputs(
+            support,
+            [output for output in response_outputs if output is not None],
         )
 
     def adapt_task(
@@ -338,17 +562,71 @@ class BilevelGRPO:
         show_progress: bool = False,
         progress_prefix: str = "adaptation",
     ) -> TaskAdaptation:
-        if supervise_confidence and support.correctness_labels is None:
-            raise ValueError(
-                "Support correctness labels are required for BCE/ranking supervision."
-            )
+        return self.adapt_tasks(
+            (support,),
+            initial_fast_parameters,
+            differentiable=differentiable,
+            supervise_confidence=supervise_confidence,
+            show_progress=show_progress,
+            progress_prefix=progress_prefix,
+        )[0]
 
-        confidence_logits = self._confidence_logits(
-            support,
+    def adapt_tasks(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        initial_fast_parameters: Mapping[str, Tensor],
+        *,
+        differentiable: bool = True,
+        supervise_confidence: bool = True,
+        show_progress: bool = False,
+        progress_prefix: str = "adaptation",
+    ) -> tuple[TaskAdaptation, ...]:
+        if not supports:
+            raise ValueError("Task adaptation requires at least one support group.")
+        confidence_logits_batch = self._confidence_logits_batch(
+            supports,
             differentiable=differentiable,
             show_progress=show_progress,
             progress_description=f"{progress_prefix}: confidence scoring",
         )
+        outputs = []
+        for problem_index, (support, confidence_logits) in enumerate(
+            zip(supports, confidence_logits_batch, strict=True)
+        ):
+            outputs.append(
+                self._adapt_task_from_confidence_logits(
+                    support,
+                    confidence_logits,
+                    initial_fast_parameters,
+                    differentiable=differentiable,
+                    supervise_confidence=supervise_confidence,
+                    show_progress=show_progress and len(supports) == 1,
+                    progress_prefix=(
+                        progress_prefix
+                        if len(supports) == 1
+                        else f"{progress_prefix} problem {problem_index + 1}"
+                    ),
+                )
+            )
+        return tuple(outputs)
+
+    def _adapt_task_from_confidence_logits(
+        self,
+        support: RolloutGroup,
+        confidence_logits: Tensor,
+        initial_fast_parameters: Mapping[str, Tensor],
+        *,
+        differentiable: bool,
+        supervise_confidence: bool,
+        show_progress: bool,
+        progress_prefix: str,
+    ) -> TaskAdaptation:
+        if supervise_confidence and support.correctness_labels is None:
+            raise ValueError(
+                "Support correctness labels are required for BCE/ranking supervision."
+            )
+        if confidence_logits.shape != (support.group_size,):
+            raise ValueError("Confidence logits must match the support group size.")
         confidence_probabilities = torch.sigmoid(confidence_logits)
         confidence_loss = None
         if supervise_confidence:
@@ -376,10 +654,20 @@ class BilevelGRPO:
 
         for inner_iteration in range(self.inner_config.num_iterations):
             names = tuple(fast_parameters)
-            if (
-                not differentiable
-                or self.inner_config.meta_gradient_mode == "first_order"
-            ):
+            if not differentiable:
+                gradients, inner_output = (
+                    self._nondifferentiable_inner_gradients(
+                        support,
+                        advantages,
+                        fast_parameters,
+                        show_progress=show_progress,
+                        progress_description=(
+                            f"{progress_prefix}: inner "
+                            f"{inner_iteration + 1}/{self.inner_config.num_iterations}"
+                        ),
+                    )
+                )
+            elif self.inner_config.meta_gradient_mode == "first_order":
                 gradients, inner_output = self._first_order_inner_gradients(
                     support,
                     advantages,
@@ -396,6 +684,9 @@ class BilevelGRPO:
                     support,
                     fast_parameters=fast_parameters,
                     micro_batch_size=self.policy_micro_batch_size,
+                    max_tokens_per_micro_batch=(
+                        self.policy_max_tokens_per_micro_batch
+                    ),
                     activation_checkpointing=True,
                     show_progress=show_progress,
                     progress_description=(
@@ -461,15 +752,31 @@ class BilevelGRPO:
         show_progress: bool = False,
         progress_prefix: str = "outer",
     ) -> TaskOuterLoss:
-        if query.verifier_rewards is None:
-            raise ValueError("Query verifier rewards are required for the meta loss.")
         if adaptation is None:
-            adaptation = self.adapt_task(
-                support,
+            return self.outer_losses_batch(
+                (support,),
+                (query,),
                 initial_fast_parameters,
                 show_progress=show_progress,
                 progress_prefix=progress_prefix,
-            )
+            )[0]
+        return self._outer_loss_from_adaptation(
+            query,
+            adaptation,
+            show_progress=show_progress,
+            progress_prefix=progress_prefix,
+        )
+
+    def _outer_loss_from_adaptation(
+        self,
+        query: RolloutGroup,
+        adaptation: TaskAdaptation,
+        *,
+        show_progress: bool,
+        progress_prefix: str,
+    ) -> TaskOuterLoss:
+        if query.verifier_rewards is None:
+            raise ValueError("Query verifier rewards are required for the meta loss.")
         if adaptation.confidence_loss is None:
             raise ValueError(
                 "Outer training requires an adaptation with confidence supervision."
@@ -480,6 +787,7 @@ class BilevelGRPO:
             query,
             fast_parameters=adaptation.fast_parameters,
             micro_batch_size=self.policy_micro_batch_size,
+            max_tokens_per_micro_batch=self.policy_max_tokens_per_micro_batch,
             activation_checkpointing=True,
             show_progress=show_progress,
             progress_description=f"{progress_prefix}: query forward",
@@ -505,4 +813,41 @@ class BilevelGRPO:
             meta_grpo=meta_grpo,
             adaptation=adaptation,
             query_advantages=query_advantages,
+        )
+
+    def outer_losses_batch(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        queries: tuple[RolloutGroup, ...],
+        initial_fast_parameters: Mapping[str, Tensor],
+        *,
+        show_progress: bool = False,
+        progress_prefix: str = "outer",
+    ) -> tuple[TaskOuterLoss, ...]:
+        if not supports or len(supports) != len(queries):
+            raise ValueError(
+                "Batched outer loss requires equal non-empty support/query groups."
+            )
+        adaptations = self.adapt_tasks(
+            supports,
+            initial_fast_parameters,
+            differentiable=True,
+            supervise_confidence=True,
+            show_progress=show_progress,
+            progress_prefix=progress_prefix,
+        )
+        return tuple(
+            self._outer_loss_from_adaptation(
+                query,
+                adaptation,
+                show_progress=show_progress and len(queries) == 1,
+                progress_prefix=(
+                    progress_prefix
+                    if len(queries) == 1
+                    else f"{progress_prefix} problem {index + 1}"
+                ),
+            )
+            for index, (query, adaptation) in enumerate(
+                zip(queries, adaptations, strict=True)
+            )
         )

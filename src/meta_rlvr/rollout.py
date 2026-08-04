@@ -19,7 +19,11 @@ import torch
 from torch import Tensor, nn
 
 from .data import MathProblem
-from .functional import materialized_fast_parameters, token_logprobs
+from .functional import (
+    materialized_fast_parameters,
+    sequence_microbatches,
+    token_logprobs,
+)
 from .types import RolloutGroup
 
 
@@ -54,6 +58,7 @@ class TransformersRolloutEngine:
         generation_micro_batch_size: int,
         top_k: int = 0,
         logprob_micro_batch_size: int = 1,
+        logprob_max_tokens_per_micro_batch: int | None = None,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> None:
         if group_size < 2:
@@ -70,6 +75,13 @@ class TransformersRolloutEngine:
             raise ValueError("generation_micro_batch_size must be positive.")
         if logprob_micro_batch_size <= 0:
             raise ValueError("logprob_micro_batch_size must be positive.")
+        if (
+            logprob_max_tokens_per_micro_batch is not None
+            and logprob_max_tokens_per_micro_batch <= 0
+        ):
+            raise ValueError(
+                "logprob_max_tokens_per_micro_batch must be positive."
+            )
         if tokenizer.pad_token_id is None or tokenizer.eos_token_id is None:
             raise ValueError("Tokenizer must define pad_token_id and eos_token_id.")
         if not hasattr(tokenizer, "apply_chat_template"):
@@ -84,6 +96,9 @@ class TransformersRolloutEngine:
         self.top_k = top_k
         self.generation_micro_batch_size = generation_micro_batch_size
         self.logprob_micro_batch_size = logprob_micro_batch_size
+        self.logprob_max_tokens_per_micro_batch = (
+            logprob_max_tokens_per_micro_batch
+        )
         self.generation_kwargs = dict(generation_kwargs or {})
         overlap = self._RESERVED_GENERATION_KEYS.intersection(self.generation_kwargs)
         if overlap:
@@ -262,6 +277,38 @@ class TransformersRolloutEngine:
             )
         return tuple(groups)
 
+    def generate_batches(
+        self,
+        problem_batches: list[list[MathProblem]],
+        fast_parameter_batches: list[list[Mapping[str, Tensor]]],
+        *,
+        show_progress: bool = False,
+        progress_description: str = "rollout phase",
+    ) -> tuple[tuple[RolloutGroup, ...], ...]:
+        if not problem_batches:
+            raise ValueError("Rollout phase must contain at least one batch.")
+        if len(problem_batches) != len(fast_parameter_batches):
+            raise ValueError(
+                "Every rollout problem batch must have one fast-parameter batch."
+            )
+        return tuple(
+            tuple(
+                group.to("cpu")
+                for group in self.generate_batch(
+                    problems,
+                    fast_parameters,
+                    show_progress=show_progress,
+                    progress_description=(
+                        f"{progress_description} batch {batch_index + 1}/"
+                        f"{len(problem_batches)}"
+                    ),
+                )
+            )
+            for batch_index, (problems, fast_parameters) in enumerate(
+                zip(problem_batches, fast_parameter_batches, strict=True)
+            )
+        )
+
     def add_reference_logprobs(
         self,
         group: RolloutGroup,
@@ -270,53 +317,66 @@ class TransformersRolloutEngine:
         show_progress: bool = False,
         progress_description: str = "reference log-probabilities",
     ) -> RolloutGroup:
+        original_device = group.device
+        device_group = group.to(self.device)
+        device_fast_parameters = {
+            name: value.to(self.device)
+            for name, value in reference_fast_parameters.items()
+        }
         was_training = self.model.training
         self.model.eval()
         try:
-            with materialized_fast_parameters(self.model, reference_fast_parameters):
-                with torch.no_grad():
-                    reference = self._unadapted_logprobs(
-                        group,
-                        show_progress=show_progress,
-                        progress_description=progress_description,
-                    )
+            with torch.no_grad():
+                reference = self._unadapted_logprobs(
+                    device_group,
+                    fast_parameters=device_fast_parameters,
+                    show_progress=show_progress,
+                    progress_description=progress_description,
+                )
         finally:
             self.model.train(was_training)
-        return group.with_reference_logprobs(reference)
+        return group.with_reference_logprobs(reference.to(original_device))
 
     def _unadapted_logprobs(
         self,
         group: RolloutGroup,
         *,
+        fast_parameters: Mapping[str, Tensor] | None = None,
         show_progress: bool,
         progress_description: str,
     ) -> Tensor:
-        starts = range(0, group.group_size, self.logprob_micro_batch_size)
+        row_batches = sequence_microbatches(
+            group,
+            max_sequences=self.logprob_micro_batch_size,
+            max_tokens=self.logprob_max_tokens_per_micro_batch,
+        )
+        batches = row_batches
         if show_progress:
             from tqdm.auto import tqdm
 
-            starts = tqdm(
-                starts,
-                total=(group.group_size + self.logprob_micro_batch_size - 1)
-                // self.logprob_micro_batch_size,
+            batches = tqdm(
+                row_batches,
+                total=len(row_batches),
                 desc=progress_description,
                 unit="microbatch",
                 leave=True,
             )
-        chunks = []
-        for start in starts:
-            chunks.append(
-                token_logprobs(
-                    self.model,
-                    group,
-                    row_start=start,
-                    row_end=min(
-                        start + self.logprob_micro_batch_size,
-                        group.group_size,
-                    ),
-                ).detach()
-            )
-        return torch.cat(chunks, dim=0)
+        outputs: list[Tensor | None] = [None] * group.group_size
+        for row_indices in batches:
+            values = token_logprobs(
+                self.model,
+                group,
+                fast_parameters=fast_parameters,
+                row_indices=row_indices,
+            ).detach()
+            for local_index, row_index in enumerate(row_indices):
+                outputs[row_index] = values[local_index : local_index + 1]
+        if any(output is None for output in outputs):
+            raise RuntimeError("Log-probability batching omitted one or more rows.")
+        return torch.cat(
+            [output for output in outputs if output is not None],
+            dim=0,
+        )
 
     def _right_pad_and_concatenate(self, batches: list[Tensor]) -> Tensor:
         if not batches:
@@ -394,13 +454,12 @@ class TransformersRolloutEngine:
 class VLLMHybridRolloutEngine(TransformersRolloutEngine):
     """vLLM continuous-batching rollout with verl-style sleep/resume.
 
-    vLLM runs in a colocated server process on the same GPU.  Every generation
-    transaction wakes weights, loads the task's detached LoRA, wakes the KV
-    cache, generates the complete group, unregisters the adapter, and returns
-    the server to level-1 sleep before PyTorch computes log-probabilities or
-    gradients.  The staged weights -> LoRA -> KV ordering matches verl's
-    hybrid-engine lifecycle and avoids allocating KV memory during adapter
-    transfer.
+    vLLM runs in a colocated server process on the same GPU.  A complete rollout
+    phase wakes weights once, swaps detached task LoRAs at problem-microbatch
+    boundaries, wakes the KV cache once, and returns the server to level-1 sleep
+    before PyTorch computes log-probabilities or gradients.  The staged weights
+    -> LoRA -> KV ordering matches verl's hybrid-engine lifecycle and avoids
+    allocating KV memory during the first adapter transfer.
     """
 
     def __init__(
@@ -449,7 +508,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             progress_description=progress_description,
         )[0]
 
-    def generate_batch(
+    def _generate_batch_transaction(
         self,
         problems: list[MathProblem],
         fast_parameter_groups: list[Mapping[str, Tensor]],
@@ -498,8 +557,17 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         problem_adapter_names: list[str] = []
         for fast_parameters in fast_parameter_groups:
             identity = id(fast_parameters)
-            adapter_name = adapter_name_by_parameter_identity.get(identity)
-            if adapter_name is None:
+            adapter_record = (
+                self._phase_adapter_by_parameter_identity.get(identity)
+                if getattr(self, "_phase_active", False)
+                else None
+            )
+            adapter_name = (
+                adapter_record[0]
+                if adapter_record is not None
+                else adapter_name_by_parameter_identity.get(identity)
+            )
+            if adapter_record is None and adapter_name is None:
                 adapter_name = f"meta-rlvr-{uuid4().hex}"
                 adapter_dir = Path(
                     tempfile.mkdtemp(
@@ -511,7 +579,25 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                     (adapter_name, adapter_dir, fast_parameters)
                 )
                 adapter_name_by_parameter_identity[identity] = adapter_name
+                if getattr(self, "_phase_active", False):
+                    self._phase_adapter_by_parameter_identity[identity] = (
+                        adapter_name,
+                        adapter_dir,
+                        fast_parameters,
+                    )
+                    self._phase_adapter_dirs.append(adapter_dir)
+            elif adapter_record is not None:
+                unique_adapters.append(adapter_record)
             problem_adapter_names.append(adapter_name)
+
+        # Multiple problems can share one adapter. Preserve the first-seen
+        # order while ensuring every desired adapter is processed once.
+        unique_adapters = list(
+            {
+                adapter_name: (adapter_name, adapter_dir, fast_parameters)
+                for adapter_name, adapter_dir, fast_parameters in unique_adapters
+            }.values()
+        )
 
         loaded_adapter_names: list[str] = []
         awake = False
@@ -530,15 +616,48 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             tuple[list[list[int]], list[list[float]]] | None
         ] = [None] * len(problems)
         try:
-            for _, adapter_dir, fast_parameters in unique_adapters:
+            for adapter_name, adapter_dir, fast_parameters in unique_adapters:
+                if (
+                    getattr(self, "_phase_active", False)
+                    and adapter_name in self._phase_saved_adapter_names
+                ):
+                    continue
                 self._save_adapter(adapter_dir, fast_parameters)
-            gc.collect()
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
-                torch.cuda.empty_cache()
-            self._request_json("POST", "/wake_up?tags=weights")
-            awake = True
+                if getattr(self, "_phase_active", False):
+                    self._phase_saved_adapter_names.add(adapter_name)
+            if not getattr(self, "_phase_active", False):
+                gc.collect()
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                    torch.cuda.empty_cache()
+                self._request_json("POST", "/wake_up?tags=weights")
+                awake = True
+            if getattr(self, "_phase_active", False):
+                desired_adapter_names = set(problem_adapter_names)
+                stale_adapter_names = [
+                    name
+                    for name in self._phase_loaded_adapter_names
+                    if name not in desired_adapter_names
+                ]
+                stale_errors = self._finish_generation_transaction(
+                    adapter_names=stale_adapter_names,
+                    awake=False,
+                )
+                if stale_errors:
+                    raise RuntimeError(
+                        "Failed to swap vLLM phase adapters."
+                    ) from stale_errors[0]
+                self._phase_loaded_adapter_names = [
+                    name
+                    for name in self._phase_loaded_adapter_names
+                    if name in desired_adapter_names
+                ]
             for adapter_name, adapter_dir, _ in unique_adapters:
+                if (
+                    getattr(self, "_phase_active", False)
+                    and adapter_name in self._phase_loaded_adapter_names
+                ):
+                    continue
                 load_response = self._request_text(
                     "POST",
                     "/v1/load_lora_adapter",
@@ -557,15 +676,27 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                         f"{load_response!r}; expected "
                         f"{expected_load_response!r}."
                     )
+                if getattr(self, "_phase_active", False):
+                    self._phase_loaded_adapter_names.append(adapter_name)
             models = self._request_json("GET", "/v1/models")
-            for adapter_name in loaded_adapter_names:
+            for adapter_name in set(problem_adapter_names):
                 self._require_model_registration(
                     models, adapter_name, present=True
                 )
-            self._request_json("POST", "/wake_up?tags=kv_cache")
-            status = self._request_json("GET", "/is_sleeping")
-            if status != {"is_sleeping": False}:
-                raise RuntimeError(f"vLLM failed to wake up fully: {status!r}.")
+            if getattr(self, "_phase_active", False):
+                if not self._phase_kv_awake:
+                    self._request_json("POST", "/wake_up?tags=kv_cache")
+                    status = self._request_json("GET", "/is_sleeping")
+                    if status != {"is_sleeping": False}:
+                        raise RuntimeError(
+                            f"vLLM failed to wake up fully: {status!r}."
+                        )
+                    self._phase_kv_awake = True
+            else:
+                self._request_json("POST", "/wake_up?tags=kv_cache")
+                status = self._request_json("GET", "/is_sleeping")
+                if status != {"is_sleeping": False}:
+                    raise RuntimeError(f"vLLM failed to wake up fully: {status!r}.")
             with ThreadPoolExecutor(max_workers=len(problems)) as executor:
                 futures = {
                     executor.submit(
@@ -601,7 +732,11 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                         )
         except BaseException as error:
             cleanup_errors = self._finish_generation_transaction(
-                adapter_names=loaded_adapter_names,
+                adapter_names=(
+                    []
+                    if getattr(self, "_phase_active", False)
+                    else loaded_adapter_names
+                ),
                 awake=awake,
             )
             if cleanup_errors:
@@ -613,7 +748,11 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             raise
         else:
             cleanup_errors = self._finish_generation_transaction(
-                adapter_names=loaded_adapter_names,
+                adapter_names=(
+                    []
+                    if getattr(self, "_phase_active", False)
+                    else loaded_adapter_names
+                ),
                 awake=awake,
             )
             if cleanup_errors:
@@ -622,8 +761,9 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         finally:
             if progress_bar is not None:
                 progress_bar.close()
-            for _, adapter_dir, _ in unique_adapters:
-                shutil.rmtree(adapter_dir)
+            if not getattr(self, "_phase_active", False):
+                for _, adapter_dir, _ in unique_adapters:
+                    shutil.rmtree(adapter_dir)
 
         groups: list[RolloutGroup] = []
         for index, result in enumerate(completion_results):
@@ -646,6 +786,9 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                 )
             )
 
+        if getattr(self, "_phase_active", False):
+            return tuple(group.to("cpu") for group in groups)
+
         old_logprob_progress = None
         if show_progress:
             from tqdm.auto import tqdm
@@ -662,16 +805,16 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             for index, (group, fast_parameters) in enumerate(
                 zip(groups, fast_parameter_groups, strict=True)
             ):
-                with materialized_fast_parameters(self.model, fast_parameters):
-                    with torch.no_grad():
-                        old_logprobs = self._unadapted_logprobs(
-                            group,
-                            show_progress=False,
-                            progress_description=(
-                                f"{progress_description} problem {index + 1}: "
-                                "old log-probabilities"
-                            ),
-                        )
+                with torch.no_grad():
+                    old_logprobs = self._unadapted_logprobs(
+                        group,
+                        fast_parameters=fast_parameters,
+                        show_progress=False,
+                        progress_description=(
+                            f"{progress_description} problem {index + 1}: "
+                            "old log-probabilities"
+                        ),
+                    )
                 groups[index] = replace(group, old_logprobs=old_logprobs)
                 if old_logprob_progress is not None:
                     old_logprob_progress.update(1)
@@ -718,6 +861,232 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                 flush=True,
             )
         return tuple(groups)
+
+    def generate_batch(
+        self,
+        problems: list[MathProblem],
+        fast_parameter_groups: list[Mapping[str, Tensor]],
+        *,
+        show_progress: bool = False,
+        progress_description: str = "rollout batch",
+    ) -> tuple[RolloutGroup, ...]:
+        batches = self.generate_batches(
+            [problems],
+            [fast_parameter_groups],
+            show_progress=show_progress,
+            progress_description=progress_description,
+        )
+        return tuple(group.to(self.device) for group in batches[0])
+
+    def generate_batches(
+        self,
+        problem_batches: list[list[MathProblem]],
+        fast_parameter_batches: list[list[Mapping[str, Tensor]]],
+        *,
+        show_progress: bool = False,
+        progress_description: str = "rollout phase",
+    ) -> tuple[tuple[RolloutGroup, ...], ...]:
+        if not problem_batches or any(not batch for batch in problem_batches):
+            raise ValueError("Rollout phase batches must be non-empty.")
+        if len(problem_batches) != len(fast_parameter_batches):
+            raise ValueError(
+                "Every rollout problem batch must have one fast-parameter batch."
+            )
+        for problems, fast_parameters in zip(
+            problem_batches, fast_parameter_batches, strict=True
+        ):
+            if len(problems) != len(fast_parameters):
+                raise ValueError(
+                    "Each rollout problem must have one fast-parameter mapping."
+                )
+        if getattr(self, "_phase_active", False):
+            raise RuntimeError("Nested vLLM rollout phases are not supported.")
+
+        self._phase_adapter_by_parameter_identity: dict[
+            int, tuple[str, Path, Mapping[str, Tensor]]
+        ] = {}
+        self._phase_adapter_dirs: list[Path] = []
+        self._phase_saved_adapter_names: set[str] = set()
+        self._phase_loaded_adapter_names: list[str] = []
+        try:
+            for fast_parameters in (
+                fast
+                for batch in fast_parameter_batches
+                for fast in batch
+            ):
+                identity = id(fast_parameters)
+                if identity in self._phase_adapter_by_parameter_identity:
+                    continue
+                adapter_name = f"meta-rlvr-{uuid4().hex}"
+                adapter_dir = Path(
+                    tempfile.mkdtemp(
+                        prefix=f"{adapter_name}-",
+                        dir=self.adapter_root,
+                    )
+                )
+                self._phase_adapter_dirs.append(adapter_dir)
+                self._phase_adapter_by_parameter_identity[identity] = (
+                    adapter_name,
+                    adapter_dir,
+                    fast_parameters,
+                )
+                self._save_adapter(adapter_dir, fast_parameters)
+                self._phase_saved_adapter_names.add(adapter_name)
+        except BaseException:
+            for adapter_dir in self._phase_adapter_dirs:
+                shutil.rmtree(adapter_dir)
+            raise
+
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+        try:
+            self._request_json("POST", "/wake_up?tags=weights")
+        except BaseException:
+            for adapter_dir in self._phase_adapter_dirs:
+                shutil.rmtree(adapter_dir)
+            raise
+        self._phase_active = True
+        self._phase_kv_awake = False
+        raw_batches: list[tuple[RolloutGroup, ...]] = []
+        generation_error: BaseException | None = None
+        try:
+            for batch_index, (problems, fast_parameters) in enumerate(
+                zip(problem_batches, fast_parameter_batches, strict=True)
+            ):
+                raw_batches.append(
+                    self._generate_batch_transaction(
+                        problems,
+                        fast_parameters,
+                        show_progress=show_progress,
+                        progress_description=(
+                            f"{progress_description} batch {batch_index + 1}/"
+                            f"{len(problem_batches)}"
+                        ),
+                    )
+                )
+        except BaseException as error:
+            generation_error = error
+        finally:
+            self._phase_active = False
+            self._phase_kv_awake = False
+            cleanup_errors = self._finish_generation_transaction(
+                adapter_names=self._phase_loaded_adapter_names,
+                awake=True,
+            )
+            for adapter_dir in self._phase_adapter_dirs:
+                shutil.rmtree(adapter_dir)
+            sleep_error = cleanup_errors[0] if cleanup_errors else None
+            if generation_error is not None:
+                if sleep_error is not None:
+                    raise RuntimeError(
+                        "vLLM rollout phase and final sleep both failed."
+                    ) from generation_error
+                raise generation_error
+            if sleep_error is not None:
+                raise sleep_error
+
+        if len(raw_batches) != len(problem_batches):
+            raise RuntimeError("vLLM rollout phase returned an incomplete batch set.")
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        total_problems = sum(len(batch) for batch in problem_batches)
+        old_logprob_progress = None
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            old_logprob_progress = tqdm(
+                total=total_problems,
+                desc=f"{progress_description}: old log-probabilities",
+                unit="problem",
+                leave=True,
+            )
+
+        output_batches: list[tuple[RolloutGroup, ...]] = []
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for batch_index, (groups, fast_parameters) in enumerate(
+                zip(raw_batches, fast_parameter_batches, strict=True)
+            ):
+                output_groups: list[RolloutGroup] = []
+                for problem_index, (cpu_group, fast) in enumerate(
+                    zip(groups, fast_parameters, strict=True)
+                ):
+                    group = cpu_group.to(self.device)
+                    device_fast = {
+                        name: value.to(self.device) for name, value in fast.items()
+                    }
+                    with torch.no_grad():
+                        old_logprobs = self._unadapted_logprobs(
+                            group,
+                            fast_parameters=device_fast,
+                            show_progress=False,
+                            progress_description=(
+                                f"{progress_description} batch {batch_index + 1} "
+                                f"problem {problem_index + 1}: old log-probabilities"
+                            ),
+                        )
+                    output_groups.append(
+                        replace(group, old_logprobs=old_logprobs).to("cpu")
+                    )
+                    del group, device_fast, old_logprobs
+                    if old_logprob_progress is not None:
+                        old_logprob_progress.update(1)
+                output_batches.append(tuple(output_groups))
+        finally:
+            self.model.train(was_training)
+            if old_logprob_progress is not None:
+                old_logprob_progress.close()
+
+        if show_progress:
+            self._print_logprob_parity(
+                tuple(group for batch in output_batches for group in batch),
+                progress_description=progress_description,
+            )
+        return tuple(output_batches)
+
+    @staticmethod
+    def _print_logprob_parity(
+        groups: tuple[RolloutGroup, ...],
+        *,
+        progress_description: str,
+    ) -> None:
+        delta_sum = 0.0
+        absolute_delta_sum = 0.0
+        max_absolute_delta = 0.0
+        token_count = 0
+        for group in groups:
+            if group.rollout_logprobs is None:
+                raise RuntimeError("vLLM rollout log-probabilities are missing.")
+            selected = group.completion_mask
+            delta = group.rollout_logprobs[selected] - group.old_logprobs[selected]
+            delta_sum += delta.sum().item()
+            absolute_delta_sum += delta.abs().sum().item()
+            max_absolute_delta = max(max_absolute_delta, delta.abs().max().item())
+            token_count += delta.numel()
+        if token_count == 0:
+            raise RuntimeError("vLLM parity check selected no completion tokens.")
+        print(
+            json.dumps(
+                {
+                    "stage": progress_description,
+                    "problem_count": len(groups),
+                    "vllm_raw_vs_pytorch_raw/mean_delta": delta_sum / token_count,
+                    "vllm_raw_vs_pytorch_raw/mean_absolute_delta": (
+                        absolute_delta_sum / token_count
+                    ),
+                    "vllm_raw_vs_pytorch_raw/max_absolute_delta": (
+                        max_absolute_delta
+                    ),
+                    "vllm_raw_vs_pytorch_raw/token_count": token_count,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     def _finish_generation_transaction(
         self,

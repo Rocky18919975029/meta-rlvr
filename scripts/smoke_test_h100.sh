@@ -128,6 +128,11 @@ echo "problem_batch_size=${SMOKE_PROBLEM_BATCH_SIZE}"
 echo "local_problem_batch_size=${LOCAL_PROBLEM_BATCH_SIZE}"
 echo "problem_micro_batch_size=${SMOKE_PROBLEM_MICRO_BATCH_SIZE}"
 echo "local_problem_micro_batch_size=${LOCAL_PROBLEM_MICRO_BATCH_SIZE}"
+echo "policy_micro_batch_size=${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}"
+echo "confidence_micro_batch_size=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}"
+echo "policy_max_tokens_per_micro_batch=${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH:-unset}"
+echo "confidence_max_tokens_per_micro_batch=${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH:-unset}"
+echo "defer_confidence_gradient_sync=${SMOKE_DEFER_CONFIDENCE_GRADIENT_SYNC:-0}"
 echo "slurm_job_gpus=${SLURM_JOB_GPUS:-unset}"
 echo "slurm_step_gpus=${SLURM_STEP_GPUS:-unset}"
 echo "gpu_binding_source=${GPU_BINDING_SOURCE}"
@@ -277,6 +282,33 @@ if [[ "${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}" == "1" ]]; then
 elif [[ "${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}" != "0" ]]; then
   echo "SMOKE_LOG_COMPONENT_GRADIENT_NORMS must be 0 or 1." >&2
   exit 2
+fi
+if [[ "${SMOKE_DEFER_CONFIDENCE_GRADIENT_SYNC:-0}" == "1" ]]; then
+  EXTRA_TRAIN_ARGS+=(--defer-confidence-gradient-sync)
+elif [[ "${SMOKE_DEFER_CONFIDENCE_GRADIENT_SYNC:-0}" != "0" ]]; then
+  echo "SMOKE_DEFER_CONFIDENCE_GRADIENT_SYNC must be 0 or 1." >&2
+  exit 2
+fi
+for token_budget_name in \
+  SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH \
+  SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH; do
+  token_budget_value="${!token_budget_name:-}"
+  if [[ -n "${token_budget_value}" && ! "${token_budget_value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${token_budget_name} must be a positive integer when set." >&2
+    exit 2
+  fi
+done
+if [[ -n "${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH:-}" ]]; then
+  EXTRA_TRAIN_ARGS+=(
+    --policy-max-tokens-per-micro-batch
+    "${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH}"
+  )
+fi
+if [[ -n "${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH:-}" ]]; then
+  EXTRA_TRAIN_ARGS+=(
+    --confidence-max-tokens-per-micro-batch
+    "${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH}"
+  )
 fi
 if [[ -n "${SMOKE_COMPONENT_GRADIENT_NORM_INTERVAL:-}" ]]; then
   if [[ ! "${SMOKE_COMPONENT_GRADIENT_NORM_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then

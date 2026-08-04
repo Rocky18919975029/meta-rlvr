@@ -149,6 +149,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urls = sys.argv[1].split(",")
 pids = [int(pid) for pid in sys.argv[2].split(",")]
@@ -206,7 +207,7 @@ while pending and time.monotonic() < deadline:
 if pending:
     raise RuntimeError(f"vLLM replicas did not become ready: {sorted(pending)}")
 
-for url in urls:
+def validate_and_sleep(url):
     models = request_json("GET", url, "/v1/models", control_timeout)
     model_ids = {item["id"] for item in models["data"]}
     if model_ids != {"meta-rlvr-base"}:
@@ -218,7 +219,14 @@ for url in urls:
     sleeping = request_json("GET", url, "/is_sleeping", control_timeout)
     if sleeping != {"is_sleeping": True}:
         raise RuntimeError(f"vLLM replica did not enter sleep mode: {url}: {sleeping}")
-    print(f"vLLM sleeping: {url}", flush=True)
+    return url
+
+
+with ThreadPoolExecutor(max_workers=len(urls)) as executor:
+    futures = {executor.submit(validate_and_sleep, url): url for url in urls}
+    for future in as_completed(futures):
+        url = future.result()
+        print(f"vLLM sleeping: {url}", flush=True)
 PY
   then
     echo "vLLM startup/lifecycle validation failed; terminating all replicas." >&2

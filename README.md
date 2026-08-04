@@ -117,9 +117,9 @@ confidence model. The frozen 7B policy is replicated on each GPU. By default,
 the global meta-batch contains one problem per rank; `--problem-batch-size`
 increases it to any positive multiple of the world size. Each rank accumulates
 the mean gradient over its local problem batch and performs one confidence
-optimizer step only after all local problems finish. Differentiable task
-adapters are still constructed and released one problem at a time, so their
-training memory does not grow linearly with the problem batch size.
+optimizer step only after all local problems finish. Confidence forwards are
+packed across the responses of several problems, while each task-dependent
+adapter is still constructed and released independently.
 
 Large logical batches can be decoupled from the rollout working set with
 `--problem-micro-batch-size`. Both values are global and must be divisible by
@@ -132,10 +132,13 @@ is 128 logical problems and eight resident problems per rank.
 Support and query groups are detached and cached on CPU. The trainer completes
 all support rollouts, then all confidence-guided query rollouts, before the
 first outer update. During each outer iteration it transfers one cached
-microbatch to the GPU, backpropagates losses scaled by the complete per-rank
-problem count, releases that microbatch, and calls the confidence optimizer
-exactly once after all logical problems. Thus microbatching changes the memory
-schedule, not the objective, rollout data, PPO old log-probabilities, number of
+microbatch to the GPU, computes its task losses together, backpropagates their
+sum scaled by the complete per-rank problem count, releases that microbatch,
+and calls the confidence optimizer exactly once after all logical problems.
+`--defer-confidence-gradient-sync` additionally suppresses FSDP gradient
+collectives until the final accumulation microbatch when memory permits. Thus,
+microbatching changes the memory schedule, not the objective, rollout data,
+PPO old log-probabilities, number of
 outer updates, or effective batch size. Host RAM and output storage still grow
 with the complete logical batch. Full response text and the redundant vLLM
 diagnostic log-probabilities are written before caching and are not retained in
@@ -275,12 +278,12 @@ strict-box verifier predictions are written to per-rank JSONL files under
 `outputs/rollout-test-$SLURM_JOB_ID`.
 
 The vLLM lifecycle follows verl's hybrid engine ordering. Servers start first
-and enter level-1 sleep. Every local problem microbatch wakes only `weights`,
-dynamically loads the required detached LoRAs from node-local `/dev/shm`, wakes
-`kv_cache`, submits all microbatch prompts concurrently for continuous
-batching, unregisters the adapters and sleeps before PyTorch performs
-log-probability or gradient work. Support deduplicates the shared initial
-adapter; query keeps one detached adapter per task within the microbatch. The
+and enter level-1 sleep. A complete support or query phase wakes `weights`
+once, dynamically swaps the required detached LoRAs from node-local `/dev/shm`
+at problem-microbatch boundaries, wakes `kv_cache` once, and sleeps before
+PyTorch performs log-probability or gradient work. Support exports and loads
+the shared initial adapter once per phase; query keeps only the current
+microbatch's task adapters registered. The
 launcher explicitly enables vLLM's development lifecycle endpoints and
 supervises every server process. An HTTP 500, a missing endpoint or a dead
 replica terminates the trainer and the Slurm job instead of waiting through a
@@ -341,11 +344,11 @@ bash scripts/submit_problem_batch_test.sh
 ```
 
 This gives each rank eight independent problems. Support prompts share one
-initial LoRA and enter one vLLM continuous-batching transaction. Query prompts
-use eight task-specific LoRAs, but are submitted concurrently during the same
-wake/sleep transaction. The differentiable outer pass then processes those
-eight tasks sequentially, accumulates their gradients, clips once and performs
-one optimizer step. To test B=64 on eight GPUs with the same script:
+initial LoRA and enter one vLLM phase transaction. Query prompts use eight
+task-specific LoRAs in the same phase transaction. The differentiable outer
+pass batches confidence scoring and performs one backward per problem
+microbatch, clips once and performs one optimizer step. To test B=64 on eight
+GPUs with the same script:
 
 ```bash
 export SMOKE_GPUS=8
@@ -565,12 +568,13 @@ and RNG state.
 
 Use `scripts/launch_8xh100.sh` for eight H100s.
 
-Policy log-probability forwards default to one response at a time via
-`--policy-micro-batch-size 1`, with full-forward activation recomputation so
-the `[batch, sequence, vocabulary]` logits are not retained across the whole
-group. Confidence forwards default to micro-batches of two. Increase these
-only after a server smoke test establishes sufficient memory headroom. Token
-log-probabilities are reduced in float32 even when model weights are bfloat16.
+Policy and confidence forwards accept both a maximum sequence count and a
+dense-token budget through `--policy-micro-batch-size`,
+`--confidence-micro-batch-size`, `--policy-max-tokens-per-micro-batch`, and
+`--confidence-max-tokens-per-micro-batch`. Rows are packed longest-first and
+right padding is trimmed. Qwen receives `logits_to_keep`, so policy forwards
+project only completion positions to the vocabulary. Token log-probabilities
+are still reduced in float32 even when model weights are bfloat16.
 
 Important configurable ablations include:
 

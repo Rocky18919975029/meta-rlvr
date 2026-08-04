@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from contextlib import contextmanager
 
@@ -43,6 +44,68 @@ def clone_fast_parameters(parameters: Mapping[str, Tensor]) -> ParameterDict:
     }
 
 
+def sequence_microbatches(
+    group: RolloutGroup,
+    *,
+    max_sequences: int,
+    max_tokens: int | None,
+) -> tuple[tuple[int, ...], ...]:
+    """Group rows by dense token cost while preserving exact sample semantics."""
+
+    if max_sequences <= 0:
+        raise ValueError("max_sequences must be positive.")
+    if max_tokens is not None and max_tokens <= 0:
+        raise ValueError("max_tokens must be positive when provided.")
+    lengths = [int(value) for value in group.attention_mask.sum(dim=1).tolist()]
+    if max_tokens is None:
+        return tuple(
+            tuple(range(start, min(start + max_sequences, group.group_size)))
+            for start in range(0, group.group_size, max_sequences)
+        )
+    over_budget = [length for length in lengths if length > max_tokens]
+    if over_budget:
+        raise ValueError(
+            f"A sequence length {max(over_budget)} exceeds the token budget "
+            f"{max_tokens}."
+        )
+
+    # Longest-first packing prevents a short response from inheriting the dense
+    # padding cost of an unrelated long response.  Results are restored to the
+    # original group order after each model forward.
+    ordered = sorted(range(group.group_size), key=lengths.__getitem__, reverse=True)
+    batches: list[tuple[int, ...]] = []
+    current: list[int] = []
+    current_max_length = 0
+    for index in ordered:
+        candidate_max_length = max(current_max_length, lengths[index])
+        candidate_size = len(current) + 1
+        if current and (
+            candidate_size > max_sequences
+            or candidate_max_length * candidate_size > max_tokens
+        ):
+            batches.append(tuple(current))
+            current = []
+            current_max_length = 0
+        current.append(index)
+        current_max_length = max(current_max_length, lengths[index])
+    if current:
+        batches.append(tuple(current))
+    if sorted(index for batch in batches for index in batch) != list(
+        range(group.group_size)
+    ):
+        raise RuntimeError("Token microbatch packing lost or duplicated rows.")
+    return tuple(batches)
+
+
+def _supports_logits_to_keep(model: nn.Module) -> bool:
+    parameters = inspect.signature(model.forward).parameters.values()
+    return any(
+        parameter.name == "logits_to_keep"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def token_logprobs(
     model: nn.Module,
     group: RolloutGroup,
@@ -50,20 +113,53 @@ def token_logprobs(
     fast_parameters: Mapping[str, Tensor] | None = None,
     row_start: int = 0,
     row_end: int | None = None,
+    row_indices: tuple[int, ...] | None = None,
     activation_checkpointing: bool = False,
 ) -> Tensor:
-    if row_end is None:
-        row_end = group.group_size
-    if row_start < 0 or row_end <= row_start or row_end > group.group_size:
-        raise ValueError("Invalid rollout row interval.")
-    input_ids = group.input_ids[row_start:row_end]
-    attention_mask = group.attention_mask[row_start:row_end]
+    if row_indices is not None:
+        if row_start != 0 or row_end is not None:
+            raise ValueError("row_indices cannot be combined with a row interval.")
+        if not row_indices or len(set(row_indices)) != len(row_indices):
+            raise ValueError("row_indices must contain distinct rows.")
+        if min(row_indices) < 0 or max(row_indices) >= group.group_size:
+            raise ValueError("row_indices contains an out-of-range row.")
+        row_selector = torch.tensor(
+            row_indices,
+            dtype=torch.long,
+            device=group.input_ids.device,
+        )
+        input_ids = group.input_ids.index_select(0, row_selector)
+        attention_mask = group.attention_mask.index_select(0, row_selector)
+        expected_full = group.completion_mask.index_select(0, row_selector)
+    else:
+        if row_end is None:
+            row_end = group.group_size
+        if row_start < 0 or row_end <= row_start or row_end > group.group_size:
+            raise ValueError("Invalid rollout row interval.")
+        input_ids = group.input_ids[row_start:row_end]
+        attention_mask = group.attention_mask[row_start:row_end]
+        expected_full = group.completion_mask[row_start:row_end]
+
+    sequence_length = int(attention_mask.sum(dim=1).max().item())
+    if sequence_length < 2:
+        raise ValueError("A policy microbatch must contain at least two tokens.")
+    input_ids = input_ids[:, :sequence_length]
+    attention_mask = attention_mask[:, :sequence_length]
+    expected = expected_full[:, : sequence_length - 1]
+    prediction_positions = torch.nonzero(
+        expected.any(dim=0), as_tuple=False
+    ).flatten()
+    if prediction_positions.numel() == 0:
+        raise ValueError("A policy microbatch contains no completion positions.")
     kwargs = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "use_cache": False,
         "return_dict": True,
     }
+    uses_selected_logits = _supports_logits_to_keep(model)
+    if uses_selected_logits:
+        kwargs["logits_to_keep"] = prediction_positions
 
     def forward_with_fast_parameters(*parameter_values: Tensor) -> Tensor:
         if fast_parameters is None:
@@ -86,14 +182,22 @@ def token_logprobs(
         logits = getattr(outputs, "logits", None)
         if logits is None:
             raise TypeError("Policy model must return logits.")
-        if logits.ndim != 3 or logits.shape[:2] != input_ids.shape:
+        if logits.ndim != 3 or logits.shape[0] != input_ids.shape[0]:
             raise ValueError(
-                f"Unexpected policy logits shape {tuple(logits.shape)}; expected "
-                f"[{input_ids.shape[0]}, {input_ids.shape[1]}, vocabulary]."
+                f"Unexpected policy logits shape {tuple(logits.shape)}."
+            )
+        if logits.shape[1] == input_ids.shape[1]:
+            completion_logits = logits.index_select(1, prediction_positions)
+        elif uses_selected_logits and logits.shape[1] == prediction_positions.numel():
+            completion_logits = logits
+        else:
+            raise ValueError(
+                "Policy logits must cover either the full sequence or exactly "
+                "the requested completion positions."
             )
 
-        next_token_logits = logits[:, :-1, :].float()
-        next_tokens = input_ids[:, 1:]
+        next_token_logits = completion_logits.float()
+        next_tokens = input_ids.index_select(1, prediction_positions + 1)
         selected_logits = next_token_logits.gather(
             -1, next_tokens.unsqueeze(-1)
         ).squeeze(-1)
@@ -118,10 +222,10 @@ def token_logprobs(
         else:
             selected = forward_with_fast_parameters(*values)
 
-    expected = group.completion_mask[row_start:row_end]
-    if selected.shape != expected.shape:
+    if selected.shape != (input_ids.shape[0], prediction_positions.numel()):
         raise RuntimeError("Selected token log-probability shape is inconsistent.")
-    return selected
+    aligned = selected.new_zeros(expected_full.shape)
+    return torch.index_copy(aligned, 1, prediction_positions, selected)
 
 
 def chunked_token_logprobs(
@@ -130,37 +234,44 @@ def chunked_token_logprobs(
     *,
     fast_parameters: Mapping[str, Tensor],
     micro_batch_size: int,
+    max_tokens_per_micro_batch: int | None = None,
     activation_checkpointing: bool,
     show_progress: bool = False,
     progress_description: str = "policy log-probabilities",
 ) -> Tensor:
     if micro_batch_size <= 0:
         raise ValueError("micro_batch_size must be positive.")
-    starts = range(0, group.group_size, micro_batch_size)
+    row_batches = sequence_microbatches(
+        group,
+        max_sequences=micro_batch_size,
+        max_tokens=max_tokens_per_micro_batch,
+    )
+    starts = range(len(row_batches))
     if show_progress:
         from tqdm.auto import tqdm
 
         starts = tqdm(
             starts,
-            total=(group.group_size + micro_batch_size - 1)
-            // micro_batch_size,
+            total=len(row_batches),
             desc=progress_description,
             unit="microbatch",
             leave=True,
         )
-    chunks = []
-    for start in starts:
-        chunks.append(
-            token_logprobs(
-                model,
-                group,
-                fast_parameters=fast_parameters,
-                row_start=start,
-                row_end=min(start + micro_batch_size, group.group_size),
-                activation_checkpointing=activation_checkpointing,
-            )
+    rows: list[Tensor | None] = [None] * group.group_size
+    for batch_index in starts:
+        row_indices = row_batches[batch_index]
+        output = token_logprobs(
+            model,
+            group,
+            fast_parameters=fast_parameters,
+            row_indices=row_indices,
+            activation_checkpointing=activation_checkpointing,
         )
-    return torch.cat(chunks, dim=0)
+        for offset, row_index in enumerate(row_indices):
+            rows[row_index] = output[offset : offset + 1]
+    if any(row is None for row in rows):
+        raise RuntimeError("Policy token batching returned an incomplete group.")
+    return torch.cat([row for row in rows if row is not None], dim=0)
 
 
 @contextmanager

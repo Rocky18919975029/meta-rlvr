@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -15,7 +16,12 @@ from meta_rlvr.config import (
     MetaLossConfig,
 )
 from meta_rlvr.data import ChatMessage, MathProblem
-from meta_rlvr.functional import token_logprobs, trainable_parameter_state
+from meta_rlvr.functional import (
+    chunked_token_logprobs,
+    sequence_microbatches,
+    token_logprobs,
+    trainable_parameter_state,
+)
 from meta_rlvr.train import (
     CachedRolloutMicrobatch,
     _accumulate_outer_batch,
@@ -250,6 +256,154 @@ def test_inference_adaptation_does_not_require_verifier_labels() -> None:
     assert adaptation.confidence_loss is None
 
 
+def test_batched_generation_adaptation_matches_single_response_updates() -> None:
+    torch.manual_seed(21)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(), hidden_size=5
+    )
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    initial_fast = trainable_parameter_state(policy)
+
+    def build_algorithm(policy_micro_batch_size: int) -> BilevelGRPO:
+        return BilevelGRPO(
+            policy=policy,
+            confidence_model=confidence,
+            inner_config=InnerLoopConfig(
+                num_iterations=2,
+                optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+                grpo=GRPOLossConfig(kl_coefficient=0.03),
+            ),
+            meta_config=MetaLossConfig(),
+            query_advantage_config=AdvantageConfig(),
+            query_grpo_config=GRPOLossConfig(),
+            policy_micro_batch_size=policy_micro_batch_size,
+        )
+
+    serial = build_algorithm(1).adapt_task(
+        support,
+        initial_fast,
+        differentiable=False,
+        supervise_confidence=False,
+    )
+    batched = build_algorithm(3).adapt_task(
+        support,
+        initial_fast,
+        differentiable=False,
+        supervise_confidence=False,
+    )
+    for name in serial.fast_parameters:
+        torch.testing.assert_close(
+            serial.fast_parameters[name], batched.fast_parameters[name]
+        )
+
+
+def test_token_aware_microbatches_trim_padding_without_changing_logprobs() -> None:
+    policy = ToyPolicy()
+    input_ids = torch.tensor(
+        (
+            (1, 2, 3, 4, 5),
+            (1, 2, 3, 0, 0),
+            (1, 2, 3, 4, 0),
+        )
+    )
+    attention_mask = torch.tensor(
+        (
+            (True, True, True, True, True),
+            (True, True, True, False, False),
+            (True, True, True, True, False),
+        )
+    )
+    completion_mask = torch.tensor(
+        (
+            (False, True, True, True),
+            (False, True, False, False),
+            (False, True, True, False),
+        )
+    )
+    group = RolloutGroup(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        completion_mask=completion_mask,
+        old_logprobs=torch.zeros((3, 4)),
+        texts=("a", "b", "c"),
+    )
+    fast = trainable_parameter_state(policy)
+    expected = token_logprobs(policy, group, fast_parameters=fast)
+    actual = chunked_token_logprobs(
+        policy,
+        group,
+        fast_parameters=fast,
+        micro_batch_size=3,
+        max_tokens_per_micro_batch=8,
+        activation_checkpointing=False,
+    )
+    assert sequence_microbatches(
+        group, max_sequences=3, max_tokens=8
+    ) == ((0,), (2, 1))
+    torch.testing.assert_close(actual, expected)
+
+
+def test_selected_policy_logits_match_full_vocabulary_projection() -> None:
+    class SelectedLogitsToyPolicy(ToyPolicy):
+        def forward(
+            self,
+            input_ids,
+            attention_mask,
+            use_cache,
+            return_dict,
+            logits_to_keep=None,
+        ):
+            outputs = super().forward(
+                input_ids, attention_mask, use_cache, return_dict
+            )
+            if logits_to_keep is not None:
+                outputs.logits = outputs.logits.index_select(1, logits_to_keep)
+            return outputs
+
+    torch.manual_seed(22)
+    full_policy = ToyPolicy()
+    selected_policy = SelectedLogitsToyPolicy()
+    selected_policy.load_state_dict(full_policy.state_dict())
+    group = make_group(full_policy, torch.tensor([1.0, 0.0, 1.0]))
+    torch.testing.assert_close(
+        token_logprobs(selected_policy, group),
+        token_logprobs(full_policy, group),
+    )
+
+
+def test_confidence_scoring_batches_responses_across_problems() -> None:
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(), hidden_size=5
+    )
+    first = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    second = make_group(policy, torch.tensor([0.0, 1.0, 0.0]))
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(),
+        meta_config=MetaLossConfig(),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+        confidence_micro_batch_size=6,
+    )
+    batched = algorithm._confidence_logits_batch(
+        (first, second),
+        differentiable=True,
+        show_progress=False,
+        progress_description="test",
+    )
+    torch.testing.assert_close(
+        batched[0],
+        confidence(first.input_ids, first.attention_mask),
+    )
+    torch.testing.assert_close(
+        batched[1],
+        confidence(second.input_ids, second.attention_mask),
+    )
+
+
 class CPUAccelerator:
     device = torch.device("cpu")
     is_main_process = False
@@ -270,6 +424,10 @@ class CPUAccelerator:
     @staticmethod
     def wait_for_everyone() -> None:
         return None
+
+    @staticmethod
+    def no_sync(model):
+        return nullcontext()
 
 
 def _problem(uid: str) -> MathProblem:
@@ -449,6 +607,8 @@ def test_problem_microbatch_accumulation_matches_full_batch_gradient() -> None:
         local_problem_batch_size=4,
         initial_fast=initial_fast,
         accelerator=CPUAccelerator(),
+        confidence_model=confidence,
+        defer_gradient_sync=True,
         progress_description="test",
     )
 

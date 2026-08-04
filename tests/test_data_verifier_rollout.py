@@ -360,13 +360,19 @@ def test_vllm_rollout_uses_staged_hybrid_lifecycle(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("distinct_adapters", "expected_adapter_count"),
-    ((False, 1), (True, 2)),
+    ("distinct_adapters", "expected_adapter_count", "split_batches"),
+    (
+        (False, 1, False),
+        (True, 2, False),
+        (False, 1, True),
+        (True, 2, True),
+    ),
 )
 def test_vllm_problem_batch_uses_one_hybrid_transaction(
     tmp_path,
     distinct_adapters,
     expected_adapter_count,
+    split_batches,
 ) -> None:
     policy = ToyGeneratingPolicy()
     first_fast = trainable_parameter_state(policy)
@@ -458,10 +464,17 @@ def test_vllm_problem_batch_uses_one_hybrid_transaction(
         )
         for index in range(2)
     ]
-    groups = engine.generate_batch(
-        problems,
-        [first_fast, second_fast],
-    )
+    if split_batches:
+        generated_batches = engine.generate_batches(
+            [[problems[0]], [problems[1]]],
+            [[first_fast], [second_fast]],
+        )
+        groups = tuple(group for batch in generated_batches for group in batch)
+    else:
+        groups = engine.generate_batch(
+            problems,
+            [first_fast, second_fast],
+        )
 
     paths = [path for _, path, _, _ in calls]
     assert paths.count("/wake_up?tags=weights") == 1
