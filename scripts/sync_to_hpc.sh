@@ -11,12 +11,10 @@ ssh "${HPC_HOST}" \
   "mkdir -p '${HPC_DIR}/artifacts/data' '${HPC_DIR}/artifacts/models' '${HPC_DIR}/artifacts/wheelhouse' '${HPC_DIR}/logs' '${HPC_DIR}/outputs'"
 
 echo "Synchronizing project code from ${LOCAL_PROJECT}"
-rsync -azP --delete \
-  --exclude '.git/' \
+rsync -azP \
   --exclude '.pytest_cache/' \
   --exclude '__pycache__/' \
   --exclude '*.egg-info/' \
-  --exclude 'artifacts/' \
   --exclude 'outputs/' \
   --exclude 'logs/' \
   "${LOCAL_PROJECT}/" \
