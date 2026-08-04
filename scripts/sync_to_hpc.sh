@@ -11,7 +11,7 @@ ssh "${HPC_HOST}" \
   "mkdir -p '${HPC_DIR}/artifacts/data' '${HPC_DIR}/artifacts/models' '${HPC_DIR}/artifacts/wheelhouse' '${HPC_DIR}/logs' '${HPC_DIR}/outputs'"
 
 echo "Synchronizing project code from ${LOCAL_PROJECT}"
-rsync -azP --delete-delay \
+rsync -azP --delete \
   --exclude '.git/' \
   --exclude '.pytest_cache/' \
   --exclude '__pycache__/' \

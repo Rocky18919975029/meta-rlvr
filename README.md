@@ -154,7 +154,7 @@ export META_RLVR_HPC=zhongal@hpc3login.hpc.hkust-gz.edu.cn
 ssh "${META_RLVR_HPC}" \
   'mkdir -p meta-rlvr/artifacts/data meta-rlvr/artifacts/models meta-rlvr/artifacts/wheelhouse meta-rlvr/logs meta-rlvr/outputs'
 
-rsync -azP --delete-delay \
+rsync -azP --delete \
   --exclude '.git/' \
   --exclude '.pytest_cache/' \
   --exclude '__pycache__/' \
