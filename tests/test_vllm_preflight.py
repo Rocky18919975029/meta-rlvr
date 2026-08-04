@@ -7,6 +7,7 @@ import pytest
 
 
 module_path = Path(__file__).parents[1] / "src/meta_rlvr/vllm_preflight.py"
+launcher_path = Path(__file__).parents[1] / "scripts/vllm_hybrid_servers.sh"
 spec = importlib.util.spec_from_file_location("vllm_preflight", module_path)
 assert spec is not None and spec.loader is not None
 vllm_preflight = importlib.util.module_from_spec(spec)
@@ -46,3 +47,14 @@ def test_vllm_preflight_rejects_broken_instrumentator(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match=">=8.0.1"):
         vllm_preflight.validate_vllm_environment()
+
+
+def test_vllm_sleep_process_does_not_inherit_expandable_segments() -> None:
+    launcher = launcher_path.read_text(encoding="utf-8")
+    server_environment = launcher.split("setsid env", maxsplit=1)[1].split(
+        "python -m vllm.entrypoints.openai.api_server",
+        maxsplit=1,
+    )[0]
+
+    assert "-u PYTORCH_CUDA_ALLOC_CONF" in server_environment
+    assert "-u PYTORCH_ALLOC_CONF" in server_environment

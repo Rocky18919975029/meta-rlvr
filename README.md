@@ -411,6 +411,13 @@ Because the CPU copy is sharded across ranks but colocated vLLM replicas also
 sleep their weights in host memory, request sufficient node RAM; `SLURM_MEM`
 is passed directly to `sbatch` by both smoke submitters.
 
+The four-GPU command keeps `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+for the Accelerate/FSDP trainer. The hybrid launcher explicitly removes both
+`PYTORCH_CUDA_ALLOC_CONF` and `PYTORCH_ALLOC_CONF` only from each vLLM server
+process: vLLM 0.11 sleep mode uses `CuMemAllocator`, whose memory pool is
+incompatible with expandable segments. The trainer process still inherits the
+requested allocator setting.
+
 This job defaults to an eight-hour Slurm limit and writes to
 `outputs/meta-meaningful-$SLURM_JOB_ID`, with progress and metrics in matching
 `logs/meta-meaningful-$SLURM_JOB_ID.{err,out}` files. It still performs only one

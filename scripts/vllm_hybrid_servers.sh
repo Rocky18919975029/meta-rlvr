@@ -87,6 +87,12 @@ PY
   export VLLM_SERVER_DEV_MODE=1
   export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
 
+  if [[ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ]] || \
+    [[ -n "${PYTORCH_ALLOC_CONF:-}" ]]; then
+    echo "vLLM replicas will ignore the trainer PyTorch allocator configuration;" \
+      "sleep-mode memory pools require expandable_segments to be disabled."
+  fi
+
   for ((gpu = 0; gpu < gpu_count; gpu++)); do
     port=$((first_port + gpu))
     url="http://127.0.0.1:${port}"
@@ -96,6 +102,8 @@ PY
     mkdir -p "${replica_cache}"
     echo "[$(date --iso-8601=seconds)] starting vLLM replica gpu=${cuda_device} url=${url}"
     setsid env \
+      -u PYTORCH_CUDA_ALLOC_CONF \
+      -u PYTORCH_ALLOC_CONF \
       CUDA_VISIBLE_DEVICES="${cuda_device}" \
       VLLM_CACHE_ROOT="${replica_cache}/vllm" \
       TORCHINDUCTOR_CACHE_DIR="${replica_cache}/torchinductor" \
