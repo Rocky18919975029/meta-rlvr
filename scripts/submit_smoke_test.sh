@@ -92,6 +92,9 @@ fi
 if [[ -n "${SLURM_EXCLUDE:-}" ]]; then
   SBATCH_ARGS+=(--exclude="${SLURM_EXCLUDE}")
 fi
+if [[ -n "${SLURM_MEM:-}" ]]; then
+  SBATCH_ARGS+=(--mem="${SLURM_MEM}")
+fi
 
 submission=$(sbatch "${SBATCH_ARGS[@]}" scripts/slurm_smoke_test.sbatch)
 job_id="${submission##* }"
@@ -101,7 +104,7 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}} K=${SMOKE_SUPPORT_GROUP_SIZE:-2}/${SMOKE_QUERY_GROUP_SIZE:-2} inner=${SMOKE_INNER_ITERATIONS:-1} outer=${SMOKE_OUTER_ITERATIONS:-1}"
+echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}} K=${SMOKE_SUPPORT_GROUP_SIZE:-2}/${SMOKE_QUERY_GROUP_SIZE:-2} inner=${SMOKE_INNER_ITERATIONS:-1} outer=${SMOKE_OUTER_ITERATIONS:-1} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0}"
 echo "stdout: ${LOG_DIR}/${RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${RUN_LABEL}-${job_id}.err"
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then

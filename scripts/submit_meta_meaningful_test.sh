@@ -99,6 +99,9 @@ fi
 if [[ -n "${SLURM_EXCLUDE:-}" ]]; then
   SBATCH_ARGS+=(--exclude="${SLURM_EXCLUDE}")
 fi
+if [[ -n "${SLURM_MEM:-}" ]]; then
+  SBATCH_ARGS+=(--mem="${SLURM_MEM}")
+fi
 
 submission=$(sbatch "${SBATCH_ARGS[@]}" scripts/slurm_smoke_test.sbatch)
 job_id="${submission##* }"
@@ -108,7 +111,7 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE} max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS}"
+echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE} max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0}"
 echo "stdout: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
 echo "vLLM throughput: ${LOG_DIR}/vllm-${job_id}/gpu-*.log"

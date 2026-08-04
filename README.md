@@ -361,6 +361,55 @@ export SMOKE_GPUS=4
 bash scripts/submit_meta_meaningful_test.sh
 ```
 
+For the first full B=32 check, use eight GPUs without optimizer offload. This
+separates correctness of the complete two-outer-update run from the 4-GPU
+memory optimization:
+
+```bash
+conda activate verl
+cd "$HOME/meta-rlvr"
+export SMOKE_GPUS=8
+export SMOKE_PROBLEM_BATCH_SIZE=32
+export META_RLVR_RUN_LABEL=meta-meaningful-b32-8gpu
+export VLLM_MAX_LORAS=4
+export VLLM_MAX_CPU_LORAS=4
+export VLLM_MAX_NUM_SEQS=64
+export SLURM_TIME=08:00:00
+unset SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER
+bash scripts/submit_meta_meaningful_test.sh
+```
+
+On four GPUs, the first outer AdamW step creates FP32 `exp_avg` and
+`exp_avg_sq` tensors. Keeping those states resident during the second outer
+forward/backward can exhaust an 80 GB H100. Enable the targeted optimizer-state
+offload as follows:
+
+```bash
+conda activate verl
+cd "$HOME/meta-rlvr"
+export SMOKE_GPUS=4
+export SMOKE_PROBLEM_BATCH_SIZE=32
+export META_RLVR_RUN_LABEL=meta-meaningful-b32-4gpu-offload
+export SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER=1
+export SLURM_MEM=200G
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export VLLM_MAX_LORAS=8
+export VLLM_MAX_CPU_LORAS=8
+export VLLM_MAX_NUM_SEQS=64
+export SLURM_TIME=08:00:00
+bash scripts/submit_meta_meaningful_test.sh
+```
+
+`--offload-confidence-optimizer` moves only AdamW moment tensors. They remain
+on CPU during the outer forward/backward, move to the local GPU immediately
+before `optimizer.step()`, and return to CPU immediately afterward. Parameters,
+gradients, the confidence forward, and all bilevel losses are unchanged. Each
+transfer prints its per-rank state size, duration, and current CUDA allocated
+and reserved memory. Checkpoint save/resume preserves the same lifecycle.
+Because the CPU copy is sharded across ranks but colocated vLLM replicas also
+sleep their weights in host memory, request sufficient node RAM; `SLURM_MEM`
+is passed directly to `sbatch` by both smoke submitters.
+
 This job defaults to an eight-hour Slurm limit and writes to
 `outputs/meta-meaningful-$SLURM_JOB_ID`, with progress and metrics in matching
 `logs/meta-meaningful-$SLURM_JOB_ID.{err,out}` files. It still performs only one
@@ -482,6 +531,7 @@ Important configurable ablations include:
 --ranking-coefficient 0
 --meta-coefficient 0
 --meta-gradient-mode first_order|second_order
+--offload-confidence-optimizer
 ```
 
 For `floored_group_std`, `--inner-std-floor` is mandatory. Incompatible

@@ -251,6 +251,12 @@ fi
 if [[ "${SMOKE_ROLLOUT_ONLY:-0}" == "1" ]]; then
   EXTRA_TRAIN_ARGS+=(--rollout-only)
 fi
+if [[ "${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0}" == "1" ]]; then
+  EXTRA_TRAIN_ARGS+=(--offload-confidence-optimizer)
+elif [[ "${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0}" != "0" ]]; then
+  echo "SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER must be 0 or 1." >&2
+  exit 2
+fi
 if ! command -v setsid >/dev/null 2>&1; then
   echo "setsid is required to supervise the distributed trainer." >&2
   exit 2

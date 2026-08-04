@@ -6,6 +6,7 @@ import json
 import math
 import random
 import re
+import time
 from pathlib import Path
 
 import torch
@@ -100,6 +101,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inner-weight-decay", type=float, default=0.0)
     parser.add_argument("--confidence-learning-rate", type=float, default=1e-6)
     parser.add_argument("--confidence-weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--offload-confidence-optimizer",
+        action="store_true",
+        help=(
+            "Keep AdamW moment tensors on CPU during outer forward/backward and "
+            "move them to the GPU only for optimizer.step()."
+        ),
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
 
     parser.add_argument(
@@ -411,6 +420,105 @@ def _prepare_for_checkpoint(confidence_optimizer, accelerator) -> None:
         )
 
 
+def _adamw_optimizer(optimizer) -> torch.optim.AdamW:
+    raw_optimizer = getattr(optimizer, "optimizer", optimizer)
+    if not isinstance(raw_optimizer, torch.optim.AdamW):
+        raise TypeError("Confidence optimizer offload requires torch.optim.AdamW.")
+    return raw_optimizer
+
+
+def _move_adamw_moments(
+    optimizer,
+    target_device: torch.device,
+) -> int:
+    raw_optimizer = _adamw_optimizer(optimizer)
+    allowed_state_keys = {
+        "step",
+        "exp_avg",
+        "exp_avg_sq",
+        "max_exp_avg_sq",
+    }
+    moment_keys = ("exp_avg", "exp_avg_sq", "max_exp_avg_sq")
+    initialized_parameters = 0
+    moment_bytes = 0
+    for state in raw_optimizer.state.values():
+        if not state:
+            continue
+        unexpected = set(state).difference(allowed_state_keys)
+        if unexpected:
+            raise ValueError(
+                f"Unexpected AdamW optimizer state keys: {sorted(unexpected)}"
+            )
+        if "exp_avg" not in state or "exp_avg_sq" not in state:
+            raise ValueError(
+                "Initialized AdamW state must contain exp_avg and exp_avg_sq."
+            )
+        initialized_parameters += 1
+        for key in moment_keys:
+            if key not in state:
+                continue
+            moment = state[key]
+            if not isinstance(moment, torch.Tensor):
+                raise TypeError(f"AdamW state {key!r} must be a tensor.")
+            moment_bytes += moment.numel() * moment.element_size()
+            if moment.device != target_device:
+                state[key] = moment.to(device=target_device)
+    if initialized_parameters == 0:
+        return 0
+    if moment_bytes == 0:
+        raise RuntimeError("Initialized AdamW state contains no moment tensors.")
+    return moment_bytes
+
+
+def _transfer_confidence_optimizer_moments(
+    optimizer,
+    *,
+    target_device: torch.device,
+    accelerator,
+    outer_iteration: int | str,
+) -> int:
+    if accelerator.device.type == "cuda":
+        torch.cuda.synchronize(accelerator.device)
+        if target_device.type == "cuda":
+            torch.cuda.empty_cache()
+    started = time.perf_counter()
+    moment_bytes = _move_adamw_moments(optimizer, target_device)
+    if accelerator.device.type == "cuda":
+        torch.cuda.synchronize(accelerator.device)
+        if target_device.type == "cpu":
+            torch.cuda.empty_cache()
+    elapsed = time.perf_counter() - started
+    if moment_bytes <= 0:
+        raise RuntimeError(
+            "Confidence optimizer state is empty when a transfer was required."
+        )
+    if accelerator.is_main_process:
+        cuda_memory = {}
+        if accelerator.device.type == "cuda":
+            cuda_memory = {
+                "optimizer_moments/cuda_allocated_gib": (
+                    torch.cuda.memory_allocated(accelerator.device) / 1024**3
+                ),
+                "optimizer_moments/cuda_reserved_gib": (
+                    torch.cuda.memory_reserved(accelerator.device) / 1024**3
+                ),
+            }
+        print(
+            json.dumps(
+                {
+                    "outer_iteration": outer_iteration,
+                    "optimizer_moments/device": target_device.type,
+                    "optimizer_moments/gib_per_rank": moment_bytes / 1024**3,
+                    "optimizer_moments/transfer_seconds": elapsed,
+                    **cuda_memory,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    return moment_bytes
+
+
 def _evaluate(
     *,
     step: int,
@@ -551,11 +659,9 @@ def main() -> None:
         raise ValueError(
             "The HPC launch must configure Accelerate mixed_precision='bf16'."
         )
-    global_problem_batch_size, local_problem_batch_size = (
-        _local_problem_batch_size(
-            args.problem_batch_size,
-            world_size=accelerator.num_processes,
-        )
+    global_problem_batch_size, local_problem_batch_size = _local_problem_batch_size(
+        args.problem_batch_size,
+        world_size=accelerator.num_processes,
     )
     args.problem_batch_size = global_problem_batch_size
     set_seed(args.seed, device_specific=True)
@@ -598,6 +704,7 @@ def main() -> None:
     )
     confidence_model.train()
     start_step = 0
+    optimizer_moments_offloaded = False
     if args.resume_from_checkpoint is not None:
         if not args.resume_from_checkpoint.is_dir():
             raise FileNotFoundError(args.resume_from_checkpoint)
@@ -612,6 +719,14 @@ def main() -> None:
                 "Checkpoint already reached or exceeded the requested max_steps."
             )
         accelerator.load_state(args.resume_from_checkpoint)
+        if args.offload_confidence_optimizer:
+            _transfer_confidence_optimizer_moments(
+                confidence_optimizer,
+                target_device=torch.device("cpu"),
+                accelerator=accelerator,
+                outer_iteration="resume",
+            )
+            optimizer_moments_offloaded = True
 
     algorithm = BilevelGRPO(
         policy=policy,
@@ -631,8 +746,7 @@ def main() -> None:
             raise ValueError("--vllm-base-urls contains an empty URL.")
         if len(base_urls) != accelerator.num_processes:
             raise ValueError(
-                f"Expected {accelerator.num_processes} vLLM URLs, got "
-                f"{len(base_urls)}."
+                f"Expected {accelerator.num_processes} vLLM URLs, got {len(base_urls)}."
             )
         rollout_engine_type = VLLMHybridRolloutEngine
         rollout_kwargs = {
@@ -781,9 +895,7 @@ def main() -> None:
                         differentiable=False,
                         supervise_confidence=False,
                         show_progress=False,
-                        progress_prefix=(
-                            f"{batch_prefix} problem {problem_index + 1}"
-                        ),
+                        progress_prefix=(f"{batch_prefix} problem {problem_index + 1}"),
                     )
                     generation_fast_parameters.append(
                         generation_adaptation.fast_parameters
@@ -827,9 +939,7 @@ def main() -> None:
                     rollout_totals = torch.zeros(
                         6, dtype=torch.float32, device=accelerator.device
                     )
-                    for support, query in zip(
-                        supports, cached_queries, strict=True
-                    ):
+                    for support, query in zip(supports, cached_queries, strict=True):
                         rollout_totals += torch.stack(
                             (
                                 support.verifier_rewards.sum(),
@@ -944,7 +1054,26 @@ def main() -> None:
                     "Confidence gradient norm is non-finite; refusing to update "
                     "or save a corrupted checkpoint."
                 )
+            if args.offload_confidence_optimizer and optimizer_moments_offloaded:
+                outer_iterations.set_postfix_str("stage=optimizer-moments-to-gpu")
+                _transfer_confidence_optimizer_moments(
+                    confidence_optimizer,
+                    target_device=accelerator.device,
+                    accelerator=accelerator,
+                    outer_iteration=outer_iteration,
+                )
+                optimizer_moments_offloaded = False
+            outer_iterations.set_postfix_str("stage=optimizer-step")
             confidence_optimizer.step()
+            if args.offload_confidence_optimizer:
+                outer_iterations.set_postfix_str("stage=optimizer-moments-to-cpu")
+                _transfer_confidence_optimizer_moments(
+                    confidence_optimizer,
+                    target_device=torch.device("cpu"),
+                    accelerator=accelerator,
+                    outer_iteration=outer_iteration,
+                )
+                optimizer_moments_offloaded = True
             outer_iterations.set_postfix_str("stage=metrics")
 
             metrics = accelerator.reduce(local_metric_sums, reduction="sum")
@@ -969,14 +1098,12 @@ def main() -> None:
                             "query_reward": metrics[7].item(),
                             "support_accuracy": metrics[8].item(),
                             "query_accuracy": metrics[9].item(),
-                            "confidence_gradient_norm": (
-                                reduced_gradient_norm.item()
-                            ),
+                            "confidence_gradient_norm": (reduced_gradient_norm.item()),
                         },
                         sort_keys=True,
                     ),
-                        flush=True,
-                    )
+                    flush=True,
+                )
 
         del (
             problems,
