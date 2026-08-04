@@ -375,6 +375,7 @@ export VLLM_MAX_LORAS=4
 export VLLM_MAX_CPU_LORAS=4
 export VLLM_MAX_NUM_SEQS=64
 export SLURM_TIME=08:00:00
+export SLURM_MEM=200G
 unset SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER
 bash scripts/submit_meta_meaningful_test.sh
 ```
