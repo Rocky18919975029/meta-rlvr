@@ -124,6 +124,7 @@ def test_resume_configuration_is_strict_except_operational_fields(tmp_path) -> N
         eval_steps=2,
         seed=42,
         inner_iterations=2,
+        vllm_base_urls="http://127.0.0.1:10001",
     )
     _initialize_or_validate_run(initial, accelerator=accelerator)
 
@@ -135,6 +136,7 @@ def test_resume_configuration_is_strict_except_operational_fields(tmp_path) -> N
         eval_steps=4,
         seed=42,
         inner_iterations=2,
+        vllm_base_urls="http://127.0.0.1:20001",
     )
     _initialize_or_validate_run(resumed, accelerator=accelerator)
 

@@ -570,6 +570,7 @@ _RESUME_MUTABLE_CONFIG_KEYS = {
     "save_steps",
     "eval_steps",
     "resume_from_checkpoint",
+    "vllm_base_urls",
 }
 
 
