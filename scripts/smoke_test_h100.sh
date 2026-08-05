@@ -116,7 +116,15 @@ fi
 
 RUN_LABEL="${META_RLVR_RUN_LABEL:-smoke}"
 RUN_TAG="${SLURM_JOB_ID:-manual-$(date +%Y%m%d-%H%M%S)}"
-RUN_DIR="${META_RLVR_OUTPUT_DIR%/}/${RUN_LABEL}-${RUN_TAG}"
+if [[ -n "${SMOKE_RESUME_FROM_CHECKPOINT:-}" ]]; then
+  if [[ ! -d "${SMOKE_RESUME_FROM_CHECKPOINT}" ]]; then
+    echo "SMOKE_RESUME_FROM_CHECKPOINT is not a checkpoint directory." >&2
+    exit 2
+  fi
+  RUN_DIR=$(dirname "${SMOKE_RESUME_FROM_CHECKPOINT}")
+else
+  RUN_DIR="${META_RLVR_OUTPUT_DIR%/}/${RUN_LABEL}-${RUN_TAG}"
+fi
 mkdir -p "${RUN_DIR}"
 
 export HF_HUB_OFFLINE=1
@@ -144,7 +152,8 @@ echo "local_problem_micro_batch_size=${LOCAL_PROBLEM_MICRO_BATCH_SIZE}"
 echo "rollout_problem_batch_size=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "local_rollout_problem_batch_size=${LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "policy_micro_batch_size=${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}"
-echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE:-policy_micro_batch_size}"
+echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE:-1}"
+echo "resume_from_checkpoint=${SMOKE_RESUME_FROM_CHECKPOINT:-none}"
 echo "confidence_micro_batch_size=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}"
 echo "policy_max_tokens_per_micro_batch=${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH:-unset}"
 echo "confidence_max_tokens_per_micro_batch=${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH:-unset}"
@@ -267,6 +276,11 @@ PY
 
 echo "[$(date --iso-8601=seconds)] launching ${SMOKE_GPUS} distributed workers"
 EXTRA_TRAIN_ARGS=()
+if [[ -n "${SMOKE_RESUME_FROM_CHECKPOINT:-}" ]]; then
+  EXTRA_TRAIN_ARGS+=(
+    --resume-from-checkpoint "${SMOKE_RESUME_FROM_CHECKPOINT}"
+  )
+fi
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
   source scripts/vllm_hybrid_servers.sh
   start_meta_rlvr_vllm_servers

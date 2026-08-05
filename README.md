@@ -570,11 +570,23 @@ bash scripts/launch_4xh100.sh \
   --outer-iterations 1
 ```
 
-Resume only from a completed step checkpoint, for example
-`--resume-from-checkpoint /path/to/output/checkpoint-50`; the numeric suffix is
-used as the next meta-step index. The frozen policy is reloaded from the base
-checkpoint, while Accelerate restores the sharded confidence model, optimizer
-and RNG state.
+Resume only from the latest committed step checkpoint, for example
+`--resume-from-checkpoint /path/to/output/checkpoint-50`. The output directory,
+world size, and all mathematical training settings must match the original run;
+only `max_steps`, `save_steps`, and `eval_steps` may change. Accelerate restores
+the sharded confidence model, AdamW state, and PyTorch RNG state. The trainer
+also validates the AdamW update counter, restores the exact committed byte
+boundary of `metrics.jsonl` and each rank's rollout log, and explicitly seeds
+every vLLM request from the global step and problem identity. A partial step is
+therefore discarded and replayed rather than duplicated in the logs.
+
+`--save-steps` defaults to 1, and the last requested global step is always
+saved even when it is not divisible by `save_steps`. Validation runs before the
+step checkpoint is committed. A checkpoint becomes resumable only after
+`trainer_state.json` and every `rank-N.json` completion marker have been
+written. `final_checkpoint.json` points to the final committed checkpoint.
+Persistent structured metrics are appended to `metrics.jsonl`; stdout mirrors
+the same records for Slurm monitoring.
 
 Use `scripts/launch_8xh100.sh` for eight H100s.
 
@@ -588,9 +600,9 @@ are still reduced in float32 even when model weights are bfloat16.
 
 `--first-order-vjp-forward-batch-size` independently limits how many support
 responses share one policy forward before the trainer computes their
-sequential first-order VJPs. It defaults to `--policy-micro-batch-size` for
-backward compatibility. Setting it to 1 avoids repeatedly traversing unrelated
-batch rows during per-response VJPs without changing rollout old-logprob,
+sequential first-order VJPs. It defaults to 1, which avoids repeatedly
+traversing unrelated batch rows during per-response VJPs without changing
+rollout old-logprob,
 non-differentiable generation adaptation, or query GRPO batching. The HPC
 launcher exposes the same control as
 `SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE`.

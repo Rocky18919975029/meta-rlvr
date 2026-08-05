@@ -60,17 +60,14 @@ class BilevelGRPO:
         query_grpo_config: GRPOLossConfig,
         *,
         policy_micro_batch_size: int = 4,
-        first_order_vjp_forward_batch_size: int | None = None,
+        first_order_vjp_forward_batch_size: int = 1,
         confidence_micro_batch_size: int = 4,
         policy_max_tokens_per_micro_batch: int | None = None,
         confidence_max_tokens_per_micro_batch: int | None = None,
     ) -> None:
         if policy_micro_batch_size <= 0 or confidence_micro_batch_size <= 0:
             raise ValueError("Micro-batch sizes must be positive.")
-        if (
-            first_order_vjp_forward_batch_size is not None
-            and first_order_vjp_forward_batch_size <= 0
-        ):
+        if first_order_vjp_forward_batch_size <= 0:
             raise ValueError("First-order VJP forward batch size must be positive.")
         self.policy = policy
         self.confidence_model = confidence_model
@@ -79,11 +76,7 @@ class BilevelGRPO:
         self.query_advantage_config = query_advantage_config
         self.query_grpo_config = query_grpo_config
         self.policy_micro_batch_size = policy_micro_batch_size
-        self.first_order_vjp_forward_batch_size = (
-            policy_micro_batch_size
-            if first_order_vjp_forward_batch_size is None
-            else first_order_vjp_forward_batch_size
-        )
+        self.first_order_vjp_forward_batch_size = first_order_vjp_forward_batch_size
         self.confidence_micro_batch_size = confidence_micro_batch_size
         self.policy_max_tokens_per_micro_batch = policy_max_tokens_per_micro_batch
         self.confidence_max_tokens_per_micro_batch = (
@@ -103,7 +96,9 @@ class BilevelGRPO:
         else:
             target_count = len(batches)
         while len(batches) < target_count:
-            split_index = max(range(len(batches)), key=lambda index: len(batches[index]))
+            split_index = max(
+                range(len(batches)), key=lambda index: len(batches[index])
+            )
             selected = batches[split_index]
             if len(selected) < 2:
                 raise RuntimeError(
@@ -224,7 +219,9 @@ class BilevelGRPO:
         outputs = []
         for rows in logits_by_problem:
             if any(row is None for row in rows):
-                raise RuntimeError("Confidence token batching returned incomplete logits.")
+                raise RuntimeError(
+                    "Confidence token batching returned incomplete logits."
+                )
             outputs.append(torch.cat([row for row in rows if row is not None]))
         return tuple(outputs)
 
@@ -274,9 +271,10 @@ class BilevelGRPO:
         token_count = support.completion_mask[response_index].sum()
         if self.inner_config.grpo.token_normalization == "global_tokens":
             return token_count / support.completion_mask.sum()
-        return torch.ones(
-            (), dtype=torch.float32, device=support.input_ids.device
-        ) / support.group_size
+        return (
+            torch.ones((), dtype=torch.float32, device=support.input_ids.device)
+            / support.group_size
+        )
 
     def _aggregate_inner_outputs(
         self,
@@ -294,9 +292,7 @@ class BilevelGRPO:
         token_counts = support.completion_mask.sum(dim=1).to(torch.float32)
         token_weights = token_counts / token_counts.sum()
         losses = torch.stack([output.loss.detach() for output in outputs])
-        policy_losses = torch.stack(
-            [output.policy_loss.detach() for output in outputs]
-        )
+        policy_losses = torch.stack([output.policy_loss.detach() for output in outputs])
         mean_kls = torch.stack([output.mean_kl.detach() for output in outputs])
         clip_fractions = torch.stack(
             [output.clip_fraction.detach() for output in outputs]
@@ -337,8 +333,7 @@ class BilevelGRPO:
             -torch.ones_like(advantages),
         )
         accumulated = {
-            name: torch.zeros_like(value)
-            for name, value in fast_parameters.items()
+            name: torch.zeros_like(value) for name, value in fast_parameters.items()
         }
 
         response_outputs: list[GRPOLossOutput | None] = [None] * support.group_size
@@ -370,22 +365,16 @@ class BilevelGRPO:
             unit_losses = []
             kl_losses = []
             for offset, response_index in enumerate(row_indices):
-                old_logprobs = support.old_logprobs[
-                    response_index : response_index + 1
-                ]
+                old_logprobs = support.old_logprobs[response_index : response_index + 1]
                 completion_mask = support.completion_mask[
                     response_index : response_index + 1
                 ]
                 reference_logprobs = (
                     None
                     if support.reference_logprobs is None
-                    else support.reference_logprobs[
-                        response_index : response_index + 1
-                    ]
+                    else support.reference_logprobs[response_index : response_index + 1]
                 )
-                response_advantage = advantages[
-                    response_index : response_index + 1
-                ]
+                response_advantage = advantages[response_index : response_index + 1]
                 response_current = current_logprobs[offset : offset + 1]
                 response_output = grpo_policy_loss(
                     response_current,
@@ -451,8 +440,7 @@ class BilevelGRPO:
                     names, unit_gradient_values, strict=True
                 ):
                     accumulated[name] = (
-                        accumulated[name]
-                        + magnitude * unit_gradient.detach()
+                        accumulated[name] + magnitude * unit_gradient.detach()
                     )
 
             if self.inner_config.grpo.kl_coefficient > 0:
@@ -463,12 +451,8 @@ class BilevelGRPO:
                     retain_graph=False,
                     allow_unused=False,
                 )
-                for name, kl_gradient in zip(
-                    names, kl_gradient_values, strict=True
-                ):
-                    accumulated[name] = (
-                        accumulated[name] + kl_gradient.detach()
-                    )
+                for name, kl_gradient in zip(names, kl_gradient_values, strict=True):
+                    accumulated[name] = accumulated[name] + kl_gradient.detach()
 
         if any(output is None for output in response_outputs):
             raise RuntimeError("Inner token batching returned incomplete metrics.")
@@ -664,17 +648,15 @@ class BilevelGRPO:
         for inner_iteration in range(self.inner_config.num_iterations):
             names = tuple(fast_parameters)
             if not differentiable:
-                gradients, inner_output = (
-                    self._nondifferentiable_inner_gradients(
-                        support,
-                        advantages,
-                        fast_parameters,
-                        show_progress=show_progress,
-                        progress_description=(
-                            f"{progress_prefix}: inner "
-                            f"{inner_iteration + 1}/{self.inner_config.num_iterations}"
-                        ),
-                    )
+                gradients, inner_output = self._nondifferentiable_inner_gradients(
+                    support,
+                    advantages,
+                    fast_parameters,
+                    show_progress=show_progress,
+                    progress_description=(
+                        f"{progress_prefix}: inner "
+                        f"{inner_iteration + 1}/{self.inner_config.num_iterations}"
+                    ),
                 )
             elif self.inner_config.meta_gradient_mode == "first_order":
                 gradients, inner_output = self._first_order_inner_gradients(
@@ -693,9 +675,7 @@ class BilevelGRPO:
                     support,
                     fast_parameters=fast_parameters,
                     micro_batch_size=self.policy_micro_batch_size,
-                    max_tokens_per_micro_batch=(
-                        self.policy_max_tokens_per_micro_batch
-                    ),
+                    max_tokens_per_micro_batch=(self.policy_max_tokens_per_micro_batch),
                     activation_checkpointing=True,
                     show_progress=show_progress,
                     progress_description=(

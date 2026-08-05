@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import random
 import re
+import shutil
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -145,9 +147,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--first-order-vjp-forward-batch-size",
         type=int,
+        default=1,
         help=(
             "Maximum responses sharing one policy forward before sequential "
-            "first-order VJPs. Defaults to policy_micro_batch_size."
+            "first-order VJPs. Defaults to 1."
         ),
     )
     parser.add_argument("--confidence-micro-batch-size", type=int, default=2)
@@ -266,7 +269,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-only", action="store_true")
 
     parser.add_argument("--max-steps", type=int, required=True)
-    parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument(
+        "--save-steps",
+        type=int,
+        default=1,
+        help="Save one committed checkpoint every N completed global steps.",
+    )
     parser.add_argument("--resume-from-checkpoint", type=Path)
     parser.add_argument(
         "--eval-steps",
@@ -473,9 +481,7 @@ def _problem_batch_layout(
             f"{sub_batch_name} must be divisible by the distributed world size."
         )
     if global_batch % global_micro_batch != 0:
-        raise ValueError(
-            f"problem_batch_size must be divisible by {sub_batch_name}."
-        )
+        raise ValueError(f"problem_batch_size must be divisible by {sub_batch_name}.")
     local_micro_batch = global_micro_batch // world_size
     num_micro_batches = global_batch // global_micro_batch
     if local_batch != local_micro_batch * num_micro_batches:
@@ -500,16 +506,209 @@ def _fixed_size_batches(items, batch_size: int) -> list[list]:
     ]
 
 
-def _write_run_config(args: argparse.Namespace, output_dir: Path, accelerator) -> None:
-    if not accelerator.is_main_process:
-        return
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _generation_seed(
+    *,
+    base_seed: int,
+    step: int,
+    phase: str,
+    rank: int,
+    problem_uid: str,
+) -> int:
+    payload = f"{base_seed}|{step}|{phase}|{rank}|{problem_uid}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big")
+
+
+def _generation_seed_batches(
+    problem_batches: list[list[MathProblem]],
+    *,
+    base_seed: int,
+    step: int,
+    phase: str,
+    rank: int,
+) -> list[list[int]]:
+    return [
+        [
+            _generation_seed(
+                base_seed=base_seed,
+                step=step,
+                phase=phase,
+                rank=rank,
+                problem_uid=problem.uid,
+            )
+            for problem in problems
+        ]
+        for problems in problem_batches
+    ]
+
+
+def _serializable_run_config(args: argparse.Namespace, *, world_size: int) -> dict:
     serializable = {
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
-    path = output_dir / "run_config.json"
-    path.write_text(json.dumps(serializable, indent=2, sort_keys=True) + "\n")
+    serializable["distributed_world_size"] = world_size
+    return serializable
+
+
+def _atomic_write_json(path: Path, record: dict) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _append_metric(path: Path, record: dict) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+        stream.flush()
+
+
+_RESUME_MUTABLE_CONFIG_KEYS = {
+    "max_steps",
+    "save_steps",
+    "eval_steps",
+    "resume_from_checkpoint",
+}
+
+
+def _initialize_or_validate_run(
+    args: argparse.Namespace,
+    *,
+    accelerator,
+) -> None:
+    output_dir = args.output_dir.resolve()
+    args.output_dir = output_dir
+    current = _serializable_run_config(
+        args,
+        world_size=accelerator.num_processes,
+    )
+    config_path = output_dir / "run_config.json"
+    if args.resume_from_checkpoint is None:
+        if accelerator.is_main_process:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            existing_training_artifacts = [
+                path
+                for path in output_dir.iterdir()
+                if path.name == "run_config.json"
+                or path.name == "metrics.jsonl"
+                or path.name.startswith("rollouts-rank-")
+                or path.name.startswith("checkpoint-")
+                or path.name == "final"
+            ]
+            if existing_training_artifacts:
+                raise FileExistsError(
+                    "Refusing to start a fresh run in a directory containing "
+                    f"training artifacts: {existing_training_artifacts}"
+                )
+            _atomic_write_json(config_path, current)
+        return
+
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"Resume requires the original run config: {config_path}"
+        )
+    original = json.loads(config_path.read_text(encoding="utf-8"))
+    compared_keys = set(original) | set(current)
+    mismatches = {
+        key: {"checkpoint_run": original.get(key), "resume_run": current.get(key)}
+        for key in sorted(compared_keys - _RESUME_MUTABLE_CONFIG_KEYS)
+        if original.get(key) != current.get(key)
+    }
+    if mismatches:
+        raise ValueError(
+            "Resume configuration differs from the original run: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+
+
+def _checkpoint_number(path: Path) -> int:
+    match = re.fullmatch(r"checkpoint-(\d+)", path.name)
+    if match is None:
+        raise ValueError(
+            "resume_from_checkpoint must end in checkpoint-<completed_steps>."
+        )
+    return int(match.group(1))
+
+
+def _resolve_resume_checkpoint(args: argparse.Namespace) -> tuple[Path | None, int]:
+    if args.resume_from_checkpoint is None:
+        return None, 0
+    checkpoint = args.resume_from_checkpoint.resolve()
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(checkpoint)
+    if checkpoint.parent != args.output_dir.resolve():
+        raise ValueError(
+            "resume_from_checkpoint must be a direct child of output_dir so "
+            "metrics and rollout logs resume in one run directory."
+        )
+    completed_steps = _checkpoint_number(checkpoint)
+    committed = []
+    for candidate in checkpoint.parent.glob("checkpoint-*"):
+        if candidate.is_dir() and (candidate / "trainer_state.json").is_file():
+            committed.append((_checkpoint_number(candidate), candidate))
+    if not committed:
+        raise ValueError("No committed checkpoint exists in output_dir.")
+    latest_steps, latest_checkpoint = max(committed)
+    if checkpoint != latest_checkpoint:
+        raise ValueError(
+            "Perfect resume is only supported from the latest committed "
+            f"checkpoint ({latest_checkpoint}), not {checkpoint}."
+        )
+    if completed_steps != latest_steps:
+        raise RuntimeError("Checkpoint directory numbering is inconsistent.")
+    return checkpoint, completed_steps
+
+
+def _truncate_file(path: Path, size: int) -> None:
+    if size < 0:
+        raise ValueError("Committed file size cannot be negative.")
+    if not path.is_file():
+        if size == 0:
+            return
+        raise FileNotFoundError(path)
+    current_size = path.stat().st_size
+    if current_size < size:
+        raise RuntimeError(
+            f"Append-only log {path} is shorter than its committed size "
+            f"({current_size} < {size})."
+        )
+    if current_size > size:
+        with path.open("r+b") as stream:
+            stream.truncate(size)
+
+
+def _restore_committed_log_boundaries(
+    checkpoint: Path,
+    *,
+    output_dir: Path,
+    accelerator,
+) -> dict:
+    trainer_state = json.loads(
+        (checkpoint / "trainer_state.json").read_text(encoding="utf-8")
+    )
+    if trainer_state.get("schema_version") != 1:
+        raise ValueError("Unsupported trainer checkpoint schema.")
+    if trainer_state.get("world_size") != accelerator.num_processes:
+        raise ValueError(
+            "Perfect resume requires the same distributed world size as the "
+            "checkpoint."
+        )
+    rank_state_path = checkpoint / f"rank-{accelerator.process_index}.json"
+    if not rank_state_path.is_file():
+        raise FileNotFoundError(rank_state_path)
+    rank_state = json.loads(rank_state_path.read_text(encoding="utf-8"))
+    if rank_state.get("rank") != accelerator.process_index:
+        raise ValueError("Checkpoint rank metadata is inconsistent.")
+    rollout_path = output_dir / f"rollouts-rank-{accelerator.process_index}.jsonl"
+    _truncate_file(rollout_path, int(rank_state["rollout_log_bytes"]))
+    if accelerator.is_main_process:
+        _truncate_file(
+            output_dir / "metrics.jsonl",
+            int(trainer_state["metrics_log_bytes"]),
+        )
+    return trainer_state
 
 
 def _append_rollout_diagnostics(
@@ -573,7 +772,7 @@ def _append_rollout_diagnostics(
         stream.flush()
 
 
-def _prepare_for_checkpoint(confidence_optimizer, accelerator) -> None:
+def _prepare_for_checkpoint(confidence_optimizer, accelerator) -> dict[str, float]:
     confidence_optimizer.zero_grad(set_to_none=True)
     gc.collect()
     torch.cuda.synchronize(accelerator.device)
@@ -590,18 +789,101 @@ def _prepare_for_checkpoint(confidence_optimizer, accelerator) -> None:
         device=accelerator.device,
     )
     memory = accelerator.reduce(memory, reduction="max") / 1024**3
-    if accelerator.is_main_process:
-        print(
-            json.dumps(
-                {
-                    "checkpoint/max_allocated_gib": memory[0].item(),
-                    "checkpoint/max_reserved_gib": memory[1].item(),
-                    "checkpoint/peak_allocated_gib": memory[2].item(),
-                },
-                sort_keys=True,
-            ),
-            flush=True,
+    return {
+        "checkpoint/max_allocated_gib": memory[0].item(),
+        "checkpoint/max_reserved_gib": memory[1].item(),
+        "checkpoint/peak_allocated_gib": memory[2].item(),
+    }
+
+
+def _optimizer_step_values(optimizer) -> set[int]:
+    values: set[int] = set()
+    for state in _adamw_optimizer(optimizer).state.values():
+        if not state:
+            continue
+        step = state.get("step")
+        if isinstance(step, torch.Tensor):
+            if step.numel() != 1:
+                raise ValueError("AdamW step tensors must be scalar.")
+            step = step.item()
+        if not isinstance(step, (int, float)) or int(step) != step:
+            raise TypeError("AdamW optimizer step must be an integer scalar.")
+        values.add(int(step))
+    return values
+
+
+def _validate_optimizer_steps(optimizer, *, expected_steps: int) -> None:
+    values = _optimizer_step_values(optimizer)
+    if values != {expected_steps}:
+        raise RuntimeError(
+            "AdamW optimizer state was not restored exactly: expected every "
+            f"initialized parameter at step {expected_steps}, got {sorted(values)}."
         )
+
+
+def _save_committed_checkpoint(
+    *,
+    checkpoint: Path,
+    completed_steps: int,
+    expected_optimizer_steps: int,
+    confidence_optimizer,
+    accelerator,
+    metrics_path: Path,
+    rollout_log_path: Path | None,
+) -> None:
+    checkpoint_started = time.perf_counter()
+    if accelerator.is_main_process and checkpoint.exists():
+        if (checkpoint / "trainer_state.json").is_file():
+            raise FileExistsError(
+                f"Refusing to overwrite committed checkpoint: {checkpoint}"
+            )
+        else:
+            shutil.rmtree(checkpoint)
+    accelerator.wait_for_everyone()
+    _validate_optimizer_steps(
+        confidence_optimizer,
+        expected_steps=expected_optimizer_steps,
+    )
+    memory = _prepare_for_checkpoint(confidence_optimizer, accelerator)
+    accelerator.save_state(checkpoint)
+    accelerator.wait_for_everyone()
+
+    checkpoint_record = {
+        "event": "checkpoint_committed",
+        "completed_steps": completed_steps,
+        "optimizer_steps": expected_optimizer_steps,
+        "checkpoint": str(checkpoint),
+        "checkpoint/save_seconds": time.perf_counter() - checkpoint_started,
+        **memory,
+    }
+    if accelerator.is_main_process:
+        _append_metric(metrics_path, checkpoint_record)
+        print(json.dumps(checkpoint_record, sort_keys=True), flush=True)
+    accelerator.wait_for_everyone()
+
+    rank_state = {
+        "rank": accelerator.process_index,
+        "rollout_log_bytes": (
+            rollout_log_path.stat().st_size
+            if rollout_log_path is not None and rollout_log_path.is_file()
+            else 0
+        ),
+    }
+    _atomic_write_json(
+        checkpoint / f"rank-{accelerator.process_index}.json",
+        rank_state,
+    )
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        trainer_state = {
+            "schema_version": 1,
+            "completed_steps": completed_steps,
+            "optimizer_steps": expected_optimizer_steps,
+            "world_size": accelerator.num_processes,
+            "metrics_log_bytes": metrics_path.stat().st_size,
+        }
+        _atomic_write_json(checkpoint / "trainer_state.json", trainer_state)
+    accelerator.wait_for_everyone()
 
 
 def _adamw_optimizer(optimizer) -> torch.optim.AdamW:
@@ -660,6 +942,8 @@ def _transfer_confidence_optimizer_moments(
     target_device: torch.device,
     accelerator,
     outer_iteration: int | str,
+    metrics_path: Path | None = None,
+    step: int | None = None,
 ) -> int:
     if accelerator.device.type == "cuda":
         torch.cuda.synchronize(accelerator.device)
@@ -687,19 +971,19 @@ def _transfer_confidence_optimizer_moments(
                     torch.cuda.memory_reserved(accelerator.device) / 1024**3
                 ),
             }
-        print(
-            json.dumps(
-                {
-                    "outer_iteration": outer_iteration,
-                    "optimizer_moments/device": target_device.type,
-                    "optimizer_moments/gib_per_rank": moment_bytes / 1024**3,
-                    "optimizer_moments/transfer_seconds": elapsed,
-                    **cuda_memory,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
+        record = {
+            "event": "optimizer_moment_transfer",
+            "step": step,
+            "completed_steps": step,
+            "outer_iteration": outer_iteration,
+            "optimizer_moments/device": target_device.type,
+            "optimizer_moments/gib_per_rank": moment_bytes / 1024**3,
+            "optimizer_moments/transfer_seconds": elapsed,
+            **cuda_memory,
+        }
+        if metrics_path is not None:
+            _append_metric(metrics_path, record)
+        print(json.dumps(record, sort_keys=True), flush=True)
     return moment_bytes
 
 
@@ -827,7 +1111,7 @@ def _accumulate_outer_batch(
             "confidence_model is required when gradient synchronization is deferred."
         )
 
-    local_metric_sums = torch.zeros(10, dtype=torch.float32, device=accelerator.device)
+    local_metric_sums = torch.zeros(16, dtype=torch.float32, device=accelerator.device)
     problem_progress = tqdm(
         total=local_problem_batch_size,
         desc=progress_description,
@@ -861,13 +1145,12 @@ def _accumulate_outer_batch(
                     f"{problem_offset + len(supports)}"
                 ),
             )
-            accumulated_loss = torch.stack(
-                tuple(output.loss for output in outputs)
-            ).sum() / local_problem_batch_size
+            accumulated_loss = (
+                torch.stack(tuple(output.loss for output in outputs)).sum()
+                / local_problem_batch_size
+            )
             accelerator.backward(accumulated_loss)
-        for support, query, output in zip(
-            supports, queries, outputs, strict=True
-        ):
+        for support, query, output in zip(supports, queries, outputs, strict=True):
             local_metric_sums += torch.stack(
                 (
                     output.loss.detach(),
@@ -880,6 +1163,12 @@ def _accumulate_outer_batch(
                     query.verifier_rewards.mean(),
                     support.correctness_labels.mean(),
                     query.correctness_labels.mean(),
+                    output.meta_grpo.mean_kl.detach(),
+                    output.adaptation.inner_losses[-1].mean_kl.detach(),
+                    output.adaptation.confidence_probabilities.detach().mean(),
+                    output.adaptation.confidence_probabilities.detach().square().mean(),
+                    torch.any(support.correctness_labels == 1).float(),
+                    torch.any(query.correctness_labels == 1).float(),
                 )
             )
             problem_progress.update(1)
@@ -901,9 +1190,12 @@ def _evaluate(
     confidence_model,
     accelerator,
     rollout_log_path: Path | None,
-) -> None:
+    metrics_path: Path,
+    base_seed: int,
+) -> dict[str, float | int | str]:
     if not problems:
         raise ValueError("Validation problems cannot be empty.")
+    evaluation_started = time.perf_counter()
     rounds = math.ceil(len(problems) / accelerator.num_processes)
     was_training = confidence_model.training
     confidence_model.eval()
@@ -929,6 +1221,13 @@ def _evaluate(
                 initial_fast,
                 show_progress=accelerator.is_main_process,
                 progress_description=f"{progress_prefix} base",
+                seed=_generation_seed(
+                    base_seed=base_seed,
+                    step=step,
+                    phase="validation_base",
+                    rank=accelerator.process_index,
+                    problem_uid=problem.uid,
+                ),
             )
             generation_adaptation = algorithm.adapt_task(
                 support,
@@ -943,6 +1242,13 @@ def _evaluate(
                 generation_adaptation.fast_parameters,
                 show_progress=accelerator.is_main_process,
                 progress_description=f"{progress_prefix} adapted",
+                seed=_generation_seed(
+                    base_seed=base_seed,
+                    step=step,
+                    phase="validation_adapted",
+                    rank=accelerator.process_index,
+                    problem_uid=problem.uid,
+                ),
             )
             del generation_adaptation
             base_verification = verifier(
@@ -992,26 +1298,24 @@ def _evaluate(
         confidence_model.train(was_training)
 
     totals = accelerator.reduce(local_metrics, reduction="sum")
+    record = {}
     if accelerator.is_main_process:
         base_accuracy = (totals[0] / totals[1]).item()
         adapted_accuracy = (totals[2] / totals[3]).item()
-        print(
-            json.dumps(
-                {
-                    "step": step,
-                    "validation/base_accuracy": base_accuracy,
-                    "validation/adapted_accuracy": adapted_accuracy,
-                    "validation/accuracy_delta": adapted_accuracy - base_accuracy,
-                    "validation/base_pass_at_group": (totals[4] / len(problems)).item(),
-                    "validation/adapted_pass_at_group": (
-                        totals[5] / len(problems)
-                    ).item(),
-                    "validation/num_unique_problems": len(problems),
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
+        record = {
+            "event": "validation",
+            "completed_steps": step,
+            "validation/base_accuracy": base_accuracy,
+            "validation/adapted_accuracy": adapted_accuracy,
+            "validation/accuracy_delta": adapted_accuracy - base_accuracy,
+            "validation/base_pass_at_group": (totals[4] / len(problems)).item(),
+            "validation/adapted_pass_at_group": (totals[5] / len(problems)).item(),
+            "validation/num_unique_problems": len(problems),
+            "validation/seconds": time.perf_counter() - evaluation_started,
+        }
+        _append_metric(metrics_path, record)
+        print(json.dumps(record, sort_keys=True), flush=True)
+    return record
 
 
 def main() -> None:
@@ -1055,16 +1359,33 @@ def main() -> None:
     args.problem_batch_size = global_problem_batch_size
     args.problem_micro_batch_size = global_problem_micro_batch_size
     args.rollout_problem_batch_size = global_rollout_problem_batch_size
-    if args.first_order_vjp_forward_batch_size is None:
-        args.first_order_vjp_forward_batch_size = args.policy_micro_batch_size
+    args.output_dir = args.output_dir.resolve()
+    if args.resume_from_checkpoint is not None:
+        args.resume_from_checkpoint = args.resume_from_checkpoint.resolve()
+    resume_checkpoint, start_step = _resolve_resume_checkpoint(args)
     set_seed(args.seed, device_specific=True)
-    _write_run_config(args, args.output_dir, accelerator)
+    _initialize_or_validate_run(args, accelerator=accelerator)
     accelerator.wait_for_everyone()
+    metrics_path = args.output_dir / "metrics.jsonl"
     rollout_log_path = (
         args.output_dir / f"rollouts-rank-{accelerator.process_index}.jsonl"
         if args.log_rollouts
         else None
     )
+    checkpoint_trainer_state = None
+    if resume_checkpoint is not None:
+        checkpoint_trainer_state = _restore_committed_log_boundaries(
+            resume_checkpoint,
+            output_dir=args.output_dir,
+            accelerator=accelerator,
+        )
+        if checkpoint_trainer_state["completed_steps"] != start_step:
+            raise ValueError("Checkpoint completed-step metadata is inconsistent.")
+        if start_step >= args.max_steps:
+            raise ValueError(
+                "Checkpoint already reached or exceeded the requested max_steps."
+            )
+    accelerator.wait_for_everyone()
 
     model_kwargs = {"attn_implementation": args.attn_implementation}
     target_modules = tuple(
@@ -1096,30 +1417,35 @@ def main() -> None:
         confidence_optimizer,
     )
     confidence_model.train()
-    start_step = 0
     optimizer_moments_offloaded = False
-    if args.resume_from_checkpoint is not None:
-        if not args.resume_from_checkpoint.is_dir():
-            raise FileNotFoundError(args.resume_from_checkpoint)
-        match = re.fullmatch(r"checkpoint-(\d+)", args.resume_from_checkpoint.name)
-        if match is None:
-            raise ValueError(
-                "resume_from_checkpoint must end in checkpoint-<completed_steps>."
-            )
-        start_step = int(match.group(1))
-        if start_step >= args.max_steps:
-            raise ValueError(
-                "Checkpoint already reached or exceeded the requested max_steps."
-            )
-        accelerator.load_state(args.resume_from_checkpoint)
+    if resume_checkpoint is not None:
+        accelerator.load_state(resume_checkpoint)
+        expected_optimizer_steps = start_step * args.outer_iterations
+        if checkpoint_trainer_state["optimizer_steps"] != expected_optimizer_steps:
+            raise ValueError("Checkpoint optimizer-step metadata is inconsistent.")
+        _validate_optimizer_steps(
+            confidence_optimizer,
+            expected_steps=expected_optimizer_steps,
+        )
         if args.offload_confidence_optimizer:
             _transfer_confidence_optimizer_moments(
                 confidence_optimizer,
                 target_device=torch.device("cpu"),
                 accelerator=accelerator,
                 outer_iteration="resume",
+                metrics_path=metrics_path,
+                step=start_step,
             )
             optimizer_moments_offloaded = True
+        if accelerator.is_main_process:
+            resume_record = {
+                "event": "resumed",
+                "completed_steps": start_step,
+                "optimizer_steps": expected_optimizer_steps,
+                "checkpoint": str(resume_checkpoint),
+            }
+            _append_metric(metrics_path, resume_record)
+            print(json.dumps(resume_record, sort_keys=True), flush=True)
 
     algorithm = BilevelGRPO(
         policy=policy,
@@ -1129,13 +1455,9 @@ def main() -> None:
         query_advantage_config=query_advantage_config,
         query_grpo_config=query_grpo_config,
         policy_micro_batch_size=args.policy_micro_batch_size,
-        first_order_vjp_forward_batch_size=(
-            args.first_order_vjp_forward_batch_size
-        ),
+        first_order_vjp_forward_batch_size=(args.first_order_vjp_forward_batch_size),
         confidence_micro_batch_size=args.confidence_micro_batch_size,
-        policy_max_tokens_per_micro_batch=(
-            args.policy_max_tokens_per_micro_batch
-        ),
+        policy_max_tokens_per_micro_batch=(args.policy_max_tokens_per_micro_batch),
         confidence_max_tokens_per_micro_batch=(
             args.confidence_max_tokens_per_micro_batch
         ),
@@ -1173,9 +1495,7 @@ def main() -> None:
             top_k=args.top_k,
             generation_micro_batch_size=args.generation_micro_batch_size,
             logprob_micro_batch_size=args.policy_micro_batch_size,
-            logprob_max_tokens_per_micro_batch=(
-                args.policy_max_tokens_per_micro_batch
-            ),
+            logprob_max_tokens_per_micro_batch=(args.policy_max_tokens_per_micro_batch),
             **rollout_kwargs,
         )
 
@@ -1257,10 +1577,15 @@ def main() -> None:
                 ],
                 show_progress=accelerator.is_main_process,
                 progress_description=f"{batch_prefix} support",
+                seed_batches=_generation_seed_batches(
+                    rollout_problem_batches,
+                    base_seed=args.seed,
+                    step=step,
+                    phase="train_support",
+                    rank=accelerator.process_index,
+                ),
             )
-        support_groups = tuple(
-            group for batch in support_batches for group in batch
-        )
+        support_groups = tuple(group for batch in support_batches for group in batch)
         if len(support_groups) != local_problem_batch_size:
             raise RuntimeError("Support rollout count does not match problem batch.")
         del support_batches
@@ -1300,9 +1625,7 @@ def main() -> None:
                         support_verification.correctness,
                     )
                     if args.inner_kl_coefficient > 0:
-                        support = support.with_reference_logprobs(
-                            support.old_logprobs
-                        )
+                        support = support.with_reference_logprobs(support.old_logprobs)
                     _append_rollout_diagnostics(
                         rollout_log_path,
                         step=step,
@@ -1351,9 +1674,7 @@ def main() -> None:
                 leave=True,
                 disable=not accelerator.is_main_process,
             )
-            for microbatch_index, cached_microbatch in enumerate(
-                adaptation_progress
-            ):
+            for microbatch_index, cached_microbatch in enumerate(adaptation_progress):
                 supports = tuple(
                     support.to(accelerator.device)
                     for support in cached_microbatch.supports
@@ -1394,6 +1715,13 @@ def main() -> None:
                 rollout_fast_parameter_batches,
                 show_progress=accelerator.is_main_process,
                 progress_description=f"{batch_prefix} query",
+                seed_batches=_generation_seed_batches(
+                    rollout_problem_batches,
+                    base_seed=args.seed,
+                    step=step,
+                    phase="train_query",
+                    rank=accelerator.process_index,
+                ),
             )
         query_groups = tuple(group for batch in query_batches for group in batch)
         if len(query_groups) != local_problem_batch_size:
@@ -1456,9 +1784,7 @@ def main() -> None:
                     )
                     rollout_totals[5] += query.group_size
                     queries[problem_index] = query
-                cached_queries = tuple(
-                    _cache_rollout_group(query) for query in queries
-                )
+                cached_queries = tuple(_cache_rollout_group(query) for query in queries)
             rollout_microbatches[microbatch_index] = replace(
                 cached_microbatch,
                 queries=cached_queries,
@@ -1471,52 +1797,37 @@ def main() -> None:
         if any(microbatch.queries is None for microbatch in rollout_microbatches):
             raise RuntimeError("Query rollout cache is incomplete.")
         if accelerator.is_main_process:
-            print(
-                json.dumps(
-                    {
-                        "diagnostic": "pipeline_timing",
-                        "step": step,
-                        "timing_seconds": dict(timings.values),
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
+            timing_record = {
+                "event": "pipeline_timing",
+                "step": step,
+                "completed_steps": step,
+                "timing_seconds": dict(timings.values),
+            }
+            _append_metric(metrics_path, timing_record)
+            print(json.dumps(timing_record, sort_keys=True), flush=True)
         if args.rollout_only:
             rollout_totals = accelerator.reduce(rollout_totals, reduction="sum")
             if accelerator.is_main_process:
-                print(
-                    json.dumps(
-                        {
-                            "rollout_only": True,
-                            "step": step,
-                            "support_mean_reward": (
-                                rollout_totals[0] / rollout_totals[2]
-                            ).item(),
-                            "support_accuracy": (
-                                rollout_totals[1] / rollout_totals[2]
-                            ).item(),
-                            "query_mean_reward": (
-                                rollout_totals[3] / rollout_totals[5]
-                            ).item(),
-                            "query_accuracy": (
-                                rollout_totals[4] / rollout_totals[5]
-                            ).item(),
-                            "num_problems": global_problem_batch_size,
-                            "problem_micro_batch_size": (
-                                global_problem_micro_batch_size
-                            ),
-                            "rollout_problem_batch_size": (
-                                global_rollout_problem_batch_size
-                            ),
-                            "support_responses": int(rollout_totals[2].item()),
-                            "query_responses": int(rollout_totals[5].item()),
-                            "timing_seconds": dict(timings.values),
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
+                rollout_record = {
+                    "event": "rollout_only",
+                    "rollout_only": True,
+                    "step": step,
+                    "completed_steps": step,
+                    "support_mean_reward": (
+                        rollout_totals[0] / rollout_totals[2]
+                    ).item(),
+                    "support_accuracy": (rollout_totals[1] / rollout_totals[2]).item(),
+                    "query_mean_reward": (rollout_totals[3] / rollout_totals[5]).item(),
+                    "query_accuracy": (rollout_totals[4] / rollout_totals[5]).item(),
+                    "num_problems": global_problem_batch_size,
+                    "problem_micro_batch_size": global_problem_micro_batch_size,
+                    "rollout_problem_batch_size": global_rollout_problem_batch_size,
+                    "support_responses": int(rollout_totals[2].item()),
+                    "query_responses": int(rollout_totals[5].item()),
+                    "timing_seconds": dict(timings.values),
+                }
+                _append_metric(metrics_path, rollout_record)
+                print(json.dumps(rollout_record, sort_keys=True), flush=True)
             accelerator.wait_for_everyone()
             accelerator.end_training()
             return
@@ -1552,23 +1863,20 @@ def main() -> None:
                             confidence_optimizer=confidence_optimizer,
                             accelerator=accelerator,
                             progress_prefix=(
-                                f"train step {step + 1} outer "
-                                f"{outer_iteration + 1}"
+                                f"train step {step + 1} outer " f"{outer_iteration + 1}"
                             ),
                         )
                 if accelerator.is_main_process:
-                    print(
-                        json.dumps(
-                            {
-                                "diagnostic": "component_gradient_norms",
-                                "step": step,
-                                "outer_iteration": outer_iteration,
-                                **component_gradient_norms,
-                            },
-                            sort_keys=True,
-                        ),
-                        flush=True,
-                    )
+                    component_record = {
+                        "event": "component_gradient_norms",
+                        "step": step,
+                        "completed_steps": step,
+                        "outer_iteration": outer_iteration,
+                        "global_outer_iteration": global_outer_iteration,
+                        **component_gradient_norms,
+                    }
+                    _append_metric(metrics_path, component_record)
+                    print(json.dumps(component_record, sort_keys=True), flush=True)
 
             outer_iterations.set_postfix_str("stage=meta-forward")
             outer_timing_prefix = f"outer_{outer_iteration + 1}"
@@ -1598,14 +1906,14 @@ def main() -> None:
                 )
             if args.offload_confidence_optimizer and optimizer_moments_offloaded:
                 outer_iterations.set_postfix_str("stage=optimizer-moments-to-gpu")
-                with timings.measure(
-                    f"{outer_timing_prefix}/optimizer_moments_to_gpu"
-                ):
+                with timings.measure(f"{outer_timing_prefix}/optimizer_moments_to_gpu"):
                     _transfer_confidence_optimizer_moments(
                         confidence_optimizer,
                         target_device=accelerator.device,
                         accelerator=accelerator,
                         outer_iteration=outer_iteration,
+                        metrics_path=metrics_path,
+                        step=step,
                     )
                 optimizer_moments_offloaded = False
             outer_iterations.set_postfix_str("stage=optimizer-step")
@@ -1613,14 +1921,14 @@ def main() -> None:
                 confidence_optimizer.step()
             if args.offload_confidence_optimizer:
                 outer_iterations.set_postfix_str("stage=optimizer-moments-to-cpu")
-                with timings.measure(
-                    f"{outer_timing_prefix}/optimizer_moments_to_cpu"
-                ):
+                with timings.measure(f"{outer_timing_prefix}/optimizer_moments_to_cpu"):
                     _transfer_confidence_optimizer_moments(
                         confidence_optimizer,
                         target_device=torch.device("cpu"),
                         accelerator=accelerator,
                         outer_iteration=outer_iteration,
+                        metrics_path=metrics_path,
+                        step=step,
                     )
                 optimizer_moments_offloaded = True
             outer_iterations.set_postfix_str("stage=metrics")
@@ -1631,44 +1939,55 @@ def main() -> None:
                 gradient_norm.detach(), reduction="mean"
             )
             if accelerator.is_main_process:
-                print(
-                    json.dumps(
-                        {
-                            "step": step,
-                            "outer_iteration": outer_iteration,
-                            "problem_batch_size": global_problem_batch_size,
-                            "problem_micro_batch_size": (
-                                global_problem_micro_batch_size
-                            ),
-                            "rollout_problem_batch_size": (
-                                global_rollout_problem_batch_size
-                            ),
-                            "loss": metrics[0].item(),
-                            "meta_loss": metrics[1].item(),
-                            "bce": metrics[2].item(),
-                            "ranking": metrics[3].item(),
-                            "outer_clip_fraction": metrics[4].item(),
-                            "inner_clip_fraction": metrics[5].item(),
-                            "support_reward": metrics[6].item(),
-                            "query_reward": metrics[7].item(),
-                            "support_accuracy": metrics[8].item(),
-                            "query_accuracy": metrics[9].item(),
-                            "confidence_gradient_norm": (reduced_gradient_norm.item()),
-                            "timing_seconds": dict(timings.values),
-                            **component_gradient_norms,
-                        },
-                        sort_keys=True,
+                train_record = {
+                    "event": "train_outer",
+                    "step": step,
+                    "completed_steps": step,
+                    "outer_iteration": outer_iteration,
+                    "global_outer_iteration": global_outer_iteration,
+                    "problem_batch_size": global_problem_batch_size,
+                    "problem_micro_batch_size": global_problem_micro_batch_size,
+                    "rollout_problem_batch_size": global_rollout_problem_batch_size,
+                    "loss": metrics[0].item(),
+                    "meta_loss": metrics[1].item(),
+                    "bce": metrics[2].item(),
+                    "ranking": metrics[3].item(),
+                    "outer_clip_fraction": metrics[4].item(),
+                    "inner_clip_fraction": metrics[5].item(),
+                    "support_reward": metrics[6].item(),
+                    "query_reward": metrics[7].item(),
+                    "support_accuracy": metrics[8].item(),
+                    "query_accuracy": metrics[9].item(),
+                    "outer_mean_kl": metrics[10].item(),
+                    "inner_mean_kl": metrics[11].item(),
+                    "confidence_probability_mean": metrics[12].item(),
+                    "confidence_probability_std": torch.sqrt(
+                        torch.clamp(metrics[13] - metrics[12].square(), min=0)
+                    ).item(),
+                    "support_pass_at_group": metrics[14].item(),
+                    "query_pass_at_group": metrics[15].item(),
+                    "confidence_gradient_norm": reduced_gradient_norm.item(),
+                    "confidence_learning_rate": confidence_optimizer.param_groups[0][
+                        "lr"
+                    ],
+                    "support_responses": (
+                        global_problem_batch_size * args.support_group_size
                     ),
-                    flush=True,
-                )
+                    "query_responses": (
+                        global_problem_batch_size * args.query_group_size
+                    ),
+                    "timing_seconds": dict(timings.values),
+                    **component_gradient_norms,
+                }
+                _append_metric(metrics_path, train_record)
+                print(json.dumps(train_record, sort_keys=True), flush=True)
 
         del problems, rollout_microbatches, rollout_totals
 
-        if (step + 1) % args.save_steps == 0:
-            _prepare_for_checkpoint(confidence_optimizer, accelerator)
-            accelerator.save_state(args.output_dir / f"checkpoint-{step + 1}")
-
-        if args.eval_steps > 0 and (step + 1) % args.eval_steps == 0:
+        should_evaluate = (
+            args.eval_steps > 0 and (step + 1) % args.eval_steps == 0
+        ) or step + 1 == args.max_steps
+        if should_evaluate:
             _evaluate(
                 step=step + 1,
                 problems=validation_problems,
@@ -1680,24 +1999,31 @@ def main() -> None:
                 confidence_model=confidence_model,
                 accelerator=accelerator,
                 rollout_log_path=rollout_log_path,
+                metrics_path=metrics_path,
+                base_seed=args.seed,
             )
 
-    if args.eval_steps == 0 or args.max_steps % args.eval_steps != 0:
-        _evaluate(
-            step=args.max_steps,
-            problems=validation_problems,
-            algorithm=algorithm,
-            support_rollouts=support_rollouts,
-            query_rollouts=query_rollouts,
-            verifier=verifier,
-            initial_fast=initial_fast,
-            confidence_model=confidence_model,
-            accelerator=accelerator,
-            rollout_log_path=rollout_log_path,
-        )
+        should_save = (step + 1) % args.save_steps == 0 or step + 1 == args.max_steps
+        if should_save:
+            _save_committed_checkpoint(
+                checkpoint=args.output_dir / f"checkpoint-{step + 1}",
+                completed_steps=step + 1,
+                expected_optimizer_steps=(step + 1) * args.outer_iterations,
+                confidence_optimizer=confidence_optimizer,
+                accelerator=accelerator,
+                metrics_path=metrics_path,
+                rollout_log_path=rollout_log_path,
+            )
 
-    _prepare_for_checkpoint(confidence_optimizer, accelerator)
-    accelerator.save_state(args.output_dir / "final")
+    if accelerator.is_main_process:
+        _atomic_write_json(
+            args.output_dir / "final_checkpoint.json",
+            {
+                "completed_steps": args.max_steps,
+                "checkpoint": str(args.output_dir / f"checkpoint-{args.max_steps}"),
+            },
+        )
+    accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":

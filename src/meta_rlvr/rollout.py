@@ -79,9 +79,7 @@ class TransformersRolloutEngine:
             logprob_max_tokens_per_micro_batch is not None
             and logprob_max_tokens_per_micro_batch <= 0
         ):
-            raise ValueError(
-                "logprob_max_tokens_per_micro_batch must be positive."
-            )
+            raise ValueError("logprob_max_tokens_per_micro_batch must be positive.")
         if tokenizer.pad_token_id is None or tokenizer.eos_token_id is None:
             raise ValueError("Tokenizer must define pad_token_id and eos_token_id.")
         if not hasattr(tokenizer, "apply_chat_template"):
@@ -96,9 +94,7 @@ class TransformersRolloutEngine:
         self.top_k = top_k
         self.generation_micro_batch_size = generation_micro_batch_size
         self.logprob_micro_batch_size = logprob_micro_batch_size
-        self.logprob_max_tokens_per_micro_batch = (
-            logprob_max_tokens_per_micro_batch
-        )
+        self.logprob_max_tokens_per_micro_batch = logprob_max_tokens_per_micro_batch
         self.generation_kwargs = dict(generation_kwargs or {})
         overlap = self._RESERVED_GENERATION_KEYS.intersection(self.generation_kwargs)
         if overlap:
@@ -120,6 +116,7 @@ class TransformersRolloutEngine:
         *,
         show_progress: bool = False,
         progress_description: str = "rollout",
+        seed: int | None = None,
     ) -> RolloutGroup:
         prompt = self.tokenizer.apply_chat_template(
             problem.conversation,
@@ -165,6 +162,8 @@ class TransformersRolloutEngine:
         generated_batches: list[Tensor] = []
         was_training = self.model.training
         self.model.eval()
+        if seed is not None:
+            torch.manual_seed(seed)
         try:
             with materialized_fast_parameters(self.model, fast_parameters):
                 with torch.no_grad():
@@ -203,8 +202,8 @@ class TransformersRolloutEngine:
                             eos_token_id=self.tokenizer.eos_token_id,
                             use_cache=True,
                             # The frozen policy is replicated, not FSDP-sharded;
-                            # ranks therefore decode independently without waiting
-                            # for the longest completion on another rank.
+                            # ranks decode independently without waiting for
+                            # the longest completion on another rank.
                             synced_gpus=False,
                             return_dict_in_generate=False,
                             **self.generation_kwargs,
@@ -245,6 +244,7 @@ class TransformersRolloutEngine:
         *,
         show_progress: bool = False,
         progress_description: str = "rollout batch",
+        seeds: list[int] | None = None,
     ) -> tuple[RolloutGroup, ...]:
         if not problems:
             raise ValueError("Rollout problem batch cannot be empty.")
@@ -252,6 +252,8 @@ class TransformersRolloutEngine:
             raise ValueError(
                 "Each rollout problem must have one fast-parameter mapping."
             )
+        if seeds is not None and len(seeds) != len(problems):
+            raise ValueError("Each rollout problem must have one generation seed.")
         indices = range(len(problems))
         if show_progress:
             from tqdm.auto import tqdm
@@ -273,6 +275,7 @@ class TransformersRolloutEngine:
                     progress_description=(
                         f"{progress_description} problem {index + 1}"
                     ),
+                    seed=None if seeds is None else seeds[index],
                 )
             )
         return tuple(groups)
@@ -284,6 +287,7 @@ class TransformersRolloutEngine:
         *,
         show_progress: bool = False,
         progress_description: str = "rollout phase",
+        seed_batches: list[list[int]] | None = None,
     ) -> tuple[tuple[RolloutGroup, ...], ...]:
         if not problem_batches:
             raise ValueError("Rollout phase must contain at least one batch.")
@@ -291,6 +295,8 @@ class TransformersRolloutEngine:
             raise ValueError(
                 "Every rollout problem batch must have one fast-parameter batch."
             )
+        if seed_batches is not None and len(seed_batches) != len(problem_batches):
+            raise ValueError("Every rollout problem batch must have one seed batch.")
         return tuple(
             tuple(
                 group.to("cpu")
@@ -302,6 +308,7 @@ class TransformersRolloutEngine:
                         f"{progress_description} batch {batch_index + 1}/"
                         f"{len(problem_batches)}"
                     ),
+                    seeds=(None if seed_batches is None else seed_batches[batch_index]),
                 )
             )
             for batch_index, (problems, fast_parameters) in enumerate(
@@ -500,12 +507,14 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         *,
         show_progress: bool = False,
         progress_description: str = "rollout",
+        seed: int | None = None,
     ) -> RolloutGroup:
         return self.generate_batch(
             [problem],
             [fast_parameters],
             show_progress=show_progress,
             progress_description=progress_description,
+            seeds=None if seed is None else [seed],
         )[0]
 
     def _generate_batch_transaction(
@@ -515,6 +524,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         *,
         show_progress: bool = False,
         progress_description: str = "rollout batch",
+        seeds: list[int] | None = None,
     ) -> tuple[RolloutGroup, ...]:
         if not problems:
             raise ValueError("Rollout problem batch cannot be empty.")
@@ -522,6 +532,8 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             raise ValueError(
                 "Each rollout problem must have one fast-parameter mapping."
             )
+        if seeds is not None and len(seeds) != len(problems):
+            raise ValueError("Each rollout problem must have one generation seed.")
         max_positions = getattr(self.model.config, "max_position_embeddings", None)
         if not isinstance(max_positions, int):
             raise ValueError(
@@ -550,9 +562,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                 )
             prompt_ids_batch.append(prompt_ids)
 
-        unique_adapters: list[
-            tuple[str, Path, Mapping[str, Tensor]]
-        ] = []
+        unique_adapters: list[tuple[str, Path, Mapping[str, Tensor]]] = []
         adapter_name_by_parameter_identity: dict[int, str] = {}
         problem_adapter_names: list[str] = []
         for fast_parameters in fast_parameter_groups:
@@ -575,9 +585,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                         dir=self.adapter_root,
                     )
                 )
-                unique_adapters.append(
-                    (adapter_name, adapter_dir, fast_parameters)
-                )
+                unique_adapters.append((adapter_name, adapter_dir, fast_parameters))
                 adapter_name_by_parameter_identity[identity] = adapter_name
                 if getattr(self, "_phase_active", False):
                     self._phase_adapter_by_parameter_identity[identity] = (
@@ -612,9 +620,9 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                 unit="response",
                 leave=True,
             )
-        completion_results: list[
-            tuple[list[list[int]], list[list[float]]] | None
-        ] = [None] * len(problems)
+        completion_results: list[tuple[list[list[int]], list[list[float]]] | None] = [
+            None
+        ] * len(problems)
         try:
             for adapter_name, adapter_dir, fast_parameters in unique_adapters:
                 if (
@@ -680,17 +688,13 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                     self._phase_loaded_adapter_names.append(adapter_name)
             models = self._request_json("GET", "/v1/models")
             for adapter_name in set(problem_adapter_names):
-                self._require_model_registration(
-                    models, adapter_name, present=True
-                )
+                self._require_model_registration(models, adapter_name, present=True)
             if getattr(self, "_phase_active", False):
                 if not self._phase_kv_awake:
                     self._request_json("POST", "/wake_up?tags=kv_cache")
                     status = self._request_json("GET", "/is_sleeping")
                     if status != {"is_sleeping": False}:
-                        raise RuntimeError(
-                            f"vLLM failed to wake up fully: {status!r}."
-                        )
+                        raise RuntimeError(f"vLLM failed to wake up fully: {status!r}.")
                     self._phase_kv_awake = True
             else:
                 self._request_json("POST", "/wake_up?tags=kv_cache")
@@ -715,6 +719,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                             "add_special_tokens": False,
                             "logprobs": 0,
                             "return_token_ids": True,
+                            **({} if seeds is None else {"seed": seeds[index]}),
                         },
                         timeout=self.request_timeout,
                     ): index
@@ -722,9 +727,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                 }
                 for future in as_completed(futures):
                     index = futures[future]
-                    completion_results[index] = self._completion_data(
-                        future.result()
-                    )
+                    completion_results[index] = self._completion_data(future.result())
                     if progress_bar is not None:
                         progress_bar.update(self.group_size)
                         progress_bar.set_postfix_str(
@@ -773,9 +776,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                 )
             completion_ids, completion_logprobs = result
             prompt_ids = prompt_ids_batch[index]
-            sequences = self._sequences_from_completion_ids(
-                prompt_ids, completion_ids
-            )
+            sequences = self._sequences_from_completion_ids(prompt_ids, completion_ids)
             group = self._build_group(sequences, len(prompt_ids))
             groups.append(
                 replace(
@@ -830,24 +831,17 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             token_count = 0
             for group in groups:
                 selected = group.completion_mask
-                delta = (
-                    group.rollout_logprobs[selected]
-                    - group.old_logprobs[selected]
-                )
+                delta = group.rollout_logprobs[selected] - group.old_logprobs[selected]
                 delta_sum += delta.sum().item()
                 absolute_delta_sum += delta.abs().sum().item()
-                max_absolute_delta = max(
-                    max_absolute_delta, delta.abs().max().item()
-                )
+                max_absolute_delta = max(max_absolute_delta, delta.abs().max().item())
                 token_count += delta.numel()
             print(
                 json.dumps(
                     {
                         "stage": progress_description,
                         "problem_count": len(problems),
-                        "vllm_raw_vs_pytorch_raw/mean_delta": (
-                            delta_sum / token_count
-                        ),
+                        "vllm_raw_vs_pytorch_raw/mean_delta": (delta_sum / token_count),
                         "vllm_raw_vs_pytorch_raw/mean_absolute_delta": (
                             absolute_delta_sum / token_count
                         ),
@@ -869,12 +863,14 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         *,
         show_progress: bool = False,
         progress_description: str = "rollout batch",
+        seeds: list[int] | None = None,
     ) -> tuple[RolloutGroup, ...]:
         batches = self.generate_batches(
             [problems],
             [fast_parameter_groups],
             show_progress=show_progress,
             progress_description=progress_description,
+            seed_batches=None if seeds is None else [seeds],
         )
         return tuple(group.to(self.device) for group in batches[0])
 
@@ -885,6 +881,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         *,
         show_progress: bool = False,
         progress_description: str = "rollout phase",
+        seed_batches: list[list[int]] | None = None,
     ) -> tuple[tuple[RolloutGroup, ...], ...]:
         if not problem_batches or any(not batch for batch in problem_batches):
             raise ValueError("Rollout phase batches must be non-empty.")
@@ -892,6 +889,8 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
             raise ValueError(
                 "Every rollout problem batch must have one fast-parameter batch."
             )
+        if seed_batches is not None and len(seed_batches) != len(problem_batches):
+            raise ValueError("Every rollout problem batch must have one seed batch.")
         for problems, fast_parameters in zip(
             problem_batches, fast_parameter_batches, strict=True
         ):
@@ -899,6 +898,12 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                 raise ValueError(
                     "Each rollout problem must have one fast-parameter mapping."
                 )
+        if seed_batches is not None:
+            for problems, seeds in zip(problem_batches, seed_batches, strict=True):
+                if len(problems) != len(seeds):
+                    raise ValueError(
+                        "Each rollout problem must have one generation seed."
+                    )
         if getattr(self, "_phase_active", False):
             raise RuntimeError("Nested vLLM rollout phases are not supported.")
 
@@ -910,9 +915,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         self._phase_loaded_adapter_names: list[str] = []
         try:
             for fast_parameters in (
-                fast
-                for batch in fast_parameter_batches
-                for fast in batch
+                fast for batch in fast_parameter_batches for fast in batch
             ):
                 identity = id(fast_parameters)
                 if identity in self._phase_adapter_by_parameter_identity:
@@ -963,6 +966,9 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                         progress_description=(
                             f"{progress_description} batch {batch_index + 1}/"
                             f"{len(problem_batches)}"
+                        ),
+                        seeds=(
+                            None if seed_batches is None else seed_batches[batch_index]
                         ),
                     )
                 )
@@ -1078,9 +1084,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
                     "vllm_raw_vs_pytorch_raw/mean_absolute_delta": (
                         absolute_delta_sum / token_count
                     ),
-                    "vllm_raw_vs_pytorch_raw/max_absolute_delta": (
-                        max_absolute_delta
-                    ),
+                    "vllm_raw_vs_pytorch_raw/max_absolute_delta": (max_absolute_delta),
                     "vllm_raw_vs_pytorch_raw/token_count": token_count,
                 },
                 sort_keys=True,

@@ -147,7 +147,7 @@ def test_transformers_rollout_builds_aligned_masks_and_old_logprobs() -> None:
         ground_truth="42",
         data_source="unit_test",
     )
-    group = engine.generate(problem, fast)
+    group = engine.generate(problem, fast, seed=12345)
 
     assert group.input_ids.shape == (3, 4)
     assert group.completion_mask.shape == (3, 3)
@@ -337,9 +337,13 @@ def test_vllm_rollout_uses_staged_hybrid_lifecycle(tmp_path) -> None:
         ground_truth="42",
         data_source="unit_test",
     )
-    group = engine.generate(problem, fast)
+    group = engine.generate(problem, fast, seed=12345)
 
     paths = [path for _, path, _, _ in calls]
+    completion_payload = next(
+        payload for _, path, payload, _ in calls if path == "/v1/completions"
+    )
+    assert completion_payload["seed"] == 12345
     assert paths[:6] == [
         "/wake_up?tags=weights",
         "/v1/load_lora_adapter",
