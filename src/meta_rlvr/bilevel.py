@@ -414,37 +414,35 @@ class BilevelGRPO:
                     ).loss
                     kl_losses.append(kl_loss * normalization_weight)
 
-            unit_loss_vector = torch.stack(unit_losses)
-            identity = torch.eye(
-                len(row_indices),
-                dtype=unit_loss_vector.dtype,
-                device=unit_loss_vector.device,
-            )
-            unit_gradient_values = torch.autograd.grad(
-                unit_loss_vector,
-                parameter_values,
-                grad_outputs=identity,
-                create_graph=False,
-                retain_graph=self.inner_config.grpo.kl_coefficient > 0,
-                allow_unused=False,
-                is_grads_batched=True,
-            )
-            batch_indices = torch.tensor(
-                row_indices,
-                dtype=torch.long,
-                device=advantages.device,
-            )
-            magnitudes = advantages.abs().index_select(0, batch_indices)
-            for name, unit_gradient in zip(
-                names, unit_gradient_values, strict=True
+            # A batched VJP materializes a leading response dimension through
+            # the complete Qwen backward graph. On a 7B policy this can require
+            # tens of GiB even when the corresponding batched forward is small.
+            # Reuse that forward graph but consume one unit-advantage VJP at a
+            # time. The detached VJP and differentiable advantage preserve the
+            # same first-order meta-gradient without materializing a batched
+            # policy-gradient Jacobian.
+            for unit_index, (response_index, unit_loss) in enumerate(
+                zip(row_indices, unit_losses, strict=True)
             ):
-                view_shape = (len(row_indices),) + (1,) * (
-                    unit_gradient.ndim - 1
+                retain_graph = (
+                    unit_index + 1 < len(unit_losses)
+                    or self.inner_config.grpo.kl_coefficient > 0
                 )
-                accumulated[name] = (
-                    accumulated[name]
-                    + (magnitudes.view(view_shape) * unit_gradient.detach()).sum(dim=0)
+                unit_gradient_values = torch.autograd.grad(
+                    unit_loss,
+                    parameter_values,
+                    create_graph=False,
+                    retain_graph=retain_graph,
+                    allow_unused=False,
                 )
+                magnitude = advantages[response_index].abs()
+                for name, unit_gradient in zip(
+                    names, unit_gradient_values, strict=True
+                ):
+                    accumulated[name] = (
+                        accumulated[name]
+                        + magnitude * unit_gradient.detach()
+                    )
 
             if self.inner_config.grpo.kl_coefficient > 0:
                 kl_gradient_values = torch.autograd.grad(
