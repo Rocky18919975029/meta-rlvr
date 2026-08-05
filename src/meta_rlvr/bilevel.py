@@ -60,12 +60,18 @@ class BilevelGRPO:
         query_grpo_config: GRPOLossConfig,
         *,
         policy_micro_batch_size: int = 4,
+        first_order_vjp_forward_batch_size: int | None = None,
         confidence_micro_batch_size: int = 4,
         policy_max_tokens_per_micro_batch: int | None = None,
         confidence_max_tokens_per_micro_batch: int | None = None,
     ) -> None:
         if policy_micro_batch_size <= 0 or confidence_micro_batch_size <= 0:
             raise ValueError("Micro-batch sizes must be positive.")
+        if (
+            first_order_vjp_forward_batch_size is not None
+            and first_order_vjp_forward_batch_size <= 0
+        ):
+            raise ValueError("First-order VJP forward batch size must be positive.")
         self.policy = policy
         self.confidence_model = confidence_model
         self.inner_config = inner_config
@@ -73,6 +79,11 @@ class BilevelGRPO:
         self.query_advantage_config = query_advantage_config
         self.query_grpo_config = query_grpo_config
         self.policy_micro_batch_size = policy_micro_batch_size
+        self.first_order_vjp_forward_batch_size = (
+            policy_micro_batch_size
+            if first_order_vjp_forward_batch_size is None
+            else first_order_vjp_forward_batch_size
+        )
         self.confidence_micro_batch_size = confidence_micro_batch_size
         self.policy_max_tokens_per_micro_batch = policy_max_tokens_per_micro_batch
         self.confidence_max_tokens_per_micro_batch = (
@@ -333,7 +344,7 @@ class BilevelGRPO:
         response_outputs: list[GRPOLossOutput | None] = [None] * support.group_size
         row_batches = sequence_microbatches(
             support,
-            max_sequences=self.policy_micro_batch_size,
+            max_sequences=self.first_order_vjp_forward_batch_size,
             max_tokens=self.policy_max_tokens_per_micro_batch,
         )
         response_batches = range(len(row_batches))

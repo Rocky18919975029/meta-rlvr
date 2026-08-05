@@ -124,7 +124,7 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}} rollout_problem_batch=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE} gradient_problem_microbatch=${SMOKE_PROBLEM_MICRO_BATCH_SIZE} K=${SMOKE_SUPPORT_GROUP_SIZE:-2}/${SMOKE_QUERY_GROUP_SIZE:-2} inner=${SMOKE_INNER_ITERATIONS:-1} outer=${SMOKE_OUTER_ITERATIONS:-1} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0} component_gradient_norms=${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}"
+echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}} rollout_problem_batch=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE} gradient_problem_microbatch=${SMOKE_PROBLEM_MICRO_BATCH_SIZE} vjp_forward_batch=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE:-policy} K=${SMOKE_SUPPORT_GROUP_SIZE:-2}/${SMOKE_QUERY_GROUP_SIZE:-2} inner=${SMOKE_INNER_ITERATIONS:-1} outer=${SMOKE_OUTER_ITERATIONS:-1} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0} component_gradient_norms=${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}"
 echo "stdout: ${LOG_DIR}/${RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${RUN_LABEL}-${job_id}.err"
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then

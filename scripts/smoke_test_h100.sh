@@ -144,6 +144,7 @@ echo "local_problem_micro_batch_size=${LOCAL_PROBLEM_MICRO_BATCH_SIZE}"
 echo "rollout_problem_batch_size=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "local_rollout_problem_batch_size=${LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "policy_micro_batch_size=${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}"
+echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE:-policy_micro_batch_size}"
 echo "confidence_micro_batch_size=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}"
 echo "policy_max_tokens_per_micro_batch=${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH:-unset}"
 echo "confidence_max_tokens_per_micro_batch=${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH:-unset}"
@@ -313,6 +314,16 @@ for token_budget_name in \
     exit 2
   fi
 done
+if [[ -n "${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE:-}" ]]; then
+  if [[ ! "${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE must be a positive integer when set." >&2
+    exit 2
+  fi
+  EXTRA_TRAIN_ARGS+=(
+    --first-order-vjp-forward-batch-size
+    "${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE}"
+  )
+fi
 if [[ -n "${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH:-}" ]]; then
   EXTRA_TRAIN_ARGS+=(
     --policy-max-tokens-per-micro-batch

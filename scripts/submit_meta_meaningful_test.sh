@@ -131,7 +131,7 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE} rollout_problem_batch=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE} gradient_problem_microbatch=${SMOKE_PROBLEM_MICRO_BATCH_SIZE} max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS} policy_batch=${SMOKE_POLICY_MICRO_BATCH_SIZE}/${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH}tokens confidence_batch=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE}/${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH}tokens deferred_sync=${SMOKE_DEFER_CONFIDENCE_GRADIENT_SYNC:-0} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0} component_gradient_norms=${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}"
+echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE} rollout_problem_batch=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE} gradient_problem_microbatch=${SMOKE_PROBLEM_MICRO_BATCH_SIZE} vjp_forward_batch=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE:-policy} max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS} policy_batch=${SMOKE_POLICY_MICRO_BATCH_SIZE}/${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH}tokens confidence_batch=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE}/${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH}tokens deferred_sync=${SMOKE_DEFER_CONFIDENCE_GRADIENT_SYNC:-0} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0} component_gradient_norms=${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}"
 echo "stdout: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
 echo "vLLM throughput: ${LOG_DIR}/vllm-${job_id}/gpu-*.log"

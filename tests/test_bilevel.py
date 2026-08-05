@@ -215,6 +215,60 @@ def test_first_order_inner_update_has_same_value_as_direct_policy_gradient() -> 
             )
 
 
+def test_first_order_vjp_forward_batch_preserves_update_and_meta_gradient() -> None:
+    torch.manual_seed(13)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(), hidden_size=5
+    )
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    query = make_group(policy, torch.tensor([0.0, 1.0, 1.0]))
+
+    def build_algorithm(vjp_forward_batch_size: int) -> BilevelGRPO:
+        return BilevelGRPO(
+            policy=policy,
+            confidence_model=confidence,
+            inner_config=InnerLoopConfig(
+                num_iterations=2,
+                meta_gradient_mode="first_order",
+                optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+                grpo=GRPOLossConfig(kl_coefficient=0.03),
+            ),
+            meta_config=MetaLossConfig(),
+            query_advantage_config=AdvantageConfig(),
+            query_grpo_config=GRPOLossConfig(),
+            policy_micro_batch_size=3,
+            first_order_vjp_forward_batch_size=vjp_forward_batch_size,
+        )
+
+    serial_output = build_algorithm(1).outer_loss(
+        support, query, initial_fast
+    )
+    serial_gradients = torch.autograd.grad(
+        serial_output.loss,
+        tuple(confidence.parameters()),
+    )
+    packed_output = build_algorithm(3).outer_loss(
+        support, query, initial_fast
+    )
+    packed_gradients = torch.autograd.grad(
+        packed_output.loss,
+        tuple(confidence.parameters()),
+    )
+
+    torch.testing.assert_close(serial_output.loss, packed_output.loss)
+    for name in serial_output.adaptation.fast_parameters:
+        torch.testing.assert_close(
+            serial_output.adaptation.fast_parameters[name],
+            packed_output.adaptation.fast_parameters[name],
+        )
+    for serial_gradient, packed_gradient in zip(
+        serial_gradients, packed_gradients, strict=True
+    ):
+        torch.testing.assert_close(serial_gradient, packed_gradient)
+
+
 def test_task_adapters_start_from_independent_fast_parameter_copies() -> None:
     policy = ToyPolicy()
     state = trainable_parameter_state(policy)

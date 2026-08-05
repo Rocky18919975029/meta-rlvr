@@ -142,6 +142,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--generation-micro-batch-size", type=int, default=4)
     parser.add_argument("--policy-micro-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--first-order-vjp-forward-batch-size",
+        type=int,
+        help=(
+            "Maximum responses sharing one policy forward before sequential "
+            "first-order VJPs. Defaults to policy_micro_batch_size."
+        ),
+    )
     parser.add_argument("--confidence-micro-batch-size", type=int, default=2)
     parser.add_argument("--policy-max-tokens-per-micro-batch", type=int)
     parser.add_argument("--confidence-max-tokens-per-micro-batch", type=int)
@@ -307,6 +315,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         and args.rollout_problem_batch_size <= 0
     ):
         raise ValueError("rollout_problem_batch_size must be positive.")
+    if (
+        args.first_order_vjp_forward_batch_size is not None
+        and args.first_order_vjp_forward_batch_size <= 0
+    ):
+        raise ValueError("first_order_vjp_forward_batch_size must be positive.")
     if (
         args.policy_max_tokens_per_micro_batch is not None
         and args.policy_max_tokens_per_micro_batch <= 0
@@ -1042,6 +1055,8 @@ def main() -> None:
     args.problem_batch_size = global_problem_batch_size
     args.problem_micro_batch_size = global_problem_micro_batch_size
     args.rollout_problem_batch_size = global_rollout_problem_batch_size
+    if args.first_order_vjp_forward_batch_size is None:
+        args.first_order_vjp_forward_batch_size = args.policy_micro_batch_size
     set_seed(args.seed, device_specific=True)
     _write_run_config(args, args.output_dir, accelerator)
     accelerator.wait_for_everyone()
@@ -1114,6 +1129,9 @@ def main() -> None:
         query_advantage_config=query_advantage_config,
         query_grpo_config=query_grpo_config,
         policy_micro_batch_size=args.policy_micro_batch_size,
+        first_order_vjp_forward_batch_size=(
+            args.first_order_vjp_forward_batch_size
+        ),
         confidence_micro_batch_size=args.confidence_micro_batch_size,
         policy_max_tokens_per_micro_batch=(
             args.policy_max_tokens_per_micro_batch
@@ -1192,7 +1210,8 @@ def main() -> None:
         f"{num_rollout_problem_batches} rollout batches); global gradient problem "
         f"microbatch is {global_problem_micro_batch_size} "
         f"({local_problem_micro_batch_size} per rank, "
-        f"{num_problem_micro_batches} accumulation microbatches)."
+        f"{num_problem_micro_batches} accumulation microbatches); first-order "
+        f"VJP forward batch is {args.first_order_vjp_forward_batch_size}."
     )
 
     initial_fast = {

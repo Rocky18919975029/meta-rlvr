@@ -586,6 +586,15 @@ right padding is trimmed. Qwen receives `logits_to_keep`, so policy forwards
 project only completion positions to the vocabulary. Token log-probabilities
 are still reduced in float32 even when model weights are bfloat16.
 
+`--first-order-vjp-forward-batch-size` independently limits how many support
+responses share one policy forward before the trainer computes their
+sequential first-order VJPs. It defaults to `--policy-micro-batch-size` for
+backward compatibility. Setting it to 1 avoids repeatedly traversing unrelated
+batch rows during per-response VJPs without changing rollout old-logprob,
+non-differentiable generation adaptation, or query GRPO batching. The HPC
+launcher exposes the same control as
+`SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE`.
+
 Important configurable ablations include:
 
 ```text
