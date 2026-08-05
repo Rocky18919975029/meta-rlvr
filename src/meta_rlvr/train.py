@@ -822,6 +822,37 @@ def _validate_optimizer_steps(optimizer, *, expected_steps: int) -> None:
         )
 
 
+def _initialize_adamw_state_for_fsdp_load(
+    optimizer,
+    *,
+    moment_device: torch.device,
+) -> None:
+    """Materialize AdamW state so FSDP DCP has tensors to restore into."""
+    raw_optimizer = _adamw_optimizer(optimizer)
+    if raw_optimizer.state:
+        raise RuntimeError("AdamW state must be empty before checkpoint restore.")
+    for group in raw_optimizer.param_groups:
+        for parameter in group["params"]:
+            state = raw_optimizer.state[parameter]
+            state["step"] = torch.zeros((), dtype=torch.float32)
+            state["exp_avg"] = torch.zeros_like(
+                parameter,
+                device=moment_device,
+                memory_format=torch.preserve_format,
+            )
+            state["exp_avg_sq"] = torch.zeros_like(
+                parameter,
+                device=moment_device,
+                memory_format=torch.preserve_format,
+            )
+            if group["amsgrad"]:
+                state["max_exp_avg_sq"] = torch.zeros_like(
+                    parameter,
+                    device=moment_device,
+                    memory_format=torch.preserve_format,
+                )
+
+
 def _save_committed_checkpoint(
     *,
     checkpoint: Path,
@@ -1420,6 +1451,14 @@ def main() -> None:
     confidence_model.train()
     optimizer_moments_offloaded = False
     if resume_checkpoint is not None:
+        _initialize_adamw_state_for_fsdp_load(
+            confidence_optimizer,
+            moment_device=(
+                torch.device("cpu")
+                if args.offload_confidence_optimizer
+                else accelerator.device
+            ),
+        )
         accelerator.load_state(resume_checkpoint)
         expected_optimizer_steps = start_step * args.outer_iterations
         if checkpoint_trainer_state["optimizer_steps"] != expected_optimizer_steps:

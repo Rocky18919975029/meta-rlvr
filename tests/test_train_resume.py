@@ -9,6 +9,7 @@ import torch
 from meta_rlvr.bilevel import BilevelGRPO
 from meta_rlvr.train import (
     _generation_seed,
+    _initialize_adamw_state_for_fsdp_load,
     _initialize_or_validate_run,
     _optimizer_step_values,
     _resolve_resume_checkpoint,
@@ -53,6 +54,21 @@ def test_optimizer_step_validation_detects_missing_or_stale_state() -> None:
     _validate_optimizer_steps(optimizer, expected_steps=2)
     with pytest.raises(RuntimeError, match="not restored exactly"):
         _validate_optimizer_steps(optimizer, expected_steps=1)
+
+
+def test_fsdp_optimizer_restore_materializes_adamw_state_first() -> None:
+    restored = _initialized_optimizer(steps=2).state_dict()
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    optimizer = torch.optim.AdamW([parameter], lr=0.01)
+
+    _initialize_adamw_state_for_fsdp_load(
+        optimizer,
+        moment_device=torch.device("cpu"),
+    )
+    assert _optimizer_step_values(optimizer) == {0}
+
+    optimizer.load_state_dict(restored)
+    _validate_optimizer_steps(optimizer, expected_steps=2)
 
 
 def test_resume_restores_exact_append_only_log_boundaries(tmp_path) -> None:
