@@ -154,6 +154,7 @@ echo "local_rollout_problem_batch_size=${LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "policy_micro_batch_size=${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}"
 echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE:-1}"
 echo "resume_from_checkpoint=${SMOKE_RESUME_FROM_CHECKPOINT:-none}"
+echo "resume_preflight_only=${SMOKE_RESUME_PREFLIGHT_ONLY:-0}"
 echo "confidence_micro_batch_size=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}"
 echo "policy_max_tokens_per_micro_batch=${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH:-unset}"
 echo "confidence_max_tokens_per_micro_batch=${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH:-unset}"
@@ -281,9 +282,26 @@ if [[ -n "${SMOKE_RESUME_FROM_CHECKPOINT:-}" ]]; then
     --resume-from-checkpoint "${SMOKE_RESUME_FROM_CHECKPOINT}"
   )
 fi
+if [[ "${SMOKE_RESUME_PREFLIGHT_ONLY:-0}" == "1" ]]; then
+  if [[ -z "${SMOKE_RESUME_FROM_CHECKPOINT:-}" ]]; then
+    echo "SMOKE_RESUME_PREFLIGHT_ONLY=1 requires SMOKE_RESUME_FROM_CHECKPOINT." >&2
+    exit 2
+  fi
+  EXTRA_TRAIN_ARGS+=(--resume-preflight-only)
+elif [[ "${SMOKE_RESUME_PREFLIGHT_ONLY:-0}" != "0" ]]; then
+  echo "SMOKE_RESUME_PREFLIGHT_ONLY must be 0 or 1." >&2
+  exit 2
+fi
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
-  source scripts/vllm_hybrid_servers.sh
-  start_meta_rlvr_vllm_servers
+  if [[ "${SMOKE_RESUME_PREFLIGHT_ONLY:-0}" == "1" ]]; then
+    META_RLVR_VLLM_BASE_URLS="http://127.0.0.1:1"
+    for ((rank = 1; rank < SMOKE_GPUS; rank++)); do
+      META_RLVR_VLLM_BASE_URLS+=",http://127.0.0.1:1"
+    done
+  else
+    source scripts/vllm_hybrid_servers.sh
+    start_meta_rlvr_vllm_servers
+  fi
   EXTRA_TRAIN_ARGS+=(
     --rollout-backend vllm
     --vllm-base-urls "${META_RLVR_VLLM_BASE_URLS}"

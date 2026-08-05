@@ -277,6 +277,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume-from-checkpoint", type=Path)
     parser.add_argument(
+        "--resume-preflight-only",
+        action="store_true",
+        help="Restore and validate a checkpoint, then exit before policy/vLLM setup.",
+    )
+    parser.add_argument(
         "--eval-steps",
         type=int,
         default=0,
@@ -340,6 +345,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("confidence_max_tokens_per_micro_batch must be positive.")
     if args.rollout_backend == "vllm" and not args.vllm_base_urls:
         raise ValueError("--vllm-base-urls is required for the vLLM backend.")
+    if args.resume_preflight_only and args.resume_from_checkpoint is None:
+        raise ValueError("--resume-preflight-only requires --resume-from-checkpoint.")
     if args.vllm_request_timeout <= 0:
         raise ValueError("--vllm-request-timeout must be positive.")
     if args.vllm_control_timeout <= 0:
@@ -570,6 +577,7 @@ _RESUME_MUTABLE_CONFIG_KEYS = {
     "save_steps",
     "eval_steps",
     "resume_from_checkpoint",
+    "resume_preflight_only",
     "vllm_base_urls",
 }
 
@@ -851,6 +859,54 @@ def _initialize_adamw_state_for_fsdp_load(
                     device=moment_device,
                     memory_format=torch.preserve_format,
                 )
+
+
+def _load_accelerator_state_without_optimizer(
+    accelerator,
+    checkpoint: Path,
+) -> None:
+    registered_optimizers = accelerator._optimizers
+    accelerator._optimizers = []
+    try:
+        accelerator.load_state(checkpoint)
+    finally:
+        accelerator._optimizers = registered_optimizers
+
+
+def _load_fsdp_optimizer_state(
+    *,
+    checkpoint: Path,
+    optimizer,
+    model,
+    accelerator,
+) -> None:
+    import torch.distributed.checkpoint as dist_cp
+    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+    from torch.distributed.fsdp.fully_sharded_data_parallel import (
+        FullyShardedDataParallel as FSDP,
+    )
+
+    fsdp_plugin = accelerator.state.fsdp_plugin
+    with FSDP.state_dict_type(
+        model,
+        fsdp_plugin.state_dict_type,
+        fsdp_plugin.state_dict_config,
+        fsdp_plugin.optim_state_dict_config,
+    ):
+        optimizer_state = FSDP.optim_state_dict(model, optimizer)
+        checkpoint_state = {"optimizer": optimizer_state}
+        dist_cp.load(
+            state_dict=checkpoint_state,
+            storage_reader=dist_cp.FileSystemReader(checkpoint / "optimizer_0"),
+            planner=DefaultLoadPlanner(allow_partial_load=True),
+        )
+        local_optimizer_state = FSDP.optim_state_dict_to_load(
+            model=model,
+            optim=optimizer,
+            optim_state_dict=checkpoint_state["optimizer"],
+        )
+        optimizer.load_state_dict(local_optimizer_state)
+    accelerator.wait_for_everyone()
 
 
 def _save_committed_checkpoint(
@@ -1423,16 +1479,6 @@ def main() -> None:
     target_modules = tuple(
         module.strip() for module in args.lora_target_modules.split(",")
     )
-    policy_bundle = load_policy_with_lora(
-        args.policy_model,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        target_modules=target_modules,
-        dtype=args.dtype,
-        trust_remote_code=args.trust_remote_code,
-        model_kwargs=model_kwargs,
-    )
-    policy = policy_bundle.model.to(accelerator.device)
     confidence_model = load_confidence_model(
         args.confidence_model,
         dtype=args.dtype,
@@ -1459,7 +1505,13 @@ def main() -> None:
                 else accelerator.device
             ),
         )
-        accelerator.load_state(resume_checkpoint)
+        _load_accelerator_state_without_optimizer(accelerator, resume_checkpoint)
+        _load_fsdp_optimizer_state(
+            checkpoint=resume_checkpoint,
+            optimizer=confidence_optimizer,
+            model=confidence_model,
+            accelerator=accelerator,
+        )
         expected_optimizer_steps = start_step * args.outer_iterations
         if checkpoint_trainer_state["optimizer_steps"] != expected_optimizer_steps:
             raise ValueError("Checkpoint optimizer-step metadata is inconsistent.")
@@ -1486,6 +1538,32 @@ def main() -> None:
             }
             _append_metric(metrics_path, resume_record)
             print(json.dumps(resume_record, sort_keys=True), flush=True)
+        if args.resume_preflight_only:
+            if accelerator.is_main_process:
+                print(
+                    json.dumps(
+                        {
+                            "event": "resume_preflight_passed",
+                            "completed_steps": start_step,
+                            "optimizer_steps": expected_optimizer_steps,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            accelerator.wait_for_everyone()
+            return
+
+    policy_bundle = load_policy_with_lora(
+        args.policy_model,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=target_modules,
+        dtype=args.dtype,
+        trust_remote_code=args.trust_remote_code,
+        model_kwargs=model_kwargs,
+    )
+    policy = policy_bundle.model.to(accelerator.device)
 
     algorithm = BilevelGRPO(
         policy=policy,

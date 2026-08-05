@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dist_cp
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 
 from meta_rlvr.bilevel import BilevelGRPO
 from meta_rlvr.train import (
@@ -69,6 +71,32 @@ def test_fsdp_optimizer_restore_materializes_adamw_state_first() -> None:
 
     optimizer.load_state_dict(restored)
     _validate_optimizer_steps(optimizer, expected_steps=2)
+
+
+def test_partial_dcp_load_restores_state_and_preserves_param_groups(tmp_path) -> None:
+    checkpoint = tmp_path / "optimizer_0"
+    saved = {
+        "optimizer": {
+            "state": {"weight": {"step": torch.tensor(1.0)}},
+            "param_groups": [{"lr": 0.01, "params": ["weight"]}],
+        }
+    }
+    dist_cp.save(saved, checkpoint_id=checkpoint)
+    current = {
+        "optimizer": {
+            "state": {"weight": {"step": torch.tensor(0.0)}},
+            "param_groups": b"current optimizer groups",
+        }
+    }
+
+    dist_cp.load(
+        current,
+        checkpoint_id=checkpoint,
+        planner=DefaultLoadPlanner(allow_partial_load=True),
+    )
+
+    assert current["optimizer"]["state"]["weight"]["step"].item() == 1
+    assert current["optimizer"]["param_groups"] == b"current optimizer groups"
 
 
 def test_resume_restores_exact_append_only_log_boundaries(tmp_path) -> None:
