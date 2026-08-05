@@ -117,6 +117,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--support-group-size", type=int, default=32)
     parser.add_argument("--query-group-size", type=int, default=32)
     parser.add_argument(
+        "--validation-support-group-size",
+        type=int,
+        help="Validation support responses per problem; defaults to support-group-size.",
+    )
+    parser.add_argument(
+        "--validation-query-group-size",
+        type=int,
+        help="Validation adapted responses per problem; defaults to query-group-size.",
+    )
+    parser.add_argument(
         "--problem-batch-size",
         type=int,
         help=(
@@ -313,6 +323,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("eval_steps must be non-negative.")
     if args.validation_max_problems is not None and args.validation_max_problems <= 0:
         raise ValueError("validation_max_problems must be positive.")
+    if args.support_group_size <= 0 or args.query_group_size <= 0:
+        raise ValueError("Training group sizes must be positive.")
+    if (
+        args.validation_support_group_size is not None
+        and args.validation_support_group_size <= 0
+    ):
+        raise ValueError("validation_support_group_size must be positive.")
+    if (
+        args.validation_query_group_size is not None
+        and args.validation_query_group_size <= 0
+    ):
+        raise ValueError("validation_query_group_size must be positive.")
     if args.max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive.")
     if args.confidence_learning_rate <= 0:
@@ -1101,10 +1123,15 @@ def _measure_component_gradient_norms(
         "bce": algorithm.meta_config.confidence.bce_coefficient,
         "ranking": algorithm.meta_config.confidence.ranking_coefficient,
     }
+    enabled_coefficients = {
+        name: coefficient
+        for name, coefficient in coefficients.items()
+        if coefficient > 0
+    }
     norms: dict[str, float] = {}
     measurement_start = time.perf_counter()
     components = tqdm(
-        tuple(coefficients),
+        tuple(enabled_coefficients),
         desc=f"{progress_prefix}: component gradient norms",
         unit="component",
         leave=True,
@@ -1159,7 +1186,7 @@ def _measure_component_gradient_norms(
         raw_value = raw_norm.item()
         norms[f"gradient_norm/{component}_raw"] = raw_value
         norms[f"gradient_norm/{component}_weighted"] = (
-            coefficients[component] * raw_value
+            enabled_coefficients[component] * raw_value
         )
         confidence_optimizer.zero_grad(set_to_none=True)
         del raw_norm
@@ -1239,12 +1266,18 @@ def _accumulate_outer_batch(
             )
             accelerator.backward(accumulated_loss)
         for support, query, output in zip(supports, queries, outputs, strict=True):
+            confidence_loss = output.adaptation.confidence_loss
+            zero = output.loss.new_zeros(())
             local_metric_sums += torch.stack(
                 (
                     output.loss.detach(),
                     output.meta_grpo.loss.detach(),
-                    output.adaptation.confidence_loss.bce.detach(),
-                    output.adaptation.confidence_loss.ranking.detach(),
+                    zero if confidence_loss is None else confidence_loss.bce.detach(),
+                    (
+                        zero
+                        if confidence_loss is None
+                        else confidence_loss.ranking.detach()
+                    ),
                     output.meta_grpo.clip_fraction.detach(),
                     output.adaptation.inner_losses[-1].clip_fraction.detach(),
                     support.verifier_rewards.mean(),
@@ -1399,6 +1432,10 @@ def _evaluate(
             "validation/base_pass_at_group": (totals[4] / len(problems)).item(),
             "validation/adapted_pass_at_group": (totals[5] / len(problems)).item(),
             "validation/num_unique_problems": len(problems),
+            "validation/support_group_size": support_rollouts.group_size,
+            "validation/query_group_size": query_rollouts.group_size,
+            "validation/support_responses": int(totals[1].item()),
+            "validation/query_responses": int(totals[3].item()),
             "validation/seconds": time.perf_counter() - evaluation_started,
         }
         _append_metric(metrics_path, record)
@@ -1409,6 +1446,10 @@ def _evaluate(
 def main() -> None:
     args = parse_args()
     _validate_args(args)
+    if args.validation_support_group_size is None:
+        args.validation_support_group_size = args.support_group_size
+    if args.validation_query_group_size is None:
+        args.validation_query_group_size = args.query_group_size
     inner_config, meta_config, query_advantage_config, query_grpo_config = _configs(
         args
     )
@@ -1619,6 +1660,10 @@ def main() -> None:
 
     support_rollouts = build_rollout_engine(args.support_group_size)
     query_rollouts = build_rollout_engine(args.query_group_size)
+    validation_support_rollouts = build_rollout_engine(
+        args.validation_support_group_size
+    )
+    validation_query_rollouts = build_rollout_engine(args.validation_query_group_size)
     verifier = DAPOMathVerifier(strict_box_verify=args.verifier_mode == "strict_box")
 
     all_problems = load_unique_dapo_problems(args.train_parquet)
@@ -2110,8 +2155,8 @@ def main() -> None:
                 step=step + 1,
                 problems=validation_problems,
                 algorithm=algorithm,
-                support_rollouts=support_rollouts,
-                query_rollouts=query_rollouts,
+                support_rollouts=validation_support_rollouts,
+                query_rollouts=validation_query_rollouts,
                 verifier=verifier,
                 initial_fast=initial_fast,
                 confidence_model=confidence_model,

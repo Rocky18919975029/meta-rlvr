@@ -46,25 +46,37 @@ def confidence_losses(
     _validate_vector("labels", labels)
     if logits.shape != labels.shape:
         raise ValueError("logits and labels must have identical shapes.")
+    if config.bce_coefficient == 0 and config.ranking_coefficient == 0:
+        zero = logits.new_zeros(())
+        return ConfidenceLossOutput(
+            loss=zero,
+            bce=zero,
+            ranking=zero,
+            num_positive=0,
+            num_negative=0,
+        )
     if torch.any((labels != 0) & (labels != 1)):
         raise ValueError("Confidence labels must contain only 0 and 1.")
 
-    bce = F.binary_cross_entropy_with_logits(logits, labels)
-    positive = labels == 1
-    negative = labels == 0
-    num_positive = int(positive.sum().item())
-    num_negative = int(negative.sum().item())
-
-    if num_positive == 0 or num_negative == 0:
-        ranking = logits.sum() * 0.0
-    else:
-        differences = logits[positive][:, None] - logits[negative][None, :]
-        ranking = -F.logsigmoid(differences).mean()
-
-    loss = (
-        config.bce_coefficient * bce
-        + config.ranking_coefficient * ranking
+    zero = logits.new_zeros(())
+    bce = (
+        F.binary_cross_entropy_with_logits(logits, labels)
+        if config.bce_coefficient > 0
+        else zero
     )
+    num_positive = 0
+    num_negative = 0
+    ranking = zero
+    if config.ranking_coefficient > 0:
+        positive = labels == 1
+        negative = labels == 0
+        num_positive = int(positive.sum().item())
+        num_negative = int(negative.sum().item())
+        if num_positive > 0 and num_negative > 0:
+            differences = logits[positive][:, None] - logits[negative][None, :]
+            ranking = -F.logsigmoid(differences).mean()
+
+    loss = config.bce_coefficient * bce + config.ranking_coefficient * ranking
     return ConfidenceLossOutput(
         loss=loss,
         bce=bce,

@@ -141,6 +141,7 @@ def test_meta_loss_backpropagates_through_inner_update_to_confidence() -> None:
         query_grpo_config=GRPOLossConfig(),
     )
     output = algorithm.outer_loss(support, query, initial_fast)
+    assert output.adaptation.confidence_loss is None
     gradients = torch.autograd.grad(
         output.loss,
         tuple(confidence.parameters()),
@@ -587,6 +588,53 @@ def test_component_gradient_norms_are_exact_and_leave_no_gradients() -> None:
         torch.testing.assert_close(parameter, initial_parameter)
     assert not optimizer.state
     assert all(parameter.grad is None for parameter in confidence.parameters())
+
+
+def test_component_gradient_norms_skip_zero_coefficient_losses() -> None:
+    torch.manual_seed(13)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    query = make_group(policy, torch.tensor([0.0, 1.0, 0.0]))
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(
+            num_iterations=1,
+            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+        ),
+        meta_config=MetaLossConfig(
+            meta_coefficient=1.0,
+            confidence=ConfidenceLossConfig(
+                bce_coefficient=0.0,
+                ranking_coefficient=0.0,
+            ),
+        ),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+    )
+    optimizer = torch.optim.AdamW(confidence.parameters(), lr=1e-3)
+    measured = _measure_component_gradient_norms(
+        algorithm=algorithm,
+        rollout_microbatches=[
+            CachedRolloutMicrobatch(
+                problems=(_problem("0"),),
+                supports=(support,),
+                queries=(query,),
+            )
+        ],
+        local_problem_batch_size=1,
+        initial_fast=initial_fast,
+        confidence_model=confidence,
+        confidence_optimizer=optimizer,
+        accelerator=CPUAccelerator(),
+        progress_prefix="test",
+    )
+
+    assert "gradient_norm/meta_raw" in measured
+    assert "gradient_norm/bce_raw" not in measured
+    assert "gradient_norm/ranking_raw" not in measured
 
 
 def test_problem_microbatch_accumulation_matches_full_batch_gradient() -> None:

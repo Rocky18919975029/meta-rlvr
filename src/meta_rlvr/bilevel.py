@@ -614,7 +614,15 @@ class BilevelGRPO:
         show_progress: bool,
         progress_prefix: str,
     ) -> TaskAdaptation:
-        if supervise_confidence and support.correctness_labels is None:
+        supervision_enabled = (
+            self.meta_config.confidence.bce_coefficient > 0
+            or self.meta_config.confidence.ranking_coefficient > 0
+        )
+        if (
+            supervise_confidence
+            and supervision_enabled
+            and support.correctness_labels is None
+        ):
             raise ValueError(
                 "Support correctness labels are required for BCE/ranking supervision."
             )
@@ -622,7 +630,7 @@ class BilevelGRPO:
             raise ValueError("Confidence logits must match the support group size.")
         confidence_probabilities = torch.sigmoid(confidence_logits)
         confidence_loss = None
-        if supervise_confidence:
+        if supervise_confidence and supervision_enabled:
             confidence_loss = confidence_losses(
                 confidence_logits,
                 support.correctness_labels,
@@ -766,7 +774,11 @@ class BilevelGRPO:
     ) -> TaskOuterLoss:
         if query.verifier_rewards is None:
             raise ValueError("Query verifier rewards are required for the meta loss.")
-        if adaptation.confidence_loss is None:
+        supervision_enabled = (
+            self.meta_config.confidence.bce_coefficient > 0
+            or self.meta_config.confidence.ranking_coefficient > 0
+        )
+        if adaptation.confidence_loss is None and supervision_enabled:
             raise ValueError(
                 "Outer training requires an adaptation with confidence supervision."
             )
@@ -793,10 +805,9 @@ class BilevelGRPO:
             self.query_grpo_config,
             reference_logprobs=query.reference_logprobs,
         )
-        loss = (
-            self.meta_config.meta_coefficient * meta_grpo.loss
-            + adaptation.confidence_loss.loss
-        )
+        loss = self.meta_config.meta_coefficient * meta_grpo.loss
+        if adaptation.confidence_loss is not None:
+            loss = loss + adaptation.confidence_loss.loss
         return TaskOuterLoss(
             loss=loss,
             meta_grpo=meta_grpo,

@@ -9,6 +9,50 @@ from meta_rlvr.config import (
 from meta_rlvr.losses import confidence_losses, grpo_policy_loss, group_advantages
 
 
+def test_disabled_confidence_losses_skip_bce_and_ranking(monkeypatch) -> None:
+    def unexpected(*args, **kwargs):
+        raise AssertionError("disabled confidence loss was evaluated")
+
+    monkeypatch.setattr(torch.nn.functional, "binary_cross_entropy_with_logits", unexpected)
+    monkeypatch.setattr(torch.nn.functional, "logsigmoid", unexpected)
+    output = confidence_losses(
+        torch.tensor([0.2, -0.1], requires_grad=True),
+        torch.tensor([1.0, 0.0]),
+        ConfidenceLossConfig(bce_coefficient=0.0, ranking_coefficient=0.0),
+    )
+
+    assert output.loss.item() == 0.0
+    assert output.bce.item() == 0.0
+    assert output.ranking.item() == 0.0
+
+
+def test_ranking_only_skips_bce(monkeypatch) -> None:
+    def unexpected(*args, **kwargs):
+        raise AssertionError("disabled BCE was evaluated")
+
+    monkeypatch.setattr(torch.nn.functional, "binary_cross_entropy_with_logits", unexpected)
+    output = confidence_losses(
+        torch.tensor([0.2, -0.1], requires_grad=True),
+        torch.tensor([1.0, 0.0]),
+        ConfidenceLossConfig(bce_coefficient=0.0, ranking_coefficient=1.0),
+    )
+    assert output.ranking.item() > 0.0
+
+
+def test_bce_only_skips_ranking(monkeypatch) -> None:
+    def unexpected(*args, **kwargs):
+        raise AssertionError("disabled ranking loss was evaluated")
+
+    monkeypatch.setattr(torch.nn.functional, "logsigmoid", unexpected)
+    output = confidence_losses(
+        torch.tensor([0.2, -0.1], requires_grad=True),
+        torch.tensor([1.0, 0.0]),
+        ConfidenceLossConfig(bce_coefficient=1.0, ranking_coefficient=0.0),
+    )
+    assert output.bce.item() > 0.0
+    assert output.ranking.item() == 0.0
+
+
 def test_qwen_ranking_loss_uses_all_positive_negative_pairs() -> None:
     logits = torch.tensor([2.0, 1.0, -1.0, -2.0], requires_grad=True)
     labels = torch.tensor([1.0, 1.0, 0.0, 0.0])

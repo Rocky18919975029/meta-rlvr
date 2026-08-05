@@ -394,8 +394,11 @@ setsid accelerate launch \
   --attn-implementation sdpa \
   --max-steps "${SMOKE_MAX_STEPS:-1}" \
   --save-steps "${SMOKE_SAVE_STEPS:-1}" \
+  --eval-steps "${SMOKE_EVAL_STEPS:-0}" \
   --support-group-size "${SMOKE_SUPPORT_GROUP_SIZE:-2}" \
   --query-group-size "${SMOKE_QUERY_GROUP_SIZE:-2}" \
+  --validation-support-group-size "${SMOKE_VALIDATION_SUPPORT_GROUP_SIZE:-${SMOKE_SUPPORT_GROUP_SIZE:-2}}" \
+  --validation-query-group-size "${SMOKE_VALIDATION_QUERY_GROUP_SIZE:-${SMOKE_QUERY_GROUP_SIZE:-2}}" \
   --problem-batch-size "${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}}" \
   --problem-micro-batch-size "${SMOKE_PROBLEM_MICRO_BATCH_SIZE}" \
   --rollout-problem-batch-size "${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}" \
@@ -405,6 +408,9 @@ setsid accelerate launch \
   --max-new-tokens "${SMOKE_MAX_NEW_TOKENS:-128}" \
   --inner-iterations "${SMOKE_INNER_ITERATIONS:-1}" \
   --outer-iterations "${SMOKE_OUTER_ITERATIONS:-1}" \
+  --meta-coefficient "${SMOKE_META_COEFFICIENT:-1.0}" \
+  --bce-coefficient "${SMOKE_BCE_COEFFICIENT:-1.0}" \
+  --ranking-coefficient "${SMOKE_RANKING_COEFFICIENT:-1.0}" \
   "${EXTRA_TRAIN_ARGS[@]}" \
   "$@" &
 META_RLVR_TRAINER_PID="$!"
