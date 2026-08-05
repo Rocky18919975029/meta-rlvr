@@ -126,9 +126,18 @@ def parse_args() -> argparse.Namespace:
         "--problem-micro-batch-size",
         type=int,
         help=(
-            "Global number of problems generated and moved to GPU at once. "
-            "Defaults to problem_batch_size; gradients still accumulate over "
-            "the complete problem batch before each outer optimizer step."
+            "Global number of problems moved to GPU for one outer backward. "
+            "Defaults to problem_batch_size; gradients accumulate over the "
+            "complete problem batch before each outer optimizer step."
+        ),
+    )
+    parser.add_argument(
+        "--rollout-problem-batch-size",
+        type=int,
+        help=(
+            "Global number of problems submitted to vLLM in one rollout batch. "
+            "Defaults to problem_batch_size and is independent of the outer "
+            "gradient problem microbatch."
         ),
     )
     parser.add_argument("--generation-micro-batch-size", type=int, default=4)
@@ -294,6 +303,11 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.problem_micro_batch_size is not None and args.problem_micro_batch_size <= 0:
         raise ValueError("problem_micro_batch_size must be positive.")
     if (
+        args.rollout_problem_batch_size is not None
+        and args.rollout_problem_batch_size <= 0
+    ):
+        raise ValueError("rollout_problem_batch_size must be positive.")
+    if (
         args.policy_max_tokens_per_micro_batch is not None
         and args.policy_max_tokens_per_micro_batch <= 0
     ):
@@ -426,6 +440,7 @@ def _problem_batch_layout(
     global_micro_batch_size: int | None,
     *,
     world_size: int,
+    sub_batch_name: str = "problem_micro_batch_size",
 ) -> tuple[int, int, int, int, int]:
     global_batch, local_batch = _local_problem_batch_size(
         global_batch_size,
@@ -436,17 +451,17 @@ def _problem_batch_layout(
     )
     if global_micro_batch < world_size:
         raise ValueError(
-            "problem_micro_batch_size must be at least the distributed world size."
+            f"{sub_batch_name} must be at least the distributed world size."
         )
     if global_micro_batch > global_batch:
-        raise ValueError("problem_micro_batch_size cannot exceed problem_batch_size.")
+        raise ValueError(f"{sub_batch_name} cannot exceed problem_batch_size.")
     if global_micro_batch % world_size != 0:
         raise ValueError(
-            "problem_micro_batch_size must be divisible by the distributed world size."
+            f"{sub_batch_name} must be divisible by the distributed world size."
         )
     if global_batch % global_micro_batch != 0:
         raise ValueError(
-            "problem_batch_size must be divisible by problem_micro_batch_size."
+            f"problem_batch_size must be divisible by {sub_batch_name}."
         )
     local_micro_batch = global_micro_batch // world_size
     num_micro_batches = global_batch // global_micro_batch
@@ -459,6 +474,17 @@ def _problem_batch_layout(
         local_micro_batch,
         num_micro_batches,
     )
+
+
+def _fixed_size_batches(items, batch_size: int) -> list[list]:
+    if not items:
+        raise ValueError("Cannot partition an empty sequence.")
+    if batch_size <= 0 or len(items) % batch_size != 0:
+        raise ValueError("Batch size must be positive and divide the sequence length.")
+    return [
+        list(items[start : start + batch_size])
+        for start in range(0, len(items), batch_size)
+    ]
 
 
 def _write_run_config(args: argparse.Namespace, output_dir: Path, accelerator) -> None:
@@ -1001,8 +1027,21 @@ def main() -> None:
         args.problem_micro_batch_size,
         world_size=accelerator.num_processes,
     )
+    (
+        _,
+        _,
+        global_rollout_problem_batch_size,
+        local_rollout_problem_batch_size,
+        num_rollout_problem_batches,
+    ) = _problem_batch_layout(
+        global_problem_batch_size,
+        args.rollout_problem_batch_size,
+        world_size=accelerator.num_processes,
+        sub_batch_name="rollout_problem_batch_size",
+    )
     args.problem_batch_size = global_problem_batch_size
     args.problem_micro_batch_size = global_problem_micro_batch_size
+    args.rollout_problem_batch_size = global_rollout_problem_batch_size
     set_seed(args.seed, device_specific=True)
     _write_run_config(args, args.output_dir, accelerator)
     accelerator.wait_for_everyone()
@@ -1147,8 +1186,11 @@ def main() -> None:
         f"rank {accelerator.process_index} owns {len(local_problems)}; "
         f"validation has {len(validation_problems)} semantically unique problems; "
         f"global problem batch is {global_problem_batch_size} "
-        f"({local_problem_batch_size} per rank); global rollout microbatch is "
-        f"{global_problem_micro_batch_size} "
+        f"({local_problem_batch_size} per rank); global rollout problem batch is "
+        f"{global_rollout_problem_batch_size} "
+        f"({local_rollout_problem_batch_size} per rank, "
+        f"{num_rollout_problem_batches} rollout batches); global gradient problem "
+        f"microbatch is {global_problem_micro_batch_size} "
         f"({local_problem_micro_batch_size} per rank, "
         f"{num_problem_micro_batches} accumulation microbatches)."
     )
@@ -1179,33 +1221,33 @@ def main() -> None:
         timings = StageTimings.create()
         rollout_microbatches: list[CachedRolloutMicrobatch] = []
         rollout_totals = torch.zeros(6, dtype=torch.float32, device=accelerator.device)
-        problem_batches = [
-            list(
-                problems[
-                    microbatch_index * local_problem_micro_batch_size :
-                    (microbatch_index + 1) * local_problem_micro_batch_size
-                ]
-            )
-            for microbatch_index in range(num_problem_micro_batches)
-        ]
+        rollout_problem_batches = _fixed_size_batches(
+            problems,
+            local_rollout_problem_batch_size,
+        )
 
         step_indices.set_postfix_str(
             f"problems={global_problem_batch_size} stage=support-rollout"
         )
         with timings.measure("support_rollout"):
             support_batches = support_rollouts.generate_batches(
-                problem_batches,
+                rollout_problem_batches,
                 [
-                    [initial_fast] * local_problem_micro_batch_size
-                    for _ in problem_batches
+                    [initial_fast] * local_rollout_problem_batch_size
+                    for _ in rollout_problem_batches
                 ],
                 show_progress=accelerator.is_main_process,
                 progress_description=f"{batch_prefix} support",
             )
+        support_groups = tuple(
+            group for batch in support_batches for group in batch
+        )
+        if len(support_groups) != local_problem_batch_size:
+            raise RuntimeError("Support rollout count does not match problem batch.")
+        del support_batches
 
-        # Finish and cache every support rollout before computing any query
-        # adapter. This preserves the full-batch rollout order while bounding
-        # GPU-resident rollout state by the configured problem microbatch.
+        # Repartition CPU-backed rollout results into the smaller gradient
+        # microbatches without changing problem order.
         for microbatch_index in range(num_problem_micro_batches):
             start = microbatch_index * local_problem_micro_batch_size
             end = start + local_problem_micro_batch_size
@@ -1219,7 +1261,7 @@ def main() -> None:
                 f"microbatch={microbatch_index + 1}/{num_problem_micro_batches} "
                 "stage=support-rollout"
             )
-            supports = list(support_batches[microbatch_index])
+            supports = list(support_groups[start:end])
             step_indices.set_postfix_str(
                 f"problems={global_problem_batch_size} "
                 f"microbatch={microbatch_index + 1}/{num_problem_micro_batches} "
@@ -1272,12 +1314,12 @@ def main() -> None:
             del supports, cached_supports, support, support_verification
             if accelerator.device.type == "cuda":
                 torch.cuda.empty_cache()
-        del support_batches
+        del support_groups
 
         # Compute task adapters in problem batches, then run the complete query
         # phase through one vLLM wake/sleep lifecycle. Fast parameters and
         # rollout caches remain CPU-backed between these two phases.
-        generation_fast_parameter_batches = []
+        generation_fast_parameters = []
         step_indices.set_postfix_str(
             f"problems={global_problem_batch_size} stage=generation-adaptation"
         )
@@ -1308,28 +1350,36 @@ def main() -> None:
                         f"{microbatch_index + 1}/{num_problem_micro_batches}"
                     ),
                 )
-                generation_fast_parameter_batches.append(
-                    [
-                        {
-                            name: value.detach().to("cpu")
-                            for name, value in adaptation.fast_parameters.items()
-                        }
-                        for adaptation in generation_adaptations
-                    ]
+                generation_fast_parameters.extend(
+                    {
+                        name: value.detach().to("cpu")
+                        for name, value in adaptation.fast_parameters.items()
+                    }
+                    for adaptation in generation_adaptations
                 )
                 del supports, generation_adaptations
+
+        if len(generation_fast_parameters) != local_problem_batch_size:
+            raise RuntimeError("Adapted parameter count does not match problem batch.")
+        rollout_fast_parameter_batches = _fixed_size_batches(
+            generation_fast_parameters,
+            local_rollout_problem_batch_size,
+        )
 
         step_indices.set_postfix_str(
             f"problems={global_problem_batch_size} stage=query-rollout"
         )
         with timings.measure("query_rollout"):
             query_batches = query_rollouts.generate_batches(
-                problem_batches,
-                generation_fast_parameter_batches,
+                rollout_problem_batches,
+                rollout_fast_parameter_batches,
                 show_progress=accelerator.is_main_process,
                 progress_description=f"{batch_prefix} query",
             )
-        del generation_fast_parameter_batches
+        query_groups = tuple(group for batch in query_batches for group in batch)
+        if len(query_groups) != local_problem_batch_size:
+            raise RuntimeError("Query rollout count does not match problem batch.")
+        del generation_fast_parameters, rollout_fast_parameter_batches, query_batches
 
         # All queries are fixed before the first confidence-model update, so
         # every outer iteration reuses exactly the same on-policy data.
@@ -1338,7 +1388,9 @@ def main() -> None:
                 f"{batch_prefix} rollout microbatch "
                 f"{microbatch_index + 1}/{num_problem_micro_batches}"
             )
-            queries = list(query_batches[microbatch_index])
+            start = microbatch_index * local_problem_micro_batch_size
+            end = start + local_problem_micro_batch_size
+            queries = list(query_groups[start:end])
             step_indices.set_postfix_str(
                 f"problems={global_problem_batch_size} "
                 f"microbatch={microbatch_index + 1}/{num_problem_micro_batches} "
@@ -1395,7 +1447,7 @@ def main() -> None:
             del queries, cached_queries, query, query_verification
             if accelerator.device.type == "cuda":
                 torch.cuda.empty_cache()
-        del query_batches
+        del query_groups, rollout_problem_batches
 
         if any(microbatch.queries is None for microbatch in rollout_microbatches):
             raise RuntimeError("Query rollout cache is incomplete.")
@@ -1434,6 +1486,9 @@ def main() -> None:
                             "num_problems": global_problem_batch_size,
                             "problem_micro_batch_size": (
                                 global_problem_micro_batch_size
+                            ),
+                            "rollout_problem_batch_size": (
+                                global_rollout_problem_batch_size
                             ),
                             "support_responses": int(rollout_totals[2].item()),
                             "query_responses": int(rollout_totals[5].item()),
@@ -1565,6 +1620,9 @@ def main() -> None:
                             "problem_batch_size": global_problem_batch_size,
                             "problem_micro_batch_size": (
                                 global_problem_micro_batch_size
+                            ),
+                            "rollout_problem_batch_size": (
+                                global_rollout_problem_batch_size
                             ),
                             "loss": metrics[0].item(),
                             "meta_loss": metrics[1].item(),

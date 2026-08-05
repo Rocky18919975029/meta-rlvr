@@ -2,6 +2,7 @@ import pytest
 
 from meta_rlvr.data import ChatMessage, MathProblem, rank_shard
 from meta_rlvr.train import (
+    _fixed_size_batches,
     _local_problem_batch_size,
     _problem_batch,
     _problem_batch_layout,
@@ -61,6 +62,31 @@ def test_problem_microbatch_layout_preserves_global_optimizer_batch() -> None:
         _problem_batch_layout(32, 12, world_size=8)
     with pytest.raises(ValueError, match="divisible by problem_micro"):
         _problem_batch_layout(96, 64, world_size=8)
+
+
+def test_rollout_and_gradient_problem_batches_are_independent_and_ordered() -> None:
+    assert _problem_batch_layout(
+        32,
+        32,
+        world_size=4,
+        sub_batch_name="rollout_problem_batch_size",
+    ) == (32, 8, 32, 8, 1)
+    assert _problem_batch_layout(32, 4, world_size=4) == (32, 8, 4, 1, 8)
+
+    items = list(range(8))
+    rollout_batches = _fixed_size_batches(items, 4)
+    flattened = tuple(item for batch in rollout_batches for item in batch)
+    gradient_microbatches = _fixed_size_batches(flattened, 1)
+    assert rollout_batches == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert gradient_microbatches == [[index] for index in range(8)]
+
+    with pytest.raises(ValueError, match="rollout_problem_batch_size"):
+        _problem_batch_layout(
+            32,
+            12,
+            world_size=8,
+            sub_batch_name="rollout_problem_batch_size",
+        )
 
 
 def test_problem_batches_are_deterministic_and_advance_by_local_batch() -> None:

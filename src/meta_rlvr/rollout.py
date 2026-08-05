@@ -455,7 +455,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
     """vLLM continuous-batching rollout with verl-style sleep/resume.
 
     vLLM runs in a colocated server process on the same GPU.  A complete rollout
-    phase wakes weights once, swaps detached task LoRAs at problem-microbatch
+    phase wakes weights once, swaps detached task LoRAs at rollout-batch
     boundaries, wakes the KV cache once, and returns the server to level-1 sleep
     before PyTorch computes log-probabilities or gradients.  The staged weights
     -> LoRA -> KV ordering matches verl's hybrid-engine lifecycle and avoids

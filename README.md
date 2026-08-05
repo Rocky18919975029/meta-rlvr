@@ -121,13 +121,16 @@ optimizer step only after all local problems finish. Confidence forwards are
 packed across the responses of several problems, while each task-dependent
 adapter is still constructed and released independently.
 
-Large logical batches can be decoupled from the rollout working set with
-`--problem-micro-batch-size`. Both values are global and must be divisible by
-the distributed world size; the microbatch must also divide the logical batch.
-For example, `--problem-batch-size 512 --problem-micro-batch-size 32` uses 16
-rollout/gradient-accumulation microbatches. On eight GPUs that is 64 logical
-problems and four simultaneously resident problems per rank; on four GPUs it
-is 128 logical problems and eight resident problems per rank.
+Large logical batches use independent rollout and backward batch sizes.
+`--rollout-problem-batch-size` controls how many prompts vLLM receives per
+continuous-batching transaction, while `--problem-micro-batch-size` controls
+how many cached problems are moved to the GPU for one outer backward. All
+three values are global, divisible by the distributed world size, and each
+sub-batch must divide the logical problem batch. For example,
+`--problem-batch-size 512`, `--rollout-problem-batch-size 32`, and
+`--problem-micro-batch-size 8` use 16 rollout batches but 64 gradient
+accumulation microbatches. This preserves rollout concurrency without making
+the meta-gradient working set equally large.
 
 Support and query groups are detached and cached on CPU. The trainer completes
 all support rollouts, then all confidence-guided query rollouts, before the
@@ -280,10 +283,10 @@ strict-box verifier predictions are written to per-rank JSONL files under
 The vLLM lifecycle follows verl's hybrid engine ordering. Servers start first
 and enter level-1 sleep. A complete support or query phase wakes `weights`
 once, dynamically swaps the required detached LoRAs from node-local `/dev/shm`
-at problem-microbatch boundaries, wakes `kv_cache` once, and sleeps before
+at rollout-problem-batch boundaries, wakes `kv_cache` once, and sleeps before
 PyTorch performs log-probability or gradient work. Support exports and loads
-the shared initial adapter once per phase; query keeps only the current
-microbatch's task adapters registered. The
+the shared initial adapter once per phase; query keeps only the current rollout
+batch's task adapters registered. The
 launcher explicitly enables vLLM's development lifecycle endpoints and
 supervises every server process. An HTTP 500, a missing endpoint or a dead
 replica terminates the trainer and the Slurm job instead of waiting through a
@@ -354,14 +357,15 @@ GPUs with the same script:
 export SMOKE_GPUS=8
 export SMOKE_PROBLEM_BATCH_SIZE=64
 export SMOKE_PROBLEM_MICRO_BATCH_SIZE=32
+export SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE=64
 bash scripts/submit_problem_batch_test.sh
 ```
 
-This exercises two logical accumulation microbatches: four problems per rank
-are resident at once, but the optimizer step still averages all eight local
-problems. The launcher derives `VLLM_MAX_LORAS` from the per-rank problem
-microbatch and fails before requesting generation if the configured vLLM
-adapter capacity is too small.
+This generates all eight local problems together while exercising two logical
+gradient-accumulation microbatches of four problems per rank. The optimizer
+still averages all eight local problems. The launcher derives
+`VLLM_MAX_LORAS` from the per-rank rollout problem batch and fails before
+requesting generation if the configured vLLM adapter capacity is too small.
 
 The B=512 layout is supported without requiring 64 or 128 simultaneous task
 adapters per rank. Validate the memory schedule with short rollout-only data
@@ -370,13 +374,17 @@ before attempting an expensive full-length run:
 ```bash
 export SMOKE_GPUS=8
 export SMOKE_PROBLEM_BATCH_SIZE=512
+export SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE=32
 export SMOKE_PROBLEM_MICRO_BATCH_SIZE=32
 export SMOKE_ROLLOUT_ONLY=1
 export SLURM_MEM=300G
 bash scripts/submit_problem_batch_test.sh
 ```
 
-This produces 16 microbatches globally, with four resident problems per rank.
+This produces 16 rollout batches and 16 gradient microbatches globally, with
+four problems per rank in each. They can be tuned independently; reducing only
+`SMOKE_PROBLEM_MICRO_BATCH_SIZE` lowers backward memory without reducing vLLM
+concurrency.
 Unset `SMOKE_ROLLOUT_ONLY` to test the accumulated outer backward and single
 optimizer step. On four GPUs the same global microbatch means eight resident
 problems per rank; use `SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER=1` for multi-outer
@@ -419,6 +427,7 @@ cd "$HOME/meta-rlvr"
 export SMOKE_GPUS=8
 export SMOKE_PROBLEM_BATCH_SIZE=32
 export SMOKE_PROBLEM_MICRO_BATCH_SIZE=32
+export SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE=32
 export META_RLVR_RUN_LABEL=meta-meaningful-b32-8gpu
 export VLLM_MAX_LORAS=4
 export VLLM_MAX_CPU_LORAS=4
@@ -440,6 +449,7 @@ cd "$HOME/meta-rlvr"
 export SMOKE_GPUS=4
 export SMOKE_PROBLEM_BATCH_SIZE=32
 export SMOKE_PROBLEM_MICRO_BATCH_SIZE=32
+export SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE=32
 export META_RLVR_RUN_LABEL=meta-meaningful-b32-4gpu-offload
 export SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER=1
 export SLURM_MEM=200G

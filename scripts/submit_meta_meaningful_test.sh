@@ -59,14 +59,23 @@ if [[ ! "${SMOKE_PROBLEM_MICRO_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || \
   echo "SMOKE_PROBLEM_MICRO_BATCH_SIZE must divide the problem batch and be divisible by SMOKE_GPUS." >&2
   exit 2
 fi
-local_problem_micro_batch_size=$((SMOKE_PROBLEM_MICRO_BATCH_SIZE / SMOKE_GPUS))
-export VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-${local_problem_micro_batch_size}}"
+export SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE="${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE:-${SMOKE_PROBLEM_BATCH_SIZE}}"
+if [[ ! "${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || \
+  (( SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE < SMOKE_GPUS || \
+     SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE > SMOKE_PROBLEM_BATCH_SIZE || \
+     SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE % SMOKE_GPUS != 0 || \
+     SMOKE_PROBLEM_BATCH_SIZE % SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE != 0 )); then
+  echo "SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE must divide the problem batch and be divisible by SMOKE_GPUS." >&2
+  exit 2
+fi
+local_rollout_problem_batch_size=$((SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE / SMOKE_GPUS))
+export VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-${local_rollout_problem_batch_size}}"
 export VLLM_MAX_CPU_LORAS="${VLLM_MAX_CPU_LORAS:-${VLLM_MAX_LORAS}}"
 if [[ ! "${VLLM_MAX_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
   [[ ! "${VLLM_MAX_CPU_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
-  (( VLLM_MAX_LORAS < local_problem_micro_batch_size )) || \
+  (( VLLM_MAX_LORAS < local_rollout_problem_batch_size )) || \
   (( VLLM_MAX_CPU_LORAS < VLLM_MAX_LORAS )); then
-  echo "vLLM LoRA capacities must cover the per-rank problem microbatch ${local_problem_micro_batch_size}." >&2
+  echo "vLLM LoRA capacities must cover the per-rank rollout problem batch ${local_rollout_problem_batch_size}." >&2
   exit 2
 fi
 
@@ -122,7 +131,7 @@ if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "${submission}"
-echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE} problem_microbatch=${SMOKE_PROBLEM_MICRO_BATCH_SIZE} max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS} policy_batch=${SMOKE_POLICY_MICRO_BATCH_SIZE}/${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH}tokens confidence_batch=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE}/${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH}tokens deferred_sync=${SMOKE_DEFER_CONFIDENCE_GRADIENT_SYNC:-0} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0} component_gradient_norms=${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}"
+echo "configuration: problems=${SMOKE_PROBLEM_BATCH_SIZE} rollout_problem_batch=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE} gradient_problem_microbatch=${SMOKE_PROBLEM_MICRO_BATCH_SIZE} max_new_tokens=3072 K=16 inner=2 outer=2 rollout=${SMOKE_ROLLOUT_BACKEND} gpus=${SMOKE_GPUS} policy_batch=${SMOKE_POLICY_MICRO_BATCH_SIZE}/${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH}tokens confidence_batch=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE}/${SMOKE_CONFIDENCE_MAX_TOKENS_PER_MICRO_BATCH}tokens deferred_sync=${SMOKE_DEFER_CONFIDENCE_GRADIENT_SYNC:-0} optimizer_offload=${SMOKE_OFFLOAD_CONFIDENCE_OPTIMIZER:-0} component_gradient_norms=${SMOKE_LOG_COMPONENT_GRADIENT_NORMS:-0}"
 echo "stdout: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.out"
 echo "stderr/progress: ${LOG_DIR}/${META_RLVR_RUN_LABEL}-${job_id}.err"
 echo "vLLM throughput: ${LOG_DIR}/vllm-${job_id}/gpu-*.log"

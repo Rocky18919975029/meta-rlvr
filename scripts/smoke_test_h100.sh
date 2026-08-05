@@ -40,12 +40,17 @@ case "${SMOKE_GPUS}" in
 esac
 SMOKE_PROBLEM_BATCH_SIZE="${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}}"
 SMOKE_PROBLEM_MICRO_BATCH_SIZE="${SMOKE_PROBLEM_MICRO_BATCH_SIZE:-${SMOKE_PROBLEM_BATCH_SIZE}}"
+SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE="${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE:-${SMOKE_PROBLEM_BATCH_SIZE}}"
 if [[ ! "${SMOKE_PROBLEM_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SMOKE_PROBLEM_BATCH_SIZE must be a positive integer." >&2
   exit 2
 fi
 if [[ ! "${SMOKE_PROBLEM_MICRO_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
   echo "SMOKE_PROBLEM_MICRO_BATCH_SIZE must be a positive integer." >&2
+  exit 2
+fi
+if [[ ! "${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE must be a positive integer." >&2
   exit 2
 fi
 if ((SMOKE_PROBLEM_BATCH_SIZE < SMOKE_GPUS || SMOKE_PROBLEM_BATCH_SIZE % SMOKE_GPUS != 0)); then
@@ -59,9 +64,17 @@ if ((SMOKE_PROBLEM_MICRO_BATCH_SIZE < SMOKE_GPUS || \
   echo "SMOKE_PROBLEM_MICRO_BATCH_SIZE must be between SMOKE_GPUS and SMOKE_PROBLEM_BATCH_SIZE, divide the problem batch, and be divisible by SMOKE_GPUS." >&2
   exit 2
 fi
-export SMOKE_PROBLEM_BATCH_SIZE SMOKE_PROBLEM_MICRO_BATCH_SIZE
+if ((SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE < SMOKE_GPUS || \
+      SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE > SMOKE_PROBLEM_BATCH_SIZE || \
+      SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE % SMOKE_GPUS != 0 || \
+      SMOKE_PROBLEM_BATCH_SIZE % SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE != 0)); then
+  echo "SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE must be between SMOKE_GPUS and SMOKE_PROBLEM_BATCH_SIZE, divide the problem batch, and be divisible by SMOKE_GPUS." >&2
+  exit 2
+fi
+export SMOKE_PROBLEM_BATCH_SIZE SMOKE_PROBLEM_MICRO_BATCH_SIZE SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE
 LOCAL_PROBLEM_BATCH_SIZE=$((SMOKE_PROBLEM_BATCH_SIZE / SMOKE_GPUS))
 LOCAL_PROBLEM_MICRO_BATCH_SIZE=$((SMOKE_PROBLEM_MICRO_BATCH_SIZE / SMOKE_GPUS))
+LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE=$((SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE / SMOKE_GPUS))
 
 GPU_BINDING_SOURCE="CUDA_VISIBLE_DEVICES"
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -128,6 +141,8 @@ echo "problem_batch_size=${SMOKE_PROBLEM_BATCH_SIZE}"
 echo "local_problem_batch_size=${LOCAL_PROBLEM_BATCH_SIZE}"
 echo "problem_micro_batch_size=${SMOKE_PROBLEM_MICRO_BATCH_SIZE}"
 echo "local_problem_micro_batch_size=${LOCAL_PROBLEM_MICRO_BATCH_SIZE}"
+echo "rollout_problem_batch_size=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}"
+echo "local_rollout_problem_batch_size=${LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "policy_micro_batch_size=${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}"
 echo "confidence_micro_batch_size=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}"
 echo "policy_max_tokens_per_micro_batch=${SMOKE_POLICY_MAX_TOKENS_PER_MICRO_BATCH:-unset}"
@@ -140,15 +155,15 @@ echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
 
 nvidia-smi
 if [[ "${SMOKE_ROLLOUT_BACKEND:-transformers}" == "vllm" ]]; then
-  VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-1}"
+  VLLM_MAX_LORAS="${VLLM_MAX_LORAS:-${LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE}}"
   VLLM_MAX_CPU_LORAS="${VLLM_MAX_CPU_LORAS:-${VLLM_MAX_LORAS}}"
   if [[ ! "${VLLM_MAX_LORAS}" =~ ^[1-9][0-9]*$ ]] || \
     [[ ! "${VLLM_MAX_CPU_LORAS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "VLLM_MAX_LORAS and VLLM_MAX_CPU_LORAS must be positive integers." >&2
     exit 2
   fi
-  if (( VLLM_MAX_LORAS < LOCAL_PROBLEM_MICRO_BATCH_SIZE )); then
-    echo "VLLM_MAX_LORAS must be at least LOCAL_PROBLEM_MICRO_BATCH_SIZE=${LOCAL_PROBLEM_MICRO_BATCH_SIZE}." >&2
+  if (( VLLM_MAX_LORAS < LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE )); then
+    echo "VLLM_MAX_LORAS must be at least LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE=${LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE}." >&2
     exit 2
   fi
   if (( VLLM_MAX_CPU_LORAS < VLLM_MAX_LORAS )); then
@@ -340,6 +355,7 @@ setsid accelerate launch \
   --query-group-size "${SMOKE_QUERY_GROUP_SIZE:-2}" \
   --problem-batch-size "${SMOKE_PROBLEM_BATCH_SIZE:-${SMOKE_GPUS}}" \
   --problem-micro-batch-size "${SMOKE_PROBLEM_MICRO_BATCH_SIZE}" \
+  --rollout-problem-batch-size "${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}" \
   --generation-micro-batch-size "${SMOKE_GENERATION_MICRO_BATCH_SIZE:-1}" \
   --policy-micro-batch-size "${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}" \
   --confidence-micro-batch-size "${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}" \
