@@ -81,10 +81,10 @@ def _probe_group(tokenizer, device: torch.device, max_length: int) -> RolloutGro
         [prompt_ids + completion_ids],
         dtype=torch.long,
         device=device,
-    )
+    ).repeat(2, 1)
     attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
     completion_mask = torch.zeros(
-        (1, input_ids.shape[1] - 1),
+        (input_ids.shape[0], input_ids.shape[1] - 1),
         dtype=torch.bool,
         device=device,
     )
@@ -94,7 +94,7 @@ def _probe_group(tokenizer, device: torch.device, max_length: int) -> RolloutGro
         attention_mask=attention_mask,
         completion_mask=completion_mask,
         old_logprobs=torch.zeros_like(completion_mask, dtype=torch.float32),
-        texts=(completion,),
+        texts=(completion, completion),
     )
 
 
@@ -155,7 +155,7 @@ def main() -> None:
             group,
             fast_parameters=fast_parameters,
             activation_checkpointing=False,
-        )
+        )[0]
 
     (jvp_primal, jvp_tangent), jvp_metrics = _timed(
         "forward_mode_jvp",
@@ -165,7 +165,7 @@ def main() -> None:
         raise RuntimeError("JVP primal output contains non-finite values.")
     if not torch.isfinite(jvp_tangent).all():
         raise RuntimeError("JVP tangent output contains non-finite values.")
-    active_jvp = jvp_tangent[group.completion_mask]
+    active_jvp = jvp_tangent[group.completion_mask[0]]
     if torch.count_nonzero(active_jvp).item() == 0:
         raise RuntimeError("JVP is identically zero on completion tokens.")
 
@@ -214,7 +214,7 @@ def main() -> None:
         "gpu": torch.cuda.get_device_name(device),
         "attn_implementation": args.attn_implementation,
         "sequence_tokens": int(group.input_ids.shape[1]),
-        "completion_tokens": int(group.completion_mask.sum().item()),
+        "completion_tokens": int(group.completion_mask[0].sum().item()),
         "fast_parameter_tensors": len(primals),
         "fast_parameter_elements": sum(value.numel() for value in primals),
         "jvp_active_l2": float(active_jvp.float().norm().item()),
