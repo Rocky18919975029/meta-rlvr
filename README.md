@@ -12,6 +12,8 @@ The policy and confidence model both initialize from
   reward-model head structure: `Linear -> ReLU -> Linear -> scalar` on the
   last non-padding token; both Linear layers use Qwen's normal initialization
   with `config.initializer_range` and zero biases;
+- the optional token-confidence branch adds an independently initialized
+  linear scalar head on every generated-token hidden state;
 - there is no separate confidence pre-training stage.
 
 ## Objective
@@ -28,6 +30,7 @@ adapted policy and scored by the official DAPO verifier. The outer objective is
 
 ```text
 lambda_meta * query_verifier_GRPO
++ lambda_token_meta * token_query_verifier_GRPO
 + lambda_bce * support_correctness_BCE
 + lambda_rank * support_Qwen_pairwise_ranking.
 ```
@@ -38,6 +41,22 @@ supervise_confidence=False)` is the inference path and requires no verifier.
 The verifier's official `-1/+1` score is kept separately from its `0/1`
 correctness label: outer GRPO consumes the former, while BCE, ranking and
 accuracy metrics consume the latter.
+
+The token-meta branch is independent of the existing sequence branch. Its
+linear head scores every generated token from the hidden state after that
+token, and GRPO normalizes these probabilities across active responses at the
+same token position. Positions with fewer than two active responses have zero
+advantage. Sequence and token branches each adapt a fresh task LoRA and sample
+an independent query group. `--meta-coefficient` and
+`--token-meta-coefficient` select sequence-only, token-only, or a weighted sum
+of both outer losses. A zero coefficient prevents the corresponding head,
+adapter, query rollout and outer forward/backward from being constructed.
+
+Token meta-gradients use exact forward-mode JVPs through the frozen policy and
+stop the policy Hessian, matching the existing first-order approximation. This
+requires `--attn-implementation eager`; response and vocabulary-position
+working sets are controlled by `--token-jvp-response-micro-batch-size` and
+`--token-jvp-logprob-position-chunk-size`.
 
 ## Code structure
 

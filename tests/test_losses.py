@@ -6,14 +6,22 @@ from meta_rlvr.config import (
     ConfidenceLossConfig,
     GRPOLossConfig,
 )
-from meta_rlvr.losses import confidence_losses, grpo_policy_loss, group_advantages
+from meta_rlvr.losses import (
+    confidence_losses,
+    grpo_policy_loss,
+    group_advantages,
+    token_grpo_policy_loss,
+    token_group_advantages,
+)
 
 
 def test_disabled_confidence_losses_skip_bce_and_ranking(monkeypatch) -> None:
     def unexpected(*args, **kwargs):
         raise AssertionError("disabled confidence loss was evaluated")
 
-    monkeypatch.setattr(torch.nn.functional, "binary_cross_entropy_with_logits", unexpected)
+    monkeypatch.setattr(
+        torch.nn.functional, "binary_cross_entropy_with_logits", unexpected
+    )
     monkeypatch.setattr(torch.nn.functional, "logsigmoid", unexpected)
     output = confidence_losses(
         torch.tensor([0.2, -0.1], requires_grad=True),
@@ -30,7 +38,9 @@ def test_ranking_only_skips_bce(monkeypatch) -> None:
     def unexpected(*args, **kwargs):
         raise AssertionError("disabled BCE was evaluated")
 
-    monkeypatch.setattr(torch.nn.functional, "binary_cross_entropy_with_logits", unexpected)
+    monkeypatch.setattr(
+        torch.nn.functional, "binary_cross_entropy_with_logits", unexpected
+    )
     output = confidence_losses(
         torch.tensor([0.2, -0.1], requires_grad=True),
         torch.tensor([1.0, 0.0]),
@@ -144,3 +154,43 @@ def test_positive_kl_requires_reference_logprobs() -> None:
             torch.tensor([1.0, -1.0]),
             GRPOLossConfig(kl_coefficient=0.1),
         )
+
+
+def test_token_advantages_normalize_same_position_across_active_responses() -> None:
+    rewards = torch.tensor([[0.1, 0.2, 0.9], [0.5, 0.6, 0.0], [0.9, 0.0, 0.0]])
+    mask = torch.tensor([[True, True, True], [True, True, False], [True, False, False]])
+    advantages = token_group_advantages(rewards, mask, AdvantageConfig())
+    torch.testing.assert_close(
+        advantages[:, 0], group_advantages(rewards[:, 0], AdvantageConfig())
+    )
+    torch.testing.assert_close(
+        advantages[:2, 1], group_advantages(rewards[:2, 1], AdvantageConfig())
+    )
+    assert torch.all(advantages[2:, 1] == 0)
+    assert torch.all(advantages[:, 2] == 0)
+
+
+def test_token_grpo_matches_sequence_grpo_for_constant_row_advantages() -> None:
+    torch.manual_seed(5)
+    current = torch.randn(3, 4) * 0.03
+    old = torch.zeros_like(current)
+    mask = torch.tensor(
+        [
+            [True, True, True, True],
+            [True, True, False, False],
+            [True, True, True, False],
+        ]
+    )
+    advantages = torch.tensor([0.7, -0.2, 0.1])
+    config = GRPOLossConfig(token_normalization="per_response")
+    sequence = grpo_policy_loss(current, old, mask, advantages, config)
+    token = token_grpo_policy_loss(
+        current,
+        old,
+        mask,
+        advantages[:, None].expand_as(current),
+        config,
+    )
+    torch.testing.assert_close(token.loss, sequence.loss)
+    torch.testing.assert_close(token.policy_loss, sequence.policy_loss)
+    torch.testing.assert_close(token.clip_fraction, sequence.clip_fraction)

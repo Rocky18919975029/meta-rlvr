@@ -25,6 +25,8 @@ from .losses import (
     confidence_losses,
     group_advantages,
     grpo_policy_loss,
+    token_grpo_policy_loss,
+    token_group_advantages,
 )
 from .optim import (
     FastOptimizerState,
@@ -52,6 +54,24 @@ class TaskOuterLoss:
     query_advantages: Tensor
 
 
+@dataclass(frozen=True)
+class TokenTaskAdaptation:
+    fast_parameters: ParameterDict
+    optimizer_state: FastOptimizerState
+    token_confidence_logits: Tensor
+    token_confidence_probabilities: Tensor
+    token_advantages: Tensor
+    inner_losses: tuple[GRPOLossOutput, ...]
+
+
+@dataclass(frozen=True)
+class TokenTaskOuterLoss:
+    loss: Tensor
+    meta_grpo: GRPOLossOutput
+    adaptation: TokenTaskAdaptation
+    query_advantages: Tensor
+
+
 class BilevelGRPO:
     """Differentiable per-problem adapter adaptation and outer meta objective."""
 
@@ -69,11 +89,17 @@ class BilevelGRPO:
         confidence_micro_batch_size: int = 4,
         policy_max_tokens_per_micro_batch: int | None = None,
         confidence_max_tokens_per_micro_batch: int | None = None,
+        token_jvp_response_micro_batch_size: int = 4,
+        token_jvp_logprob_position_chunk_size: int = 256,
     ) -> None:
         if policy_micro_batch_size <= 0 or confidence_micro_batch_size <= 0:
             raise ValueError("Micro-batch sizes must be positive.")
         if first_order_vjp_forward_batch_size <= 0:
             raise ValueError("First-order VJP forward batch size must be positive.")
+        if token_jvp_response_micro_batch_size <= 0:
+            raise ValueError("Token JVP response micro-batch size must be positive.")
+        if token_jvp_logprob_position_chunk_size <= 0:
+            raise ValueError("Token JVP position chunk size must be positive.")
         self.policy = policy
         self.confidence_model = confidence_model
         self.inner_config = inner_config
@@ -86,6 +112,10 @@ class BilevelGRPO:
         self.policy_max_tokens_per_micro_batch = policy_max_tokens_per_micro_batch
         self.confidence_max_tokens_per_micro_batch = (
             confidence_max_tokens_per_micro_batch
+        )
+        self.token_jvp_response_micro_batch_size = token_jvp_response_micro_batch_size
+        self.token_jvp_logprob_position_chunk_size = (
+            token_jvp_logprob_position_chunk_size
         )
 
     @staticmethod
@@ -244,6 +274,75 @@ class BilevelGRPO:
             show_progress=show_progress,
             progress_description=progress_description,
         )[0]
+
+    def _token_confidence_logits_batch(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        *,
+        differentiable: bool,
+        show_progress: bool,
+        progress_description: str,
+    ) -> tuple[Tensor, ...]:
+        if not supports:
+            raise ValueError("Token confidence scoring requires support groups.")
+        batches = self._confidence_row_batches(supports)
+        batch_indices = range(len(batches))
+        if show_progress:
+            from tqdm.auto import tqdm
+
+            batch_indices = tqdm(
+                batch_indices,
+                total=len(batches),
+                desc=progress_description,
+                unit="microbatch",
+                leave=True,
+            )
+        logits_by_problem: list[list[Tensor | None]] = [
+            [None] * support.group_size for support in supports
+        ]
+        for batch_index in batch_indices:
+            entries = batches[batch_index]
+            max_length = max(entry[2] for entry in entries)
+            input_rows = []
+            mask_rows = []
+            for problem_index, response_index, length in entries:
+                support = supports[problem_index]
+                input_row = support.input_ids[response_index, :length]
+                mask_row = support.attention_mask[response_index, :length]
+                if length < max_length:
+                    input_row = torch.nn.functional.pad(
+                        input_row, (0, max_length - length), value=0
+                    )
+                    mask_row = torch.nn.functional.pad(
+                        mask_row, (0, max_length - length), value=False
+                    )
+                input_rows.append(input_row)
+                mask_rows.append(mask_row)
+            input_ids = torch.stack(input_rows)
+            attention_mask = torch.stack(mask_rows)
+            if differentiable:
+                batch_logits = self.confidence_model(
+                    input_ids, attention_mask, output="token"
+                )
+            else:
+                with torch.no_grad():
+                    batch_logits = self.confidence_model(
+                        input_ids, attention_mask, output="token"
+                    )
+            for offset, (problem_index, response_index, length) in enumerate(entries):
+                width = supports[problem_index].completion_mask.shape[1]
+                row = batch_logits[offset, : length - 1]
+                logits_by_problem[problem_index][response_index] = (
+                    torch.nn.functional.pad(row, (0, width - row.numel()))
+                )
+        outputs = []
+        for rows in logits_by_problem:
+            if any(row is None for row in rows):
+                raise RuntimeError(
+                    "Token confidence batching returned incomplete logits."
+                )
+            outputs.append(torch.stack([row for row in rows if row is not None]))
+        return tuple(outputs)
 
     def confidence_supervision_loss(
         self,
@@ -550,6 +649,239 @@ class BilevelGRPO:
             [output for output in response_outputs if output is not None],
         )
 
+    def _token_batch_loss_weight(
+        self,
+        support: RolloutGroup,
+        row_indices: tuple[int, ...],
+    ) -> Tensor:
+        if self.inner_config.grpo.token_normalization == "global_tokens":
+            selected = torch.tensor(
+                row_indices,
+                dtype=torch.long,
+                device=support.completion_mask.device,
+            )
+            return (
+                support.completion_mask.index_select(0, selected).sum()
+                / support.completion_mask.sum()
+            )
+        return torch.as_tensor(
+            len(row_indices) / support.group_size,
+            dtype=torch.float32,
+            device=support.device,
+        )
+
+    def _token_gradient_operator(
+        self,
+        support: RolloutGroup,
+        token_advantages: Tensor,
+        fast_parameters: Mapping[str, Tensor],
+    ) -> tuple[ParameterDict, GRPOLossOutput]:
+        """First-order policy gradient with an exact JVP to token rewards."""
+        algorithm = self
+        names = tuple(fast_parameters)
+        config = self.inner_config.grpo
+        group = support
+
+        class TokenPolicyGradient(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, advantages, *parameter_values):
+                local_values = tuple(
+                    value.detach().requires_grad_(True) for value in parameter_values
+                )
+                local_parameters = dict(zip(names, local_values, strict=True))
+                accumulated = [torch.zeros_like(value) for value in local_values]
+                metric_sums = [advantages.new_zeros(()) for _ in range(4)]
+                row_batches = sequence_microbatches(
+                    group,
+                    max_sequences=algorithm.policy_micro_batch_size,
+                    max_tokens=algorithm.policy_max_tokens_per_micro_batch,
+                )
+                with torch.enable_grad():
+                    for row_indices in row_batches:
+                        selector = torch.tensor(
+                            row_indices,
+                            dtype=torch.long,
+                            device=group.device,
+                        )
+                        current = token_logprobs(
+                            algorithm.policy,
+                            group,
+                            fast_parameters=local_parameters,
+                            row_indices=row_indices,
+                            activation_checkpointing=False,
+                        )
+                        output = token_grpo_policy_loss(
+                            current,
+                            group.old_logprobs.index_select(0, selector),
+                            group.completion_mask.index_select(0, selector),
+                            advantages.detach().index_select(0, selector),
+                            config,
+                            reference_logprobs=(
+                                None
+                                if group.reference_logprobs is None
+                                else group.reference_logprobs.index_select(0, selector)
+                            ),
+                        )
+                        loss_weight = algorithm._token_batch_loss_weight(
+                            group, row_indices
+                        ).to(output.loss.dtype)
+                        gradients = torch.autograd.grad(
+                            output.loss * loss_weight,
+                            local_values,
+                            create_graph=False,
+                            retain_graph=False,
+                            allow_unused=False,
+                        )
+                        accumulated = [
+                            total + gradient.detach()
+                            for total, gradient in zip(
+                                accumulated, gradients, strict=True
+                            )
+                        ]
+                        token_weight = (
+                            group.completion_mask.index_select(0, selector).sum()
+                            / group.completion_mask.sum()
+                        ).to(output.loss.dtype)
+                        metric_sums[0] = (
+                            metric_sums[0] + output.loss.detach() * loss_weight
+                        )
+                        metric_sums[1] = (
+                            metric_sums[1] + output.policy_loss.detach() * loss_weight
+                        )
+                        metric_sums[2] = (
+                            metric_sums[2] + output.mean_kl.detach() * token_weight
+                        )
+                        metric_sums[3] = (
+                            metric_sums[3]
+                            + output.clip_fraction.detach() * token_weight
+                        )
+                ctx.save_for_backward(
+                    advantages.detach(),
+                    *(value.detach() for value in parameter_values),
+                )
+                ctx.mark_non_differentiable(*metric_sums)
+                return (*accumulated, *metric_sums)
+
+            @staticmethod
+            def backward(ctx, *output_cotangents):
+                saved = ctx.saved_tensors
+                advantages = saved[0]
+                parameter_values = saved[1:]
+                parameter_cotangents = tuple(
+                    torch.zeros_like(value) if tangent is None else tangent.detach()
+                    for value, tangent in zip(
+                        parameter_values,
+                        output_cotangents[: len(names)],
+                        strict=True,
+                    )
+                )
+                advantage_gradient = torch.zeros_like(advantages)
+                row_batches = sequence_microbatches(
+                    group,
+                    max_sequences=algorithm.token_jvp_response_micro_batch_size,
+                    max_tokens=None,
+                )
+                with torch.enable_grad():
+                    for row_indices in row_batches:
+                        selector = torch.tensor(
+                            row_indices,
+                            dtype=torch.long,
+                            device=group.device,
+                        )
+
+                        def selected_logprobs(*values):
+                            parameters = dict(zip(names, values, strict=True))
+                            return token_logprobs(
+                                algorithm.policy,
+                                group,
+                                fast_parameters=parameters,
+                                row_indices=row_indices,
+                                activation_checkpointing=False,
+                                logprob_position_chunk_size=(
+                                    algorithm.token_jvp_logprob_position_chunk_size
+                                ),
+                            )
+
+                        current, directional = torch.func.jvp(
+                            selected_logprobs,
+                            parameter_values,
+                            parameter_cotangents,
+                        )
+                        old = group.old_logprobs.index_select(0, selector)
+                        selected_advantages = advantages.index_select(0, selector)
+                        mask = group.completion_mask.index_select(0, selector)
+                        if config.use_importance_ratio:
+                            ratios = torch.exp(current - old)
+                            coefficient = ratios
+                            if config.use_clipping:
+                                clipped_ratios = torch.clamp(
+                                    ratios,
+                                    min=1.0 - config.clip_epsilon_low,
+                                    max=1.0 + config.clip_epsilon_high,
+                                )
+                                unclipped_active = torch.where(
+                                    selected_advantages >= 0,
+                                    ratios <= clipped_ratios,
+                                    ratios >= clipped_ratios,
+                                )
+                                coefficient = coefficient * unclipped_active
+                        else:
+                            coefficient = torch.ones_like(current)
+                        if config.token_normalization == "per_response":
+                            normalization = 1.0 / (
+                                group.group_size * mask.sum(dim=1, keepdim=True)
+                            )
+                        elif config.token_normalization == "global_tokens":
+                            normalization = torch.ones_like(current) / mask.sum()
+                            normalization = normalization * (
+                                mask.sum() / group.completion_mask.sum()
+                            )
+                        elif config.token_normalization == "sequence_sum":
+                            normalization = torch.ones_like(current) / group.group_size
+                        else:
+                            raise ValueError(
+                                "Unsupported token normalization: "
+                                f"{config.token_normalization}"
+                            )
+                        row_gradient = -directional * coefficient * normalization * mask
+                        advantage_gradient.index_copy_(
+                            0, selector, row_gradient.to(advantage_gradient.dtype)
+                        )
+                return (advantage_gradient, *(None for _ in names))
+
+        outputs = TokenPolicyGradient.apply(
+            token_advantages,
+            *(fast_parameters[name] for name in names),
+        )
+        gradient_values = outputs[: len(names)]
+        loss, policy_loss, mean_kl, clip_fraction = outputs[len(names) :]
+        return (
+            dict(zip(names, gradient_values, strict=True)),
+            GRPOLossOutput(
+                loss=loss,
+                policy_loss=policy_loss,
+                mean_kl=mean_kl,
+                clip_fraction=clip_fraction,
+            ),
+        )
+
+    def _nondifferentiable_token_inner_gradients(
+        self,
+        support: RolloutGroup,
+        token_advantages: Tensor,
+        fast_parameters: Mapping[str, Tensor],
+    ) -> tuple[ParameterDict, GRPOLossOutput]:
+        detached_advantages = token_advantages.detach().requires_grad_(True)
+        gradients, output = self._token_gradient_operator(
+            support,
+            detached_advantages,
+            fast_parameters,
+        )
+        return (
+            {name: value.detach() for name, value in gradients.items()},
+            output,
+        )
+
     def adapt_task(
         self,
         support: RolloutGroup,
@@ -814,6 +1146,172 @@ class BilevelGRPO:
             confidence_probabilities=confidence_probabilities,
             confidence_loss=confidence_loss,
             inner_losses=tuple(inner_outputs),
+        )
+
+    def adapt_token_task(
+        self,
+        support: RolloutGroup,
+        initial_fast_parameters: Mapping[str, Tensor],
+        *,
+        differentiable: bool = True,
+    ) -> TokenTaskAdaptation:
+        return self.adapt_token_tasks(
+            (support,),
+            initial_fast_parameters,
+            differentiable=differentiable,
+        )[0]
+
+    def adapt_token_tasks(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        initial_fast_parameters: Mapping[str, Tensor],
+        *,
+        differentiable: bool = True,
+    ) -> tuple[TokenTaskAdaptation, ...]:
+        if self.meta_config.token_meta_coefficient <= 0:
+            raise RuntimeError("Token adaptation is disabled by its zero coefficient.")
+        if differentiable and self.inner_config.meta_gradient_mode != "first_order":
+            raise ValueError(
+                "Token confidence supports first-order meta-gradients only."
+            )
+        logits_batch = self._token_confidence_logits_batch(
+            supports,
+            differentiable=differentiable,
+            show_progress=False,
+            progress_description="token confidence scoring",
+        )
+        outputs = []
+        for support, logits in zip(supports, logits_batch, strict=True):
+            if logits.shape != support.completion_mask.shape:
+                raise ValueError("Token confidence logits must match completion_mask.")
+            probabilities = torch.sigmoid(logits)
+            adaptation_rewards = (
+                probabilities if differentiable else probabilities.detach()
+            )
+            advantages = token_group_advantages(
+                adaptation_rewards,
+                support.completion_mask,
+                self.inner_config.advantage,
+            )
+            fast_parameters = clone_fast_parameters(initial_fast_parameters)
+            optimizer_state = initial_fast_optimizer_state(
+                fast_parameters,
+                self.inner_config.optimizer,
+            )
+            inner_outputs = []
+            for _ in range(self.inner_config.num_iterations):
+                if differentiable:
+                    gradients, inner_output = self._token_gradient_operator(
+                        support,
+                        advantages,
+                        fast_parameters,
+                    )
+                else:
+                    gradients, inner_output = (
+                        self._nondifferentiable_token_inner_gradients(
+                            support,
+                            advantages,
+                            fast_parameters,
+                        )
+                    )
+                fast_parameters, optimizer_state = fast_optimizer_step(
+                    fast_parameters,
+                    gradients,
+                    optimizer_state,
+                    self.inner_config.optimizer,
+                )
+                if not differentiable:
+                    fast_parameters = {
+                        name: value.detach().requires_grad_(True)
+                        for name, value in fast_parameters.items()
+                    }
+                    optimizer_state = FastOptimizerState(
+                        step=optimizer_state.step,
+                        first_moment={
+                            name: value.detach()
+                            for name, value in optimizer_state.first_moment.items()
+                        },
+                        second_moment={
+                            name: value.detach()
+                            for name, value in optimizer_state.second_moment.items()
+                        },
+                    )
+                inner_outputs.append(inner_output)
+            outputs.append(
+                TokenTaskAdaptation(
+                    fast_parameters=fast_parameters,
+                    optimizer_state=optimizer_state,
+                    token_confidence_logits=logits,
+                    token_confidence_probabilities=probabilities,
+                    token_advantages=advantages,
+                    inner_losses=tuple(inner_outputs),
+                )
+            )
+        return tuple(outputs)
+
+    def _token_outer_loss_from_adaptation(
+        self,
+        query: RolloutGroup,
+        adaptation: TokenTaskAdaptation,
+        *,
+        show_progress: bool,
+        progress_prefix: str,
+    ) -> TokenTaskOuterLoss:
+        if query.verifier_rewards is None:
+            raise ValueError("Query verifier rewards are required for token meta loss.")
+        current_query_logprobs = chunked_token_logprobs(
+            self.policy,
+            query,
+            fast_parameters=adaptation.fast_parameters,
+            micro_batch_size=self.policy_micro_batch_size,
+            max_tokens_per_micro_batch=self.policy_max_tokens_per_micro_batch,
+            activation_checkpointing=True,
+            show_progress=show_progress,
+            progress_description=f"{progress_prefix}: token query forward",
+        )
+        query_advantages = group_advantages(
+            query.verifier_rewards.detach(),
+            self.query_advantage_config,
+        )
+        meta_grpo = grpo_policy_loss(
+            current_query_logprobs,
+            query.old_logprobs,
+            query.completion_mask,
+            query_advantages,
+            self.query_grpo_config,
+            reference_logprobs=query.reference_logprobs,
+        )
+        return TokenTaskOuterLoss(
+            loss=self.meta_config.token_meta_coefficient * meta_grpo.loss,
+            meta_grpo=meta_grpo,
+            adaptation=adaptation,
+            query_advantages=query_advantages,
+        )
+
+    def token_outer_losses_batch(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        queries: tuple[RolloutGroup, ...],
+        initial_fast_parameters: Mapping[str, Tensor],
+        *,
+        show_progress: bool = False,
+        progress_prefix: str = "token outer",
+    ) -> tuple[TokenTaskOuterLoss, ...]:
+        if not supports or len(supports) != len(queries):
+            raise ValueError("Token outer loss requires matching support/query groups.")
+        adaptations = self.adapt_token_tasks(
+            supports,
+            initial_fast_parameters,
+            differentiable=True,
+        )
+        return tuple(
+            self._token_outer_loss_from_adaptation(
+                query,
+                adaptation,
+                show_progress=show_progress,
+                progress_prefix=progress_prefix,
+            )
+            for query, adaptation in zip(queries, adaptations, strict=True)
         )
 
     def outer_loss(

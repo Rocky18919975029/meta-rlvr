@@ -13,6 +13,9 @@ class SequenceConfidenceModel(nn.Module):
         self,
         backbone: nn.Module,
         hidden_size: int,
+        *,
+        enable_sequence_head: bool = True,
+        enable_token_head: bool = False,
     ) -> None:
         super().__init__()
         if hidden_size <= 0:
@@ -22,22 +25,31 @@ class SequenceConfidenceModel(nn.Module):
             raise TypeError("Confidence backbone must expose a config object.")
         self.config = backbone.config
         self._no_split_modules = getattr(backbone, "_no_split_modules", None)
-        self.score = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
+        if not enable_sequence_head and not enable_token_head:
+            raise ValueError("At least one confidence head must be enabled.")
+        self.score = (
+            nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, 1),
+            )
+            if enable_sequence_head
+            else None
         )
+        self.token_score = nn.Linear(hidden_size, 1) if enable_token_head else None
         initializer_range = getattr(self.config, "initializer_range", None)
-        if (
-            not isinstance(initializer_range, (int, float))
-            or initializer_range <= 0
-        ):
+        if not isinstance(initializer_range, (int, float)) or initializer_range <= 0:
             raise ValueError(
                 "Confidence backbone config must define a positive "
                 "initializer_range."
             )
-        for module in self.score.modules():
-            if isinstance(module, nn.Linear):
+        heads = tuple(
+            head for head in (self.score, self.token_score) if head is not None
+        )
+        for head in heads:
+            for module in head.modules():
+                if not isinstance(module, nn.Linear):
+                    continue
                 nn.init.normal_(
                     module.weight,
                     mean=0.0,
@@ -50,6 +62,9 @@ class SequenceConfidenceModel(nn.Module):
     def from_pretrained(
         cls,
         model_name_or_path: str,
+        *,
+        enable_sequence_head: bool = True,
+        enable_token_head: bool = False,
         **model_kwargs: Any,
     ) -> "SequenceConfidenceModel":
         if not model_name_or_path:
@@ -63,18 +78,22 @@ class SequenceConfidenceModel(nn.Module):
         model = cls(
             backbone,
             hidden_size,
+            enable_sequence_head=enable_sequence_head,
+            enable_token_head=enable_token_head,
         )
         try:
             reference_parameter = next(backbone.parameters())
         except StopIteration as error:
             raise ValueError("Confidence backbone has no parameters.") from error
-        model.score.to(
-            device=reference_parameter.device,
-            dtype=reference_parameter.dtype,
-        )
+        for head in (model.score, model.token_score):
+            if head is not None:
+                head.to(
+                    device=reference_parameter.device,
+                    dtype=reference_parameter.dtype,
+                )
         return model
 
-    def forward(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
+    def _hidden_states(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence].")
         if attention_mask.shape != input_ids.shape:
@@ -95,13 +114,67 @@ class SequenceConfidenceModel(nn.Module):
         if hidden_states.ndim != 3 or hidden_states.shape[:2] != input_ids.shape:
             raise ValueError("Unexpected confidence backbone hidden-state shape.")
 
+        return hidden_states
+
+    def sequence_logits_from_hidden(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+    ) -> Tensor:
+        if self.score is None:
+            raise RuntimeError("Sequence confidence head is disabled.")
         positions = torch.arange(
-            input_ids.shape[1], device=input_ids.device
+            attention_mask.shape[1], device=attention_mask.device
         ).unsqueeze(0)
         last_indices = positions.masked_fill(~attention_mask, -1).max(dim=1).values
-        batch_indices = torch.arange(input_ids.shape[0], device=input_ids.device)
+        batch_indices = torch.arange(
+            attention_mask.shape[0], device=attention_mask.device
+        )
         pooled = hidden_states[batch_indices, last_indices]
         logits = self.score(pooled).squeeze(-1)
-        if logits.shape != (input_ids.shape[0],):
+        if logits.shape != (attention_mask.shape[0],):
             raise ValueError("Confidence head must return one scalar per sequence.")
         return logits
+
+    def token_logits_from_hidden(self, hidden_states: Tensor) -> Tensor:
+        if self.token_score is None:
+            raise RuntimeError("Token confidence head is disabled.")
+        logits = self.token_score(hidden_states[:, 1:]).squeeze(-1)
+        if logits.shape != (hidden_states.shape[0], hidden_states.shape[1] - 1):
+            raise ValueError("Token confidence head returned an unexpected shape.")
+        return logits
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        *,
+        output: str = "sequence",
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        hidden_states = self._hidden_states(input_ids, attention_mask)
+        if output == "sequence":
+            return self.sequence_logits_from_hidden(hidden_states, attention_mask)
+        if output == "token":
+            return self.token_logits_from_hidden(hidden_states)
+        if output == "both":
+            return (
+                self.sequence_logits_from_hidden(hidden_states, attention_mask),
+                self.token_logits_from_hidden(hidden_states),
+            )
+        raise ValueError(f"Unsupported confidence output: {output!r}")
+
+    def token_logits(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
+        output = self(input_ids, attention_mask, output="token")
+        if not isinstance(output, Tensor):
+            raise RuntimeError("Token confidence forward returned a tuple.")
+        return output
+
+    def sequence_and_token_logits(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        output = self(input_ids, attention_mask, output="both")
+        if not isinstance(output, tuple):
+            raise RuntimeError("Joint confidence forward returned one tensor.")
+        return output

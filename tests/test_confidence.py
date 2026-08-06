@@ -26,9 +26,7 @@ def test_confidence_model_pools_last_non_padding_token() -> None:
     backbone = ToyBackbone(vocabulary_size=10, hidden_size=4)
     model = SequenceConfidenceModel(backbone, hidden_size=4)
     input_ids = torch.tensor([[1, 2, 0], [3, 0, 0]])
-    attention_mask = torch.tensor(
-        [[True, True, False], [True, False, False]]
-    )
+    attention_mask = torch.tensor([[True, True, False], [True, False, False]])
     logits = model(input_ids, attention_mask)
     assert logits.shape == (2,)
 
@@ -51,3 +49,33 @@ def test_confidence_model_rejects_non_boolean_mask() -> None:
     )
     with pytest.raises(TypeError, match="torch.bool"):
         model(torch.tensor([[1, 2]]), torch.tensor([[1, 1]]))
+
+
+def test_token_head_scores_hidden_state_after_each_current_token() -> None:
+    torch.manual_seed(11)
+    model = SequenceConfidenceModel(
+        ToyBackbone(vocabulary_size=10, hidden_size=4),
+        hidden_size=4,
+        enable_sequence_head=False,
+        enable_token_head=True,
+    )
+    input_ids = torch.tensor([[1, 2, 3], [4, 5, 0]])
+    attention_mask = torch.tensor([[True, True, True], [True, True, False]])
+    logits = model(input_ids, attention_mask, output="token")
+    expected = model.token_score(model.backbone.embedding(input_ids)[:, 1:]).squeeze(-1)
+    torch.testing.assert_close(logits, expected)
+    assert model.score is None
+
+
+def test_disabled_token_head_is_not_instantiated() -> None:
+    model = SequenceConfidenceModel(
+        ToyBackbone(vocabulary_size=10, hidden_size=4),
+        hidden_size=4,
+    )
+    assert model.token_score is None
+    with pytest.raises(RuntimeError, match="Token confidence head is disabled"):
+        model(
+            torch.tensor([[1, 2]]),
+            torch.tensor([[True, True]]),
+            output="token",
+        )

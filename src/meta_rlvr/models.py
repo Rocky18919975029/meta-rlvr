@@ -109,6 +109,8 @@ def load_confidence_model(
     gradient_checkpointing: bool = True,
     trust_remote_code: bool = False,
     model_kwargs: dict[str, Any] | None = None,
+    enable_sequence_head: bool = True,
+    enable_token_head: bool = False,
 ) -> SequenceConfidenceModel:
     kwargs = dict(model_kwargs or {})
     forbidden = {"torch_dtype", "trust_remote_code"}.intersection(kwargs)
@@ -116,13 +118,17 @@ def load_confidence_model(
         raise ValueError(f"model_kwargs contains reserved keys: {sorted(forbidden)}")
     model = SequenceConfidenceModel.from_pretrained(
         model_name_or_path,
+        enable_sequence_head=enable_sequence_head,
+        enable_token_head=enable_token_head,
         torch_dtype=_torch_dtype(dtype),
         trust_remote_code=trust_remote_code,
         **kwargs,
     )
     if gradient_checkpointing:
         if not hasattr(model.backbone, "gradient_checkpointing_enable"):
-            raise TypeError("Confidence backbone does not support gradient checkpointing.")
+            raise TypeError(
+                "Confidence backbone does not support gradient checkpointing."
+            )
         model.backbone.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )

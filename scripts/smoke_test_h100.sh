@@ -153,6 +153,9 @@ echo "rollout_problem_batch_size=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "local_rollout_problem_batch_size=${LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "policy_micro_batch_size=${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}"
 echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE:-1}"
+echo "token_jvp_response_micro_batch_size=${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-4}"
+echo "token_jvp_logprob_position_chunk_size=${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}"
+echo "attn_implementation=${SMOKE_ATTN_IMPLEMENTATION:-sdpa}"
 echo "resume_from_checkpoint=${SMOKE_RESUME_FROM_CHECKPOINT:-none}"
 echo "resume_preflight_only=${SMOKE_RESUME_PREFLIGHT_ONLY:-0}"
 echo "confidence_micro_batch_size=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}"
@@ -391,7 +394,7 @@ setsid accelerate launch \
   --output-dir "${RUN_DIR}" \
   --policy-model "${META_RLVR_MODEL_PATH}" \
   --confidence-model "${META_RLVR_MODEL_PATH}" \
-  --attn-implementation sdpa \
+  --attn-implementation "${SMOKE_ATTN_IMPLEMENTATION:-sdpa}" \
   --max-steps "${SMOKE_MAX_STEPS:-1}" \
   --save-steps "${SMOKE_SAVE_STEPS:-1}" \
   --eval-steps "${SMOKE_EVAL_STEPS:-0}" \
@@ -404,11 +407,14 @@ setsid accelerate launch \
   --rollout-problem-batch-size "${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}" \
   --generation-micro-batch-size "${SMOKE_GENERATION_MICRO_BATCH_SIZE:-1}" \
   --policy-micro-batch-size "${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}" \
+  --token-jvp-response-micro-batch-size "${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-4}" \
+  --token-jvp-logprob-position-chunk-size "${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}" \
   --confidence-micro-batch-size "${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}" \
   --max-new-tokens "${SMOKE_MAX_NEW_TOKENS:-128}" \
   --inner-iterations "${SMOKE_INNER_ITERATIONS:-1}" \
   --outer-iterations "${SMOKE_OUTER_ITERATIONS:-1}" \
   --meta-coefficient "${SMOKE_META_COEFFICIENT:-1.0}" \
+  --token-meta-coefficient "${SMOKE_TOKEN_META_COEFFICIENT:-0.0}" \
   --bce-coefficient "${SMOKE_BCE_COEFFICIENT:-1.0}" \
   --ranking-coefficient "${SMOKE_RANKING_COEFFICIENT:-1.0}" \
   "${EXTRA_TRAIN_ARGS[@]}" \

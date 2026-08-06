@@ -42,6 +42,7 @@ class CachedRolloutMicrobatch:
     problems: tuple[MathProblem, ...]
     supports: tuple[RolloutGroup, ...]
     queries: tuple[RolloutGroup, ...] | None = None
+    token_queries: tuple[RolloutGroup, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.problems or len(self.problems) != len(self.supports):
@@ -53,9 +54,17 @@ class CachedRolloutMicrobatch:
             raise ValueError(
                 "Cached query groups must match the problem microbatch size."
             )
+        if self.token_queries is not None and len(self.token_queries) != len(
+            self.problems
+        ):
+            raise ValueError(
+                "Cached token query groups must match the problem microbatch size."
+            )
         groups = self.supports
         if self.queries is not None:
             groups += self.queries
+        if self.token_queries is not None:
+            groups += self.token_queries
         if any(group.device.type != "cpu" for group in groups):
             raise ValueError("Cached rollout microbatches must reside on CPU.")
 
@@ -163,6 +172,16 @@ def parse_args() -> argparse.Namespace:
             "first-order VJPs. Defaults to 1."
         ),
     )
+    parser.add_argument(
+        "--token-jvp-response-micro-batch-size",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--token-jvp-logprob-position-chunk-size",
+        type=int,
+        default=256,
+    )
     parser.add_argument("--confidence-micro-batch-size", type=int, default=2)
     parser.add_argument("--policy-max-tokens-per-micro-batch", type=int)
     parser.add_argument("--confidence-max-tokens-per-micro-batch", type=int)
@@ -268,6 +287,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--meta-coefficient", type=float, default=1.0)
+    parser.add_argument("--token-meta-coefficient", type=float, default=0.0)
     parser.add_argument("--bce-coefficient", type=float, default=1.0)
     parser.add_argument("--ranking-coefficient", type=float, default=1.0)
     parser.add_argument(
@@ -315,6 +335,16 @@ def _grpo_config(args: argparse.Namespace, *, kl_coefficient: float) -> GRPOLoss
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    objective_coefficients = (
+        args.meta_coefficient,
+        args.token_meta_coefficient,
+        args.bce_coefficient,
+        args.ranking_coefficient,
+    )
+    if any(coefficient < 0 for coefficient in objective_coefficients):
+        raise ValueError("All objective coefficients must be non-negative.")
+    if not any(coefficient > 0 for coefficient in objective_coefficients):
+        raise ValueError("At least one training objective must be enabled.")
     if args.outer_iterations <= 0:
         raise ValueError("outer_iterations must be positive.")
     if args.max_steps <= 0 or args.save_steps <= 0:
@@ -355,6 +385,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         and args.first_order_vjp_forward_batch_size <= 0
     ):
         raise ValueError("first_order_vjp_forward_batch_size must be positive.")
+    if args.token_jvp_response_micro_batch_size <= 0:
+        raise ValueError("token_jvp_response_micro_batch_size must be positive.")
+    if args.token_jvp_logprob_position_chunk_size <= 0:
+        raise ValueError("token_jvp_logprob_position_chunk_size must be positive.")
     if (
         args.policy_max_tokens_per_micro_batch is not None
         and args.policy_max_tokens_per_micro_batch <= 0
@@ -385,6 +419,13 @@ def _validate_args(args: argparse.Namespace) -> None:
             "second_order meta-gradients require --attn-implementation eager; "
             "fused attention kernels do not provide the required double backward."
         )
+    if args.token_meta_coefficient > 0:
+        if args.meta_gradient_mode != "first_order":
+            raise ValueError("Token confidence requires first_order meta-gradients.")
+        if args.attn_implementation != "eager":
+            raise ValueError(
+                "Token confidence exact JVP requires --attn-implementation eager."
+            )
     target_modules = tuple(
         module.strip() for module in args.lora_target_modules.split(",")
     )
@@ -416,6 +457,7 @@ def _configs(args: argparse.Namespace):
     )
     meta = MetaLossConfig(
         meta_coefficient=args.meta_coefficient,
+        token_meta_coefficient=args.token_meta_coefficient,
         confidence=ConfidenceLossConfig(
             bce_coefficient=args.bce_coefficient,
             ranking_coefficient=args.ranking_coefficient,
@@ -641,6 +683,13 @@ def _initialize_or_validate_run(
             f"Resume requires the original run config: {config_path}"
         )
     original = json.loads(config_path.read_text(encoding="utf-8"))
+    for key, value in {
+        "token_meta_coefficient": 0.0,
+        "token_jvp_response_micro_batch_size": 4,
+        "token_jvp_logprob_position_chunk_size": 256,
+    }.items():
+        original.setdefault(key, value)
+        current.setdefault(key, value)
     compared_keys = set(original) | set(current)
     mismatches = {
         key: {"checkpoint_run": original.get(key), "resume_run": current.get(key)}
@@ -1116,10 +1165,9 @@ def _measure_component_gradient_norms(
             "Component gradient norms require one cached support/query pair per "
             "local problem."
         )
-    if any(microbatch.queries is None for microbatch in rollout_microbatches):
-        raise ValueError("Component gradient norms require cached query groups.")
     coefficients = {
         "meta": algorithm.meta_config.meta_coefficient,
+        "token_meta": algorithm.meta_config.token_meta_coefficient,
         "bce": algorithm.meta_config.confidence.bce_coefficient,
         "ranking": algorithm.meta_config.confidence.ranking_coefficient,
     }
@@ -1149,6 +1197,13 @@ def _measure_component_gradient_norms(
                 if component == "meta"
                 else None
             )
+            token_queries = (
+                tuple(
+                    group.to(accelerator.device) for group in microbatch.token_queries
+                )
+                if component == "token_meta"
+                else None
+            )
             for problem_index, support in enumerate(supports):
                 if component == "meta":
                     output = algorithm.outer_loss(
@@ -1162,17 +1217,24 @@ def _measure_component_gradient_norms(
                         ),
                     )
                     component_loss = output.meta_grpo.loss
+                elif component == "token_meta":
+                    output = algorithm.token_outer_losses_batch(
+                        (support,),
+                        (token_queries[problem_index],),
+                        initial_fast,
+                    )[0]
+                    component_loss = output.meta_grpo.loss
                 else:
                     confidence_loss = algorithm.confidence_supervision_loss(support)
                     component_loss = getattr(confidence_loss, component)
                 accelerator.backward(component_loss / local_problem_batch_size)
                 del component_loss
-                if component == "meta":
+                if component in ("meta", "token_meta"):
                     del output
                 else:
                     del confidence_loss
             problem_offset += len(supports)
-            del support, supports, queries
+            del support, supports, queries, token_queries
 
         raw_norm = accelerator.clip_grad_norm_(
             confidence_model.parameters(),
@@ -1219,14 +1281,26 @@ def _accumulate_outer_batch(
             "Outer gradient accumulation requires exactly one cached rollout "
             "pair per local problem."
         )
-    if any(microbatch.queries is None for microbatch in rollout_microbatches):
-        raise ValueError("Outer gradient accumulation requires cached query groups.")
+    sequence_enabled = algorithm.meta_config.meta_coefficient > 0
+    token_enabled = algorithm.meta_config.token_meta_coefficient > 0
+    supervision_enabled = (
+        algorithm.meta_config.confidence.bce_coefficient > 0
+        or algorithm.meta_config.confidence.ranking_coefficient > 0
+    )
+    if sequence_enabled and any(
+        microbatch.queries is None for microbatch in rollout_microbatches
+    ):
+        raise ValueError("Sequence meta loss requires cached sequence queries.")
+    if token_enabled and any(
+        microbatch.token_queries is None for microbatch in rollout_microbatches
+    ):
+        raise ValueError("Token meta loss requires cached token queries.")
     if defer_gradient_sync and confidence_model is None:
         raise ValueError(
             "confidence_model is required when gradient synchronization is deferred."
         )
 
-    local_metric_sums = torch.zeros(16, dtype=torch.float32, device=accelerator.device)
+    local_metric_sums = torch.zeros(26, dtype=torch.float32, device=accelerator.device)
     problem_progress = tqdm(
         total=local_problem_batch_size,
         desc=progress_description,
@@ -1246,55 +1320,202 @@ def _accumulate_outer_batch(
             supports = tuple(
                 group.to(accelerator.device) for group in microbatch.supports
             )
-            queries = tuple(
-                group.to(accelerator.device) for group in microbatch.queries
+            queries = (
+                tuple(group.to(accelerator.device) for group in microbatch.queries)
+                if sequence_enabled
+                else None
             )
-            outputs = algorithm.outer_losses_batch(
-                supports,
-                queries,
-                initial_fast,
-                show_progress=False,
-                progress_prefix=(
-                    f"{progress_description} problems "
-                    f"{problem_offset + 1}-"
-                    f"{problem_offset + len(supports)}"
-                ),
+            token_queries = (
+                tuple(
+                    group.to(accelerator.device) for group in microbatch.token_queries
+                )
+                if token_enabled
+                else None
             )
+            sequence_outputs = (
+                algorithm.outer_losses_batch(
+                    supports,
+                    queries,
+                    initial_fast,
+                    show_progress=False,
+                    progress_prefix=progress_description,
+                )
+                if sequence_enabled
+                else None
+            )
+            token_outputs = (
+                algorithm.token_outer_losses_batch(
+                    supports,
+                    token_queries,
+                    initial_fast,
+                    show_progress=False,
+                    progress_prefix=progress_description,
+                )
+                if token_enabled
+                else None
+            )
+            confidence_outputs = (
+                tuple(
+                    algorithm.confidence_supervision_loss(support)
+                    for support in supports
+                )
+                if supervision_enabled and not sequence_enabled
+                else None
+            )
+            problem_losses = []
+            for index, support in enumerate(supports):
+                loss = support.old_logprobs.new_zeros(())
+                if sequence_outputs is not None:
+                    loss = loss + sequence_outputs[index].loss
+                elif confidence_outputs is not None:
+                    loss = loss + confidence_outputs[index].loss
+                if token_outputs is not None:
+                    loss = loss + token_outputs[index].loss
+                problem_losses.append(loss)
             accumulated_loss = (
-                torch.stack(tuple(output.loss for output in outputs)).sum()
-                / local_problem_batch_size
+                torch.stack(problem_losses).sum() / local_problem_batch_size
             )
             accelerator.backward(accumulated_loss)
-        for support, query, output in zip(supports, queries, outputs, strict=True):
-            confidence_loss = output.adaptation.confidence_loss
-            zero = output.loss.new_zeros(())
+        for index, support in enumerate(supports):
+            sequence_output = (
+                None if sequence_outputs is None else sequence_outputs[index]
+            )
+            token_output = None if token_outputs is None else token_outputs[index]
+            query = None if queries is None else queries[index]
+            token_query = None if token_queries is None else token_queries[index]
+            confidence_loss = (
+                sequence_output.adaptation.confidence_loss
+                if sequence_output is not None
+                else (None if confidence_outputs is None else confidence_outputs[index])
+            )
+            zero = support.old_logprobs.new_zeros(())
+            sequence_probability = (
+                zero
+                if sequence_output is None
+                else sequence_output.adaptation.confidence_probabilities.detach().mean()
+            )
+            token_probability = (
+                zero
+                if token_output is None
+                else token_output.adaptation.token_confidence_probabilities.detach()[
+                    support.completion_mask
+                ].mean()
+            )
+            sequence_probability_square = (
+                zero
+                if sequence_output is None
+                else sequence_output.adaptation.confidence_probabilities.detach()
+                .square()
+                .mean()
+            )
+            token_probability_square = (
+                zero
+                if token_output is None
+                else token_output.adaptation.token_confidence_probabilities.detach()[
+                    support.completion_mask
+                ]
+                .square()
+                .mean()
+            )
             local_metric_sums += torch.stack(
                 (
-                    output.loss.detach(),
-                    output.meta_grpo.loss.detach(),
+                    problem_losses[index].detach(),
+                    (
+                        zero
+                        if sequence_output is None
+                        else sequence_output.meta_grpo.loss.detach()
+                    ),
+                    (
+                        zero
+                        if token_output is None
+                        else token_output.meta_grpo.loss.detach()
+                    ),
                     zero if confidence_loss is None else confidence_loss.bce.detach(),
                     (
                         zero
                         if confidence_loss is None
                         else confidence_loss.ranking.detach()
                     ),
-                    output.meta_grpo.clip_fraction.detach(),
-                    output.adaptation.inner_losses[-1].clip_fraction.detach(),
+                    (
+                        zero
+                        if sequence_output is None
+                        else sequence_output.meta_grpo.clip_fraction.detach()
+                    ),
+                    (
+                        zero
+                        if token_output is None
+                        else token_output.meta_grpo.clip_fraction.detach()
+                    ),
+                    (
+                        zero
+                        if sequence_output is None
+                        else sequence_output.adaptation.inner_losses[
+                            -1
+                        ].clip_fraction.detach()
+                    ),
+                    (
+                        zero
+                        if token_output is None
+                        else token_output.adaptation.inner_losses[
+                            -1
+                        ].clip_fraction.detach()
+                    ),
                     support.verifier_rewards.mean(),
-                    query.verifier_rewards.mean(),
+                    zero if query is None else query.verifier_rewards.mean(),
+                    (
+                        zero
+                        if token_query is None
+                        else token_query.verifier_rewards.mean()
+                    ),
                     support.correctness_labels.mean(),
-                    query.correctness_labels.mean(),
-                    output.meta_grpo.mean_kl.detach(),
-                    output.adaptation.inner_losses[-1].mean_kl.detach(),
-                    output.adaptation.confidence_probabilities.detach().mean(),
-                    output.adaptation.confidence_probabilities.detach().square().mean(),
+                    zero if query is None else query.correctness_labels.mean(),
+                    (
+                        zero
+                        if token_query is None
+                        else token_query.correctness_labels.mean()
+                    ),
+                    (
+                        zero
+                        if sequence_output is None
+                        else sequence_output.meta_grpo.mean_kl.detach()
+                    ),
+                    (
+                        zero
+                        if token_output is None
+                        else token_output.meta_grpo.mean_kl.detach()
+                    ),
+                    (
+                        zero
+                        if sequence_output is None
+                        else sequence_output.adaptation.inner_losses[
+                            -1
+                        ].mean_kl.detach()
+                    ),
+                    (
+                        zero
+                        if token_output is None
+                        else token_output.adaptation.inner_losses[-1].mean_kl.detach()
+                    ),
+                    sequence_probability,
+                    sequence_probability_square,
+                    token_probability,
+                    token_probability_square,
                     torch.any(support.correctness_labels == 1).float(),
-                    torch.any(query.correctness_labels == 1).float(),
+                    (
+                        zero
+                        if query is None
+                        else torch.any(query.correctness_labels == 1).float()
+                    ),
+                    (
+                        zero
+                        if token_query is None
+                        else torch.any(token_query.correctness_labels == 1).float()
+                    ),
                 )
             )
             problem_progress.update(1)
         problem_offset += len(supports)
-        del accumulated_loss, output, outputs, support, query, supports, queries
+        del accumulated_loss, problem_losses, support, supports
     problem_progress.close()
     return local_metric_sums
 
@@ -1320,7 +1541,9 @@ def _evaluate(
     rounds = math.ceil(len(problems) / accelerator.num_processes)
     was_training = confidence_model.training
     confidence_model.eval()
-    local_metrics = torch.zeros(6, device=accelerator.device, dtype=torch.float64)
+    sequence_enabled = algorithm.meta_config.meta_coefficient > 0
+    token_enabled = algorithm.meta_config.token_meta_coefficient > 0
+    local_metrics = torch.zeros(9, device=accelerator.device, dtype=torch.float64)
     try:
         round_indices = tqdm(
             range(rounds),
@@ -1350,38 +1573,68 @@ def _evaluate(
                     problem_uid=problem.uid,
                 ),
             )
-            generation_adaptation = algorithm.adapt_task(
-                support,
-                initial_fast,
-                differentiable=False,
-                supervise_confidence=False,
-                show_progress=accelerator.is_main_process,
-                progress_prefix=f"{progress_prefix} adaptation",
-            )
-            query = query_rollouts.generate(
-                problem,
-                generation_adaptation.fast_parameters,
-                show_progress=accelerator.is_main_process,
-                progress_description=f"{progress_prefix} adapted",
-                seed=_generation_seed(
-                    base_seed=base_seed,
-                    step=step,
-                    phase="validation_adapted",
-                    rank=accelerator.process_index,
-                    problem_uid=problem.uid,
-                ),
-            )
-            del generation_adaptation
             base_verification = verifier(
                 support.texts,
                 problem.ground_truth,
                 device=accelerator.device,
             )
-            adapted_verification = verifier(
-                query.texts,
-                problem.ground_truth,
-                device=accelerator.device,
-            )
+            query = None
+            adapted_verification = None
+            if sequence_enabled:
+                generation_adaptation = algorithm.adapt_task(
+                    support,
+                    initial_fast,
+                    differentiable=False,
+                    supervise_confidence=False,
+                    show_progress=accelerator.is_main_process,
+                    progress_prefix=f"{progress_prefix} adaptation",
+                )
+                query = query_rollouts.generate(
+                    problem,
+                    generation_adaptation.fast_parameters,
+                    show_progress=accelerator.is_main_process,
+                    progress_description=f"{progress_prefix} adapted",
+                    seed=_generation_seed(
+                        base_seed=base_seed,
+                        step=step,
+                        phase="validation_adapted",
+                        rank=accelerator.process_index,
+                        problem_uid=problem.uid,
+                    ),
+                )
+                adapted_verification = verifier(
+                    query.texts,
+                    problem.ground_truth,
+                    device=accelerator.device,
+                )
+                del generation_adaptation
+            token_query = None
+            token_verification = None
+            if token_enabled:
+                token_adaptation = algorithm.adapt_token_task(
+                    support,
+                    initial_fast,
+                    differentiable=False,
+                )
+                token_query = query_rollouts.generate(
+                    problem,
+                    token_adaptation.fast_parameters,
+                    show_progress=accelerator.is_main_process,
+                    progress_description=f"{progress_prefix} token adapted",
+                    seed=_generation_seed(
+                        base_seed=base_seed,
+                        step=step,
+                        phase="validation_token_adapted",
+                        rank=accelerator.process_index,
+                        problem_uid=problem.uid,
+                    ),
+                )
+                token_verification = verifier(
+                    token_query.texts,
+                    problem.ground_truth,
+                    device=accelerator.device,
+                )
+                del token_adaptation
             if valid:
                 _append_rollout_diagnostics(
                     rollout_log_path,
@@ -1393,24 +1646,67 @@ def _evaluate(
                     max_new_tokens=support_rollouts.max_new_tokens,
                     eos_token_id=support_rollouts.tokenizer.eos_token_id,
                 )
-                _append_rollout_diagnostics(
-                    rollout_log_path,
-                    step=step,
-                    phase="validation_adapted",
-                    problem=problem,
-                    group=query,
-                    verification=adapted_verification,
-                    max_new_tokens=query_rollouts.max_new_tokens,
-                    eos_token_id=query_rollouts.tokenizer.eos_token_id,
-                )
+                if sequence_enabled:
+                    _append_rollout_diagnostics(
+                        rollout_log_path,
+                        step=step,
+                        phase="validation_adapted",
+                        problem=problem,
+                        group=query,
+                        verification=adapted_verification,
+                        max_new_tokens=query_rollouts.max_new_tokens,
+                        eos_token_id=query_rollouts.tokenizer.eos_token_id,
+                    )
+                if token_enabled:
+                    _append_rollout_diagnostics(
+                        rollout_log_path,
+                        step=step,
+                        phase="validation_token_adapted",
+                        problem=problem,
+                        group=token_query,
+                        verification=token_verification,
+                        max_new_tokens=query_rollouts.max_new_tokens,
+                        eos_token_id=query_rollouts.tokenizer.eos_token_id,
+                    )
                 local_metrics += torch.tensor(
                     (
                         base_verification.correctness.sum().item(),
                         float(base_verification.correctness.numel()),
-                        adapted_verification.correctness.sum().item(),
-                        float(adapted_verification.correctness.numel()),
                         float(torch.any(base_verification.correctness == 1).item()),
-                        float(torch.any(adapted_verification.correctness == 1).item()),
+                        (
+                            0.0
+                            if adapted_verification is None
+                            else adapted_verification.correctness.sum().item()
+                        ),
+                        (
+                            0.0
+                            if adapted_verification is None
+                            else float(adapted_verification.correctness.numel())
+                        ),
+                        (
+                            0.0
+                            if adapted_verification is None
+                            else float(
+                                torch.any(adapted_verification.correctness == 1).item()
+                            )
+                        ),
+                        (
+                            0.0
+                            if token_verification is None
+                            else token_verification.correctness.sum().item()
+                        ),
+                        (
+                            0.0
+                            if token_verification is None
+                            else float(token_verification.correctness.numel())
+                        ),
+                        (
+                            0.0
+                            if token_verification is None
+                            else float(
+                                torch.any(token_verification.correctness == 1).item()
+                            )
+                        ),
                     ),
                     device=accelerator.device,
                     dtype=torch.float64,
@@ -1422,20 +1718,36 @@ def _evaluate(
     record = {}
     if accelerator.is_main_process:
         base_accuracy = (totals[0] / totals[1]).item()
-        adapted_accuracy = (totals[2] / totals[3]).item()
+        sequence_accuracy = (totals[3] / totals[4]).item() if sequence_enabled else 0.0
+        token_accuracy = (totals[6] / totals[7]).item() if token_enabled else 0.0
+        adapted_accuracy = sequence_accuracy if sequence_enabled else token_accuracy
+        adapted_pass = (
+            (totals[5] / len(problems)).item()
+            if sequence_enabled
+            else (totals[8] / len(problems)).item()
+        )
         record = {
             "event": "validation",
             "completed_steps": step,
             "validation/base_accuracy": base_accuracy,
             "validation/adapted_accuracy": adapted_accuracy,
             "validation/accuracy_delta": adapted_accuracy - base_accuracy,
-            "validation/base_pass_at_group": (totals[4] / len(problems)).item(),
-            "validation/adapted_pass_at_group": (totals[5] / len(problems)).item(),
+            "validation/base_pass_at_group": (totals[2] / len(problems)).item(),
+            "validation/adapted_pass_at_group": adapted_pass,
+            "validation/sequence_adapted_accuracy": sequence_accuracy,
+            "validation/sequence_adapted_pass_at_group": (
+                (totals[5] / len(problems)).item() if sequence_enabled else 0.0
+            ),
+            "validation/token_adapted_accuracy": token_accuracy,
+            "validation/token_adapted_pass_at_group": (
+                (totals[8] / len(problems)).item() if token_enabled else 0.0
+            ),
             "validation/num_unique_problems": len(problems),
             "validation/support_group_size": support_rollouts.group_size,
             "validation/query_group_size": query_rollouts.group_size,
             "validation/support_responses": int(totals[1].item()),
-            "validation/query_responses": int(totals[3].item()),
+            "validation/query_responses": int(totals[4].item()),
+            "validation/token_query_responses": int(totals[7].item()),
             "validation/seconds": time.perf_counter() - evaluation_started,
         }
         _append_metric(metrics_path, record)
@@ -1525,6 +1837,12 @@ def main() -> None:
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
         model_kwargs=model_kwargs,
+        enable_sequence_head=(
+            args.meta_coefficient > 0
+            or args.bce_coefficient > 0
+            or args.ranking_coefficient > 0
+        ),
+        enable_token_head=args.token_meta_coefficient > 0,
     )
     confidence_optimizer = torch.optim.AdamW(
         confidence_model.parameters(),
@@ -1619,6 +1937,10 @@ def main() -> None:
         policy_max_tokens_per_micro_batch=(args.policy_max_tokens_per_micro_batch),
         confidence_max_tokens_per_micro_batch=(
             args.confidence_max_tokens_per_micro_batch
+        ),
+        token_jvp_response_micro_batch_size=(args.token_jvp_response_micro_batch_size),
+        token_jvp_logprob_position_chunk_size=(
+            args.token_jvp_logprob_position_chunk_size
         ),
     )
     rollout_kwargs: dict[str, object] = {}
@@ -1722,7 +2044,7 @@ def main() -> None:
         )
         timings = StageTimings.create()
         rollout_microbatches: list[CachedRolloutMicrobatch] = []
-        rollout_totals = torch.zeros(6, dtype=torch.float32, device=accelerator.device)
+        rollout_totals = torch.zeros(9, dtype=torch.float32, device=accelerator.device)
         rollout_problem_batches = _fixed_size_batches(
             problems,
             local_rollout_problem_batch_size,
@@ -1821,144 +2143,154 @@ def main() -> None:
                 torch.cuda.empty_cache()
         del support_groups
 
-        # Compute task adapters in problem batches, then run the complete query
-        # phase through one vLLM wake/sleep lifecycle. Fast parameters and
-        # rollout caches remain CPU-backed between these two phases.
-        generation_fast_parameters = []
-        step_indices.set_postfix_str(
-            f"problems={global_problem_batch_size} stage=generation-adaptation"
-        )
-        with timings.measure("generation_adaptation"):
-            adaptation_progress = tqdm(
-                rollout_microbatches,
-                total=len(rollout_microbatches),
-                desc=f"{batch_prefix} batched generation adaptation",
-                unit="microbatch",
-                leave=True,
-                disable=not accelerator.is_main_process,
-            )
-            for microbatch_index, cached_microbatch in enumerate(adaptation_progress):
-                supports = tuple(
-                    support.to(accelerator.device)
-                    for support in cached_microbatch.supports
-                )
-                generation_adaptations = algorithm.adapt_tasks(
-                    supports,
-                    initial_fast,
-                    differentiable=False,
-                    supervise_confidence=False,
-                    show_progress=False,
-                    progress_prefix=(
-                        f"{batch_prefix} rollout microbatch "
-                        f"{microbatch_index + 1}/{num_problem_micro_batches}"
-                    ),
-                )
-                generation_fast_parameters.extend(
-                    {
-                        name: value.detach().to("cpu")
-                        for name, value in adaptation.fast_parameters.items()
-                    }
-                    for adaptation in generation_adaptations
-                )
-                del supports, generation_adaptations
-
-        if len(generation_fast_parameters) != local_problem_batch_size:
-            raise RuntimeError("Adapted parameter count does not match problem batch.")
-        rollout_fast_parameter_batches = _fixed_size_batches(
-            generation_fast_parameters,
-            local_rollout_problem_batch_size,
-        )
-
-        step_indices.set_postfix_str(
-            f"problems={global_problem_batch_size} stage=query-rollout"
-        )
-        with timings.measure("query_rollout"):
-            query_batches = query_rollouts.generate_batches(
-                rollout_problem_batches,
-                rollout_fast_parameter_batches,
-                show_progress=accelerator.is_main_process,
-                progress_description=f"{batch_prefix} query",
-                seed_batches=_generation_seed_batches(
-                    rollout_problem_batches,
-                    base_seed=args.seed,
-                    step=step,
-                    phase="train_query",
-                    rank=accelerator.process_index,
-                ),
-            )
-        query_groups = tuple(group for batch in query_batches for group in batch)
-        if len(query_groups) != local_problem_batch_size:
-            raise RuntimeError("Query rollout count does not match problem batch.")
-        del generation_fast_parameters, rollout_fast_parameter_batches, query_batches
-
-        # All queries are fixed before the first confidence-model update, so
-        # every outer iteration reuses exactly the same on-policy data.
-        for microbatch_index, cached_microbatch in enumerate(rollout_microbatches):
-            microbatch_prefix = (
-                f"{batch_prefix} rollout microbatch "
-                f"{microbatch_index + 1}/{num_problem_micro_batches}"
-            )
-            start = microbatch_index * local_problem_micro_batch_size
-            end = start + local_problem_micro_batch_size
-            queries = list(query_groups[start:end])
+        def generate_query_branch(*, token_branch: bool) -> None:
+            branch = "token" if token_branch else "sequence"
+            phase = "train_token_query" if token_branch else "train_query"
+            metric_offset = 6 if token_branch else 3
+            timing_prefix = "token_" if token_branch else ""
+            generation_fast_parameters = []
             step_indices.set_postfix_str(
                 f"problems={global_problem_batch_size} "
-                f"microbatch={microbatch_index + 1}/{num_problem_micro_batches} "
-                "stage=query-verifier"
+                f"stage={branch}-generation-adaptation"
             )
-            with timings.measure("query_verifier_and_cache"):
-                for problem_index, (problem, query) in enumerate(
-                    zip(cached_microbatch.problems, queries, strict=True)
+            with timings.measure(f"{timing_prefix}generation_adaptation"):
+                for cached_microbatch in tqdm(
+                    rollout_microbatches,
+                    total=len(rollout_microbatches),
+                    desc=f"{batch_prefix} {branch} generation adaptation",
+                    unit="microbatch",
+                    leave=True,
+                    disable=not accelerator.is_main_process,
                 ):
-                    query_verification = verifier(
-                        query.texts,
-                        problem.ground_truth,
-                        device=query.device,
+                    supports = tuple(
+                        support.to(accelerator.device)
+                        for support in cached_microbatch.supports
                     )
-                    query = query.with_verification(
-                        query_verification.rewards,
-                        query_verification.correctness,
-                    )
-                    if args.outer_kl_coefficient > 0:
-                        query = query_rollouts.add_reference_logprobs(
-                            query,
-                            initial_fast,
-                            show_progress=False,
-                            progress_description=(
-                                f"{microbatch_prefix} query reference "
-                                f"{problem_index + 1}"
-                            ),
+                    adaptations = (
+                        algorithm.adapt_token_tasks(
+                            supports, initial_fast, differentiable=False
                         )
-                    _append_rollout_diagnostics(
-                        rollout_log_path,
-                        step=step,
-                        phase="train_query",
-                        problem=problem,
-                        group=query,
-                        verification=query_verification,
-                        max_new_tokens=query_rollouts.max_new_tokens,
-                        eos_token_id=query_rollouts.tokenizer.eos_token_id,
+                        if token_branch
+                        else algorithm.adapt_tasks(
+                            supports,
+                            initial_fast,
+                            differentiable=False,
+                            supervise_confidence=False,
+                            show_progress=False,
+                        )
                     )
-                    rollout_totals[3] += query.verifier_rewards.sum().to(
-                        accelerator.device
+                    generation_fast_parameters.extend(
+                        {
+                            name: value.detach().to("cpu")
+                            for name, value in adaptation.fast_parameters.items()
+                        }
+                        for adaptation in adaptations
                     )
-                    rollout_totals[4] += query.correctness_labels.sum().to(
-                        accelerator.device
-                    )
-                    rollout_totals[5] += query.group_size
-                    queries[problem_index] = query
-                cached_queries = tuple(_cache_rollout_group(query) for query in queries)
-            rollout_microbatches[microbatch_index] = replace(
-                cached_microbatch,
-                queries=cached_queries,
+                    del supports, adaptations
+            if len(generation_fast_parameters) != local_problem_batch_size:
+                raise RuntimeError(
+                    f"{branch} adapted parameter count does not match problem batch."
+                )
+            fast_batches = _fixed_size_batches(
+                generation_fast_parameters,
+                local_rollout_problem_batch_size,
             )
-            del queries, cached_queries, query, query_verification
-            if accelerator.device.type == "cuda":
-                torch.cuda.empty_cache()
-        del query_groups, rollout_problem_batches
+            step_indices.set_postfix_str(
+                f"problems={global_problem_batch_size} stage={branch}-query-rollout"
+            )
+            with timings.measure(f"{timing_prefix}query_rollout"):
+                generated_batches = query_rollouts.generate_batches(
+                    rollout_problem_batches,
+                    fast_batches,
+                    show_progress=accelerator.is_main_process,
+                    progress_description=f"{batch_prefix} {branch} query",
+                    seed_batches=_generation_seed_batches(
+                        rollout_problem_batches,
+                        base_seed=args.seed,
+                        step=step,
+                        phase=phase,
+                        rank=accelerator.process_index,
+                    ),
+                )
+            query_groups = tuple(
+                group for batch in generated_batches for group in batch
+            )
+            if len(query_groups) != local_problem_batch_size:
+                raise RuntimeError(
+                    f"{branch} query count does not match problem batch."
+                )
+            del generation_fast_parameters, fast_batches, generated_batches
 
-        if any(microbatch.queries is None for microbatch in rollout_microbatches):
-            raise RuntimeError("Query rollout cache is incomplete.")
+            for microbatch_index, cached_microbatch in enumerate(rollout_microbatches):
+                start = microbatch_index * local_problem_micro_batch_size
+                end = start + local_problem_micro_batch_size
+                queries = list(query_groups[start:end])
+                with timings.measure(f"{timing_prefix}query_verifier_and_cache"):
+                    for problem_index, (problem, query) in enumerate(
+                        zip(cached_microbatch.problems, queries, strict=True)
+                    ):
+                        verification = verifier(
+                            query.texts,
+                            problem.ground_truth,
+                            device=query.device,
+                        )
+                        query = query.with_verification(
+                            verification.rewards,
+                            verification.correctness,
+                        )
+                        if args.outer_kl_coefficient > 0:
+                            query = query_rollouts.add_reference_logprobs(
+                                query,
+                                initial_fast,
+                                show_progress=False,
+                            )
+                        _append_rollout_diagnostics(
+                            rollout_log_path,
+                            step=step,
+                            phase=phase,
+                            problem=problem,
+                            group=query,
+                            verification=verification,
+                            max_new_tokens=query_rollouts.max_new_tokens,
+                            eos_token_id=query_rollouts.tokenizer.eos_token_id,
+                        )
+                        rollout_totals[
+                            metric_offset
+                        ] += query.verifier_rewards.sum().to(accelerator.device)
+                        rollout_totals[
+                            metric_offset + 1
+                        ] += query.correctness_labels.sum().to(accelerator.device)
+                        rollout_totals[metric_offset + 2] += query.group_size
+                        queries[problem_index] = query
+                    cached_queries = tuple(
+                        _cache_rollout_group(query) for query in queries
+                    )
+                rollout_microbatches[microbatch_index] = replace(
+                    cached_microbatch,
+                    **(
+                        {"token_queries": cached_queries}
+                        if token_branch
+                        else {"queries": cached_queries}
+                    ),
+                )
+                if accelerator.device.type == "cuda":
+                    torch.cuda.empty_cache()
+            del query_groups
+
+        if args.meta_coefficient > 0:
+            generate_query_branch(token_branch=False)
+        if args.token_meta_coefficient > 0:
+            generate_query_branch(token_branch=True)
+        del rollout_problem_batches
+
+        if args.meta_coefficient > 0 and any(
+            microbatch.queries is None for microbatch in rollout_microbatches
+        ):
+            raise RuntimeError("Sequence query rollout cache is incomplete.")
+        if args.token_meta_coefficient > 0 and any(
+            microbatch.token_queries is None for microbatch in rollout_microbatches
+        ):
+            raise RuntimeError("Token query rollout cache is incomplete.")
         if accelerator.is_main_process:
             timing_record = {
                 "event": "pipeline_timing",
@@ -1980,13 +2312,32 @@ def main() -> None:
                         rollout_totals[0] / rollout_totals[2]
                     ).item(),
                     "support_accuracy": (rollout_totals[1] / rollout_totals[2]).item(),
-                    "query_mean_reward": (rollout_totals[3] / rollout_totals[5]).item(),
-                    "query_accuracy": (rollout_totals[4] / rollout_totals[5]).item(),
+                    "query_mean_reward": (
+                        (rollout_totals[3] / rollout_totals[5]).item()
+                        if args.meta_coefficient > 0
+                        else 0.0
+                    ),
+                    "query_accuracy": (
+                        (rollout_totals[4] / rollout_totals[5]).item()
+                        if args.meta_coefficient > 0
+                        else 0.0
+                    ),
+                    "token_query_mean_reward": (
+                        (rollout_totals[6] / rollout_totals[8]).item()
+                        if args.token_meta_coefficient > 0
+                        else 0.0
+                    ),
+                    "token_query_accuracy": (
+                        (rollout_totals[7] / rollout_totals[8]).item()
+                        if args.token_meta_coefficient > 0
+                        else 0.0
+                    ),
                     "num_problems": global_problem_batch_size,
                     "problem_micro_batch_size": global_problem_micro_batch_size,
                     "rollout_problem_batch_size": global_rollout_problem_batch_size,
                     "support_responses": int(rollout_totals[2].item()),
                     "query_responses": int(rollout_totals[5].item()),
+                    "token_query_responses": int(rollout_totals[8].item()),
                     "timing_seconds": dict(timings.values),
                 }
                 _append_metric(metrics_path, rollout_record)
@@ -2113,22 +2464,34 @@ def main() -> None:
                     "rollout_problem_batch_size": global_rollout_problem_batch_size,
                     "loss": metrics[0].item(),
                     "meta_loss": metrics[1].item(),
-                    "bce": metrics[2].item(),
-                    "ranking": metrics[3].item(),
-                    "outer_clip_fraction": metrics[4].item(),
-                    "inner_clip_fraction": metrics[5].item(),
-                    "support_reward": metrics[6].item(),
-                    "query_reward": metrics[7].item(),
-                    "support_accuracy": metrics[8].item(),
-                    "query_accuracy": metrics[9].item(),
-                    "outer_mean_kl": metrics[10].item(),
-                    "inner_mean_kl": metrics[11].item(),
-                    "confidence_probability_mean": metrics[12].item(),
+                    "token_meta_loss": metrics[2].item(),
+                    "bce": metrics[3].item(),
+                    "ranking": metrics[4].item(),
+                    "outer_clip_fraction": metrics[5].item(),
+                    "token_outer_clip_fraction": metrics[6].item(),
+                    "inner_clip_fraction": metrics[7].item(),
+                    "token_inner_clip_fraction": metrics[8].item(),
+                    "support_reward": metrics[9].item(),
+                    "query_reward": metrics[10].item(),
+                    "token_query_reward": metrics[11].item(),
+                    "support_accuracy": metrics[12].item(),
+                    "query_accuracy": metrics[13].item(),
+                    "token_query_accuracy": metrics[14].item(),
+                    "outer_mean_kl": metrics[15].item(),
+                    "token_outer_mean_kl": metrics[16].item(),
+                    "inner_mean_kl": metrics[17].item(),
+                    "token_inner_mean_kl": metrics[18].item(),
+                    "confidence_probability_mean": metrics[19].item(),
                     "confidence_probability_std": torch.sqrt(
-                        torch.clamp(metrics[13] - metrics[12].square(), min=0)
+                        torch.clamp(metrics[20] - metrics[19].square(), min=0)
                     ).item(),
-                    "support_pass_at_group": metrics[14].item(),
-                    "query_pass_at_group": metrics[15].item(),
+                    "token_confidence_probability_mean": metrics[21].item(),
+                    "token_confidence_probability_std": torch.sqrt(
+                        torch.clamp(metrics[22] - metrics[21].square(), min=0)
+                    ).item(),
+                    "support_pass_at_group": metrics[23].item(),
+                    "query_pass_at_group": metrics[24].item(),
+                    "token_query_pass_at_group": metrics[25].item(),
                     "confidence_gradient_norm": reduced_gradient_norm.item(),
                     "confidence_learning_rate": confidence_optimizer.param_groups[0][
                         "lr"
@@ -2137,7 +2500,14 @@ def main() -> None:
                         global_problem_batch_size * args.support_group_size
                     ),
                     "query_responses": (
-                        global_problem_batch_size * args.query_group_size
+                        global_problem_batch_size
+                        * args.query_group_size
+                        * int(args.meta_coefficient > 0)
+                    ),
+                    "token_query_responses": (
+                        global_problem_batch_size
+                        * args.query_group_size
+                        * int(args.token_meta_coefficient > 0)
                     ),
                     "timing_seconds": dict(timings.values),
                     **component_gradient_norms,

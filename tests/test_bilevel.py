@@ -22,6 +22,8 @@ from meta_rlvr.functional import (
     token_logprobs,
     trainable_parameter_state,
 )
+from meta_rlvr.losses import token_grpo_policy_loss, token_group_advantages
+from meta_rlvr.optim import fast_optimizer_step, initial_fast_optimizer_state
 from meta_rlvr.train import (
     CachedRolloutMicrobatch,
     _accumulate_outer_batch,
@@ -148,17 +150,162 @@ def test_meta_loss_backpropagates_through_inner_update_to_confidence() -> None:
         allow_unused=True,
     )
     assert any(
-        gradient is not None and torch.any(gradient != 0)
-        for gradient in gradients
+        gradient is not None and torch.any(gradient != 0) for gradient in gradients
     )
+
+
+def test_token_meta_loss_backpropagates_through_exact_jvp() -> None:
+    torch.manual_seed(41)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(),
+        hidden_size=5,
+        enable_sequence_head=False,
+        enable_token_head=True,
+    )
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    query = make_group(policy, torch.tensor([0.0, 1.0, 1.0]))
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(
+            num_iterations=1,
+            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+        ),
+        meta_config=MetaLossConfig(
+            meta_coefficient=0.0,
+            token_meta_coefficient=1.0,
+            confidence=ConfidenceLossConfig(
+                bce_coefficient=0.0,
+                ranking_coefficient=0.0,
+            ),
+        ),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+        token_jvp_response_micro_batch_size=2,
+    )
+    output = algorithm.token_outer_losses_batch((support,), (query,), initial_fast)[0]
+    gradients = torch.autograd.grad(
+        output.loss,
+        tuple(confidence.parameters()),
+        allow_unused=True,
+    )
+    assert confidence.score is None
+    assert any(
+        gradient is not None and torch.any(gradient != 0) for gradient in gradients
+    )
+
+
+def test_token_first_order_operator_has_standard_grpo_update_value() -> None:
+    torch.manual_seed(43)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(),
+        hidden_size=5,
+        enable_sequence_head=False,
+        enable_token_head=True,
+    )
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    inner = InnerLoopConfig(
+        num_iterations=1,
+        optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+    )
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=inner,
+        meta_config=MetaLossConfig(
+            meta_coefficient=0.0,
+            token_meta_coefficient=1.0,
+        ),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+        policy_micro_batch_size=3,
+    )
+    adaptation = algorithm.adapt_token_task(support, initial_fast, differentiable=True)
+
+    logits = confidence(
+        support.input_ids,
+        support.attention_mask,
+        output="token",
+    )
+    advantages = token_group_advantages(
+        torch.sigmoid(logits),
+        support.completion_mask,
+        inner.advantage,
+    )
+    current = token_logprobs(
+        policy,
+        support,
+        fast_parameters=initial_fast,
+    )
+    direct_loss = token_grpo_policy_loss(
+        current,
+        support.old_logprobs,
+        support.completion_mask,
+        advantages,
+        inner.grpo,
+        reference_logprobs=support.reference_logprobs,
+    )
+    names = tuple(initial_fast)
+    direct_gradients = torch.autograd.grad(
+        direct_loss.loss,
+        tuple(initial_fast[name] for name in names),
+    )
+    expected, _ = fast_optimizer_step(
+        initial_fast,
+        dict(zip(names, direct_gradients, strict=True)),
+        initial_fast_optimizer_state(initial_fast, inner.optimizer),
+        inner.optimizer,
+    )
+    for name in names:
+        torch.testing.assert_close(
+            adaptation.fast_parameters[name].detach(),
+            expected[name].detach(),
+        )
+
+
+def test_sequence_only_path_never_invokes_token_jvp(monkeypatch) -> None:
+    torch.manual_seed(47)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    query = make_group(policy, torch.tensor([0.0, 1.0, 1.0]))
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("disabled token JVP was evaluated")
+
+    monkeypatch.setattr(torch.func, "jvp", unexpected)
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(
+            num_iterations=1,
+            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+        ),
+        meta_config=MetaLossConfig(
+            meta_coefficient=1.0,
+            token_meta_coefficient=0.0,
+            confidence=ConfidenceLossConfig(
+                bce_coefficient=0.0,
+                ranking_coefficient=0.0,
+            ),
+        ),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+    )
+    output = algorithm.outer_loss(support, query, initial_fast)
+    output.loss.backward()
+    assert confidence.token_score is None
 
 
 def test_first_order_inner_update_has_same_value_as_direct_policy_gradient() -> None:
     torch.manual_seed(9)
     policy = ToyPolicy()
-    confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5
-    )
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
     initial_fast = trainable_parameter_state(policy)
     support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
     support = replace(
@@ -192,9 +339,7 @@ def test_first_order_inner_update_has_same_value_as_direct_policy_gradient() -> 
             query_advantage_config=AdvantageConfig(),
             query_grpo_config=GRPOLossConfig(),
         )
-        first_order = algorithm.adapt_task(
-            support, initial_fast, differentiable=True
-        )
+        first_order = algorithm.adapt_task(support, initial_fast, differentiable=True)
         exact_algorithm = BilevelGRPO(
             policy=policy,
             confidence_model=confidence,
@@ -206,9 +351,7 @@ def test_first_order_inner_update_has_same_value_as_direct_policy_gradient() -> 
             query_advantage_config=AdvantageConfig(),
             query_grpo_config=GRPOLossConfig(),
         )
-        direct = exact_algorithm.adapt_task(
-            support, initial_fast, differentiable=True
-        )
+        direct = exact_algorithm.adapt_task(support, initial_fast, differentiable=True)
         for name in first_order.fast_parameters:
             torch.testing.assert_close(
                 first_order.fast_parameters[name].detach(),
@@ -219,9 +362,7 @@ def test_first_order_inner_update_has_same_value_as_direct_policy_gradient() -> 
 def test_first_order_vjp_forward_batch_preserves_update_and_meta_gradient() -> None:
     torch.manual_seed(13)
     policy = ToyPolicy()
-    confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5
-    )
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
     initial_fast = trainable_parameter_state(policy)
     support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
     query = make_group(policy, torch.tensor([0.0, 1.0, 1.0]))
@@ -243,16 +384,12 @@ def test_first_order_vjp_forward_batch_preserves_update_and_meta_gradient() -> N
             first_order_vjp_forward_batch_size=vjp_forward_batch_size,
         )
 
-    serial_output = build_algorithm(1).outer_loss(
-        support, query, initial_fast
-    )
+    serial_output = build_algorithm(1).outer_loss(support, query, initial_fast)
     serial_gradients = torch.autograd.grad(
         serial_output.loss,
         tuple(confidence.parameters()),
     )
-    packed_output = build_algorithm(3).outer_loss(
-        support, query, initial_fast
-    )
+    packed_output = build_algorithm(3).outer_loss(support, query, initial_fast)
     packed_gradients = torch.autograd.grad(
         packed_output.loss,
         tuple(confidence.parameters()),
@@ -273,8 +410,14 @@ def test_first_order_vjp_forward_batch_preserves_update_and_meta_gradient() -> N
 def test_task_adapters_start_from_independent_fast_parameter_copies() -> None:
     policy = ToyPolicy()
     state = trainable_parameter_state(policy)
-    first = {name: value.detach().clone().requires_grad_(True) for name, value in state.items()}
-    second = {name: value.detach().clone().requires_grad_(True) for name, value in state.items()}
+    first = {
+        name: value.detach().clone().requires_grad_(True)
+        for name, value in state.items()
+    }
+    second = {
+        name: value.detach().clone().requires_grad_(True)
+        for name, value in state.items()
+    }
     with torch.no_grad():
         first["adapter"].add_(1.0)
     assert not torch.equal(first["adapter"], second["adapter"])
@@ -283,9 +426,7 @@ def test_task_adapters_start_from_independent_fast_parameter_copies() -> None:
 
 def test_inference_adaptation_does_not_require_verifier_labels() -> None:
     policy = ToyPolicy()
-    confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5
-    )
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
     support = replace(
         make_group(policy, torch.tensor([1.0, 0.0, 0.0])),
         verifier_rewards=None,
@@ -314,9 +455,7 @@ def test_inference_adaptation_does_not_require_verifier_labels() -> None:
 def test_batched_generation_adaptation_matches_single_response_updates() -> None:
     torch.manual_seed(21)
     policy = ToyPolicy()
-    confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5
-    )
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
     support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
     initial_fast = trainable_parameter_state(policy)
 
@@ -356,9 +495,7 @@ def test_batched_generation_adaptation_matches_single_response_updates() -> None
 def test_continued_adaptation_preserves_fast_adam_state() -> None:
     torch.manual_seed(23)
     policy = ToyPolicy()
-    confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5
-    )
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
     support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
     initial_fast = trainable_parameter_state(policy)
 
@@ -449,9 +586,7 @@ def test_token_aware_microbatches_trim_padding_without_changing_logprobs() -> No
         max_tokens_per_micro_batch=8,
         activation_checkpointing=False,
     )
-    assert sequence_microbatches(
-        group, max_sequences=3, max_tokens=8
-    ) == ((0,), (2, 1))
+    assert sequence_microbatches(group, max_sequences=3, max_tokens=8) == ((0,), (2, 1))
     torch.testing.assert_close(actual, expected)
 
 
@@ -465,9 +600,7 @@ def test_selected_policy_logits_match_full_vocabulary_projection() -> None:
             return_dict,
             logits_to_keep=None,
         ):
-            outputs = super().forward(
-                input_ids, attention_mask, use_cache, return_dict
-            )
+            outputs = super().forward(input_ids, attention_mask, use_cache, return_dict)
             if logits_to_keep is not None:
                 outputs.logits = outputs.logits.index_select(1, logits_to_keep)
             return outputs
@@ -516,9 +649,7 @@ def test_position_chunked_logprobs_preserve_forward_jvp() -> None:
 
 def test_confidence_scoring_batches_responses_across_problems() -> None:
     policy = ToyPolicy()
-    confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5
-    )
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
     first = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
     second = make_group(policy, torch.tensor([0.0, 1.0, 0.0]))
     algorithm = BilevelGRPO(
@@ -599,9 +730,7 @@ def _parameter_gradient_norm(
 def test_component_gradient_norms_are_exact_and_leave_no_gradients() -> None:
     torch.manual_seed(12)
     policy = ToyPolicy()
-    confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5
-    )
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
     initial_fast = trainable_parameter_state(policy)
     support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
     query = make_group(policy, torch.tensor([0.0, 1.0, 0.0]))
@@ -727,9 +856,7 @@ def test_component_gradient_norms_skip_zero_coefficient_losses() -> None:
 def test_problem_microbatch_accumulation_matches_full_batch_gradient() -> None:
     torch.manual_seed(16)
     policy = ToyPolicy()
-    confidence = SequenceConfidenceModel(
-        ToyConfidenceBackbone(), hidden_size=5
-    )
+    confidence = SequenceConfidenceModel(ToyConfidenceBackbone(), hidden_size=5)
     initial_fast = trainable_parameter_state(policy)
     supports = (
         make_group(policy, torch.tensor([1.0, 0.0, 1.0])),
@@ -755,7 +882,7 @@ def test_problem_microbatch_accumulation_matches_full_batch_gradient() -> None:
         query_grpo_config=GRPOLossConfig(),
     )
     parameters = tuple(confidence.parameters())
-    expected_metrics = torch.zeros(10)
+    expected_metrics = torch.zeros(26)
     for support, query in zip(supports, queries, strict=True):
         output = algorithm.outer_loss(support, query, initial_fast)
         (output.loss / len(supports)).backward()
@@ -763,14 +890,30 @@ def test_problem_microbatch_accumulation_matches_full_batch_gradient() -> None:
             (
                 output.loss.detach(),
                 output.meta_grpo.loss.detach(),
+                torch.tensor(0.0),
                 output.adaptation.confidence_loss.bce.detach(),
                 output.adaptation.confidence_loss.ranking.detach(),
                 output.meta_grpo.clip_fraction.detach(),
+                torch.tensor(0.0),
                 output.adaptation.inner_losses[-1].clip_fraction.detach(),
+                torch.tensor(0.0),
                 support.verifier_rewards.mean(),
                 query.verifier_rewards.mean(),
+                torch.tensor(0.0),
                 support.correctness_labels.mean(),
                 query.correctness_labels.mean(),
+                torch.tensor(0.0),
+                output.meta_grpo.mean_kl.detach(),
+                torch.tensor(0.0),
+                output.adaptation.inner_losses[-1].mean_kl.detach(),
+                torch.tensor(0.0),
+                output.adaptation.confidence_probabilities.detach().mean(),
+                output.adaptation.confidence_probabilities.detach().square().mean(),
+                torch.tensor(0.0),
+                torch.tensor(0.0),
+                torch.any(support.correctness_labels == 1).float(),
+                torch.any(query.correctness_labels == 1).float(),
+                torch.tensor(0.0),
             )
         )
     expected_gradients = tuple(
@@ -804,5 +947,73 @@ def test_problem_microbatch_accumulation_matches_full_batch_gradient() -> None:
     torch.testing.assert_close(actual_metrics, expected_metrics)
     for parameter, expected_gradient in zip(
         parameters, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(parameter.grad, expected_gradient)
+
+
+def test_combined_sequence_and_token_meta_losses_accumulate_independently() -> None:
+    torch.manual_seed(53)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(),
+        hidden_size=5,
+        enable_sequence_head=True,
+        enable_token_head=True,
+    )
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    sequence_query = make_group(policy, torch.tensor([0.0, 1.0, 1.0]))
+    token_query = make_group(policy, torch.tensor([1.0, 1.0, 0.0]))
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(
+            num_iterations=1,
+            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+        ),
+        meta_config=MetaLossConfig(
+            meta_coefficient=0.3,
+            token_meta_coefficient=0.7,
+            confidence=ConfidenceLossConfig(
+                bce_coefficient=0.0,
+                ranking_coefficient=0.0,
+            ),
+        ),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+        token_jvp_response_micro_batch_size=2,
+    )
+    sequence_output = algorithm.outer_loss(support, sequence_query, initial_fast)
+    token_output = algorithm.token_outer_losses_batch(
+        (support,), (token_query,), initial_fast
+    )[0]
+    expected_loss = sequence_output.loss + token_output.loss
+    expected_loss.backward()
+    expected_gradients = tuple(
+        parameter.grad.detach().clone() for parameter in confidence.parameters()
+    )
+    confidence.zero_grad(set_to_none=True)
+
+    metrics = _accumulate_outer_batch(
+        algorithm=algorithm,
+        rollout_microbatches=[
+            CachedRolloutMicrobatch(
+                problems=(_problem("combined"),),
+                supports=(support,),
+                queries=(sequence_query,),
+                token_queries=(token_query,),
+            )
+        ],
+        local_problem_batch_size=1,
+        initial_fast=initial_fast,
+        accelerator=CPUAccelerator(),
+        confidence_model=confidence,
+        progress_description="combined",
+    )
+    torch.testing.assert_close(metrics[0], expected_loss.detach())
+    torch.testing.assert_close(metrics[1], sequence_output.meta_grpo.loss.detach())
+    torch.testing.assert_close(metrics[2], token_output.meta_grpo.loss.detach())
+    for parameter, expected_gradient in zip(
+        confidence.parameters(), expected_gradients, strict=True
     ):
         torch.testing.assert_close(parameter.grad, expected_gradient)

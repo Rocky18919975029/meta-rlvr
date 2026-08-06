@@ -26,9 +26,7 @@ class AdvantageConfig:
             raise ValueError("std_epsilon must be positive.")
         if self.scale == "floored_group_std":
             if self.std_floor is None or self.std_floor <= 0:
-                raise ValueError(
-                    "floored_group_std requires a positive std_floor."
-                )
+                raise ValueError("floored_group_std requires a positive std_floor.")
         elif self.std_floor is not None:
             raise ValueError("std_floor is only valid for floored_group_std.")
 
@@ -98,7 +96,8 @@ class ConfidenceLossConfig:
 class MetaLossConfig:
     meta_coefficient: float = 1.0
     confidence: ConfidenceLossConfig = field(default_factory=ConfidenceLossConfig)
+    token_meta_coefficient: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.meta_coefficient < 0:
-            raise ValueError("meta_coefficient must be non-negative.")
+        if self.meta_coefficient < 0 or self.token_meta_coefficient < 0:
+            raise ValueError("Meta loss coefficients must be non-negative.")
