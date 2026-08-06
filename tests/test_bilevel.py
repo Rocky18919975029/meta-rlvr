@@ -483,6 +483,37 @@ def test_selected_policy_logits_match_full_vocabulary_projection() -> None:
     )
 
 
+def test_position_chunked_logprobs_preserve_forward_jvp() -> None:
+    torch.manual_seed(23)
+    policy = ToyPolicy()
+    group = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    fast = trainable_parameter_state(policy)
+    names = tuple(fast)
+    primals = tuple(fast[name].detach() for name in names)
+    tangents = tuple(torch.randn_like(value) for value in primals)
+
+    def logprobs(position_chunk_size, *parameter_values):
+        return token_logprobs(
+            policy,
+            group,
+            fast_parameters=dict(zip(names, parameter_values, strict=True)),
+            logprob_position_chunk_size=position_chunk_size,
+        )
+
+    full_primal, full_tangent = torch.func.jvp(
+        lambda *values: logprobs(None, *values),
+        primals,
+        tangents,
+    )
+    chunked_primal, chunked_tangent = torch.func.jvp(
+        lambda *values: logprobs(1, *values),
+        primals,
+        tangents,
+    )
+    torch.testing.assert_close(chunked_primal, full_primal)
+    torch.testing.assert_close(chunked_tangent, full_tangent)
+
+
 def test_confidence_scoring_batches_responses_across_problems() -> None:
     policy = ToyPolicy()
     confidence = SequenceConfidenceModel(

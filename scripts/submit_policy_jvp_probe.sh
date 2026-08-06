@@ -9,6 +9,7 @@ export JVP_ATTN_IMPLEMENTATION="${JVP_ATTN_IMPLEMENTATION:-sdpa}"
 export JVP_MAX_SEQUENCE_LENGTH="${JVP_MAX_SEQUENCE_LENGTH:-64}"
 export JVP_GROUP_SIZE="${JVP_GROUP_SIZE:-2}"
 export JVP_RESPONSE_MICRO_BATCH_SIZE="${JVP_RESPONSE_MICRO_BATCH_SIZE:-2}"
+export JVP_LOGPROB_POSITION_CHUNK_SIZE="${JVP_LOGPROB_POSITION_CHUNK_SIZE:-}"
 export JVP_SKIP_DUALITY_CHECK="${JVP_SKIP_DUALITY_CHECK:-0}"
 export JVP_SEED="${JVP_SEED:-42}"
 
@@ -40,7 +41,7 @@ submission=$(sbatch \
 job_id="${submission##* }"
 
 echo "${submission}"
-echo "configuration: gpu=1 attn=${JVP_ATTN_IMPLEMENTATION} sequence_length=${JVP_MAX_SEQUENCE_LENGTH} group_size=${JVP_GROUP_SIZE} response_micro_batch=${JVP_RESPONSE_MICRO_BATCH_SIZE} skip_duality=${JVP_SKIP_DUALITY_CHECK}"
+echo "configuration: gpu=1 attn=${JVP_ATTN_IMPLEMENTATION} sequence_length=${JVP_MAX_SEQUENCE_LENGTH} group_size=${JVP_GROUP_SIZE} response_micro_batch=${JVP_RESPONSE_MICRO_BATCH_SIZE} logprob_position_chunk=${JVP_LOGPROB_POSITION_CHUNK_SIZE:-none} skip_duality=${JVP_SKIP_DUALITY_CHECK}"
 echo "stdout: ${META_RLVR_PROJECT_DIR}/logs/policy-jvp-probe-${job_id}.out"
 echo "stderr: ${META_RLVR_PROJECT_DIR}/logs/policy-jvp-probe-${job_id}.err"
 echo "queue: squeue -j ${job_id}"

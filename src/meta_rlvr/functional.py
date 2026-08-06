@@ -115,7 +115,13 @@ def token_logprobs(
     row_end: int | None = None,
     row_indices: tuple[int, ...] | None = None,
     activation_checkpointing: bool = False,
+    logprob_position_chunk_size: int | None = None,
 ) -> Tensor:
+    if (
+        logprob_position_chunk_size is not None
+        and logprob_position_chunk_size <= 0
+    ):
+        raise ValueError("logprob_position_chunk_size must be positive.")
     if row_indices is not None:
         if row_start != 0 or row_end is not None:
             raise ValueError("row_indices cannot be combined with a row interval.")
@@ -196,12 +202,24 @@ def token_logprobs(
                 "the requested completion positions."
             )
 
-        next_token_logits = completion_logits.float()
         next_tokens = input_ids.index_select(1, prediction_positions + 1)
-        selected_logits = next_token_logits.gather(
-            -1, next_tokens.unsqueeze(-1)
-        ).squeeze(-1)
-        return selected_logits - torch.logsumexp(next_token_logits, dim=-1)
+        position_chunk_size = (
+            completion_logits.shape[1]
+            if logprob_position_chunk_size is None
+            else logprob_position_chunk_size
+        )
+        selected_logprob_chunks = []
+        for start in range(0, completion_logits.shape[1], position_chunk_size):
+            end = min(start + position_chunk_size, completion_logits.shape[1])
+            logits_chunk = completion_logits[:, start:end].float()
+            token_chunk = next_tokens[:, start:end]
+            selected_logits = logits_chunk.gather(
+                -1, token_chunk.unsqueeze(-1)
+            ).squeeze(-1)
+            selected_logprob_chunks.append(
+                selected_logits - torch.logsumexp(logits_chunk, dim=-1)
+            )
+        return torch.cat(selected_logprob_chunks, dim=1)
 
     if fast_parameters is None:
         if activation_checkpointing:

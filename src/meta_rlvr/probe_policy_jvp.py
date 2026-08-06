@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-sequence-length", type=int, default=64)
     parser.add_argument("--group-size", type=int, default=2)
     parser.add_argument("--response-micro-batch-size", type=int, default=2)
+    parser.add_argument("--logprob-position-chunk-size", type=int)
     parser.add_argument("--skip-duality-check", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--duality-relative-tolerance", type=float, default=0.05)
@@ -121,6 +122,11 @@ def main() -> None:
         raise ValueError(
             "response_micro_batch_size must be between 1 and group_size."
         )
+    if (
+        args.logprob_position_chunk_size is not None
+        and args.logprob_position_chunk_size <= 0
+    ):
+        raise ValueError("logprob_position_chunk_size must be positive.")
     if args.duality_relative_tolerance <= 0:
         raise ValueError("duality_relative_tolerance must be positive.")
 
@@ -179,6 +185,7 @@ def main() -> None:
             row_start=row_start,
             row_end=row_end,
             activation_checkpointing=False,
+            logprob_position_chunk_size=args.logprob_position_chunk_size,
         )
 
     row_intervals = tuple(
@@ -293,6 +300,7 @@ def main() -> None:
         "sequence_tokens": int(group.input_ids.shape[1]),
         "group_size": args.group_size,
         "response_micro_batch_size": args.response_micro_batch_size,
+        "logprob_position_chunk_size": args.logprob_position_chunk_size,
         "jvp_microbatches": len(row_intervals),
         "completion_tokens": int(group.completion_mask[0].sum().item()),
         "total_completion_tokens": int(group.completion_mask.sum().item()),

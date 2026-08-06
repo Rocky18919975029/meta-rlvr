@@ -23,6 +23,11 @@ PROBE_ARGS=(
   --response-micro-batch-size "${JVP_RESPONSE_MICRO_BATCH_SIZE}"
   --seed "${JVP_SEED}"
 )
+if [[ -n "${JVP_LOGPROB_POSITION_CHUNK_SIZE}" ]]; then
+  PROBE_ARGS+=(
+    --logprob-position-chunk-size "${JVP_LOGPROB_POSITION_CHUNK_SIZE}"
+  )
+fi
 if [[ "${JVP_SKIP_DUALITY_CHECK}" == "1" ]]; then
   PROBE_ARGS+=(--skip-duality-check)
 elif [[ "${JVP_SKIP_DUALITY_CHECK}" != "0" ]]; then
