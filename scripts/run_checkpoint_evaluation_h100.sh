@@ -65,6 +65,7 @@ setsid accelerate launch \
   --model "${META_RLVR_MODEL_PATH}" \
   --vllm-base-urls "${META_RLVR_VLLM_BASE_URLS}" \
   --support-group-size "${EVAL_SUPPORT_GROUP_SIZE:-16}" \
+  --adaptation-rounds "${EVAL_ADAPTATION_ROUNDS:-1}" \
   --base-query-group-size "${EVAL_BASE_QUERY_GROUP_SIZE:-32}" \
   --adapted-query-group-size "${EVAL_ADAPTED_QUERY_GROUP_SIZE:-32}" \
   --seed "${EVAL_SEED:-42}" \

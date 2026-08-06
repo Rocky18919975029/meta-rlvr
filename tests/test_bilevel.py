@@ -353,6 +353,62 @@ def test_batched_generation_adaptation_matches_single_response_updates() -> None
         )
 
 
+def test_continued_adaptation_preserves_fast_adam_state() -> None:
+    torch.manual_seed(23)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(), hidden_size=5
+    )
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    initial_fast = trainable_parameter_state(policy)
+
+    def build_algorithm(iterations: int) -> BilevelGRPO:
+        return BilevelGRPO(
+            policy=policy,
+            confidence_model=confidence,
+            inner_config=InnerLoopConfig(
+                num_iterations=iterations,
+                optimizer=FastOptimizerConfig(name="adamw", learning_rate=0.01),
+            ),
+            meta_config=MetaLossConfig(),
+            query_advantage_config=AdvantageConfig(),
+            query_grpo_config=GRPOLossConfig(),
+        )
+
+    first_round = build_algorithm(2).adapt_task(
+        support,
+        initial_fast,
+        differentiable=False,
+        supervise_confidence=False,
+    )
+    second_round = build_algorithm(2).continue_adapt_tasks(
+        (support,),
+        (first_round.fast_parameters,),
+        (first_round.optimizer_state,),
+    )[0]
+    direct = build_algorithm(4).adapt_task(
+        support,
+        initial_fast,
+        differentiable=False,
+        supervise_confidence=False,
+    )
+
+    assert first_round.optimizer_state.step == 2
+    assert second_round.optimizer_state.step == 4
+    for name in direct.fast_parameters:
+        torch.testing.assert_close(
+            second_round.fast_parameters[name], direct.fast_parameters[name]
+        )
+        torch.testing.assert_close(
+            second_round.optimizer_state.first_moment[name],
+            direct.optimizer_state.first_moment[name],
+        )
+        torch.testing.assert_close(
+            second_round.optimizer_state.second_moment[name],
+            direct.optimizer_state.second_moment[name],
+        )
+
+
 def test_token_aware_microbatches_trim_padding_without_changing_logprobs() -> None:
     policy = ToyPolicy()
     input_ids = torch.tensor(

@@ -26,13 +26,18 @@ from .losses import (
     group_advantages,
     grpo_policy_loss,
 )
-from .optim import fast_optimizer_step, initial_fast_optimizer_state
+from .optim import (
+    FastOptimizerState,
+    fast_optimizer_step,
+    initial_fast_optimizer_state,
+)
 from .types import RolloutGroup
 
 
 @dataclass(frozen=True)
 class TaskAdaptation:
     fast_parameters: ParameterDict
+    optimizer_state: FastOptimizerState
     confidence_logits: Tensor
     confidence_probabilities: Tensor
     confidence_loss: ConfidenceLossOutput | None
@@ -603,12 +608,70 @@ class BilevelGRPO:
             )
         return tuple(outputs)
 
+    def continue_adapt_tasks(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        initial_fast_parameter_groups: tuple[Mapping[str, Tensor], ...],
+        initial_optimizer_states: tuple[FastOptimizerState, ...],
+        *,
+        show_progress: bool = False,
+        progress_prefix: str = "adaptation",
+    ) -> tuple[TaskAdaptation, ...]:
+        """Continue non-differentiable task adaptation across on-policy rounds."""
+        if not supports:
+            raise ValueError("Task adaptation requires at least one support group.")
+        if not (
+            len(supports)
+            == len(initial_fast_parameter_groups)
+            == len(initial_optimizer_states)
+        ):
+            raise ValueError(
+                "Every support must have one fast-parameter and optimizer state."
+            )
+        confidence_logits_batch = self._confidence_logits_batch(
+            supports,
+            differentiable=False,
+            show_progress=show_progress,
+            progress_description=f"{progress_prefix}: confidence scoring",
+        )
+        return tuple(
+            self._adapt_task_from_confidence_logits(
+                support,
+                confidence_logits,
+                fast_parameters,
+                initial_optimizer_state=optimizer_state,
+                differentiable=False,
+                supervise_confidence=False,
+                show_progress=show_progress and len(supports) == 1,
+                progress_prefix=(
+                    progress_prefix
+                    if len(supports) == 1
+                    else f"{progress_prefix} problem {problem_index + 1}"
+                ),
+            )
+            for problem_index, (
+                support,
+                confidence_logits,
+                fast_parameters,
+                optimizer_state,
+            ) in enumerate(
+                zip(
+                    supports,
+                    confidence_logits_batch,
+                    initial_fast_parameter_groups,
+                    initial_optimizer_states,
+                    strict=True,
+                )
+            )
+        )
+
     def _adapt_task_from_confidence_logits(
         self,
         support: RolloutGroup,
         confidence_logits: Tensor,
         initial_fast_parameters: Mapping[str, Tensor],
         *,
+        initial_optimizer_state: FastOptimizerState | None = None,
         differentiable: bool,
         supervise_confidence: bool,
         show_progress: bool,
@@ -647,10 +710,23 @@ class BilevelGRPO:
         )
 
         fast_parameters = clone_fast_parameters(initial_fast_parameters)
-        optimizer_state = initial_fast_optimizer_state(
-            fast_parameters,
-            self.inner_config.optimizer,
-        )
+        if initial_optimizer_state is None:
+            optimizer_state = initial_fast_optimizer_state(
+                fast_parameters,
+                self.inner_config.optimizer,
+            )
+        else:
+            optimizer_state = FastOptimizerState(
+                step=initial_optimizer_state.step,
+                first_moment={
+                    name: value.detach().clone()
+                    for name, value in initial_optimizer_state.first_moment.items()
+                },
+                second_moment={
+                    name: value.detach().clone()
+                    for name, value in initial_optimizer_state.second_moment.items()
+                },
+            )
         inner_outputs: list[GRPOLossOutput] = []
 
         for inner_iteration in range(self.inner_config.num_iterations):
@@ -733,6 +809,7 @@ class BilevelGRPO:
 
         return TaskAdaptation(
             fast_parameters=fast_parameters,
+            optimizer_state=optimizer_state,
             confidence_logits=confidence_logits,
             confidence_probabilities=confidence_probabilities,
             confidence_loss=confidence_loss,

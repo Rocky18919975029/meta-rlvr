@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 from .bilevel import BilevelGRPO
 from .data import MathProblem, load_semantically_unique_dapo_problems
 from .models import load_confidence_model, load_policy_with_lora
+from .optim import FastOptimizerState
 from .rollout import VLLMHybridRolloutEngine
 from .train import (
     _configs,
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-problems", type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--inner-iterations", type=int)
+    parser.add_argument("--adaptation-rounds", type=int, default=1)
     parser.add_argument("--inner-learning-rate", type=float)
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--local-rollout-batch-size", type=int, default=8)
@@ -57,6 +59,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "adapted_query_group_size": args.adapted_query_group_size,
         "local_rollout_batch_size": args.local_rollout_batch_size,
         "local_adaptation_batch_size": args.local_adaptation_batch_size,
+        "adaptation_rounds": args.adaptation_rounds,
         "request_timeout": args.request_timeout,
         "control_timeout": args.control_timeout,
     }
@@ -122,6 +125,7 @@ def _write_group(
     max_new_tokens: int,
     eos_token_id: int,
     confidence_probabilities: list[float] | None = None,
+    adaptation_round: int | None = None,
 ) -> None:
     completion_lengths = group.completion_mask.sum(dim=1).tolist()
     for response_index, response in enumerate(group.texts):
@@ -152,6 +156,8 @@ def _write_group(
             record["confidence_probability"] = confidence_probabilities[
                 response_index
             ]
+        if adaptation_round is not None:
+            record["adaptation_round"] = adaptation_round
         stream.write(json.dumps(record, ensure_ascii=False) + "\n")
     stream.flush()
 
@@ -160,6 +166,48 @@ def _correctness(group: RolloutGroup) -> list[float]:
     if group.correctness_labels is None:
         raise ValueError("Verified rollout group is required.")
     return group.correctness_labels.tolist()
+
+
+def _optimizer_state_to(
+    state: FastOptimizerState,
+    device: torch.device | str,
+) -> FastOptimizerState:
+    return FastOptimizerState(
+        step=state.step,
+        first_moment={
+            name: value.to(device)
+            for name, value in state.first_moment.items()
+        },
+        second_moment={
+            name: value.to(device) for name, value in state.second_moment.items()
+        },
+    )
+
+
+def _support_round_summaries(totals: torch.Tensor) -> list[dict[str, object]]:
+    summaries = []
+    for round_index, values_tensor in enumerate(totals, start=1):
+        values = values_tensor.tolist()
+        problems = int(values[3])
+        summaries.append(
+            {
+                "round": round_index,
+                "accuracy": values[0] / values[1],
+                "responses": int(values[1]),
+                "correct": int(values[0]),
+                "pass_at_group": values[2] / problems,
+                "passed_problems": int(values[2]),
+                "num_unique_problems": problems,
+                "confidence_mean": values[4] / values[1],
+                "confidence_correct_mean": (
+                    None if values[6] == 0 else values[5] / values[6]
+                ),
+                "confidence_incorrect_mean": (
+                    None if values[8] == 0 else values[7] / values[8]
+                ),
+            }
+        )
+    return summaries
 
 
 def _summary_from_totals(
@@ -394,6 +442,10 @@ def main() -> None:
         "num_unique_problems": len(problems),
         "model": str(args.model),
         "support_group_size": args.support_group_size,
+        "adaptation_rounds": args.adaptation_rounds,
+        "total_support_group_size": (
+            args.support_group_size * args.adaptation_rounds
+        ),
         "base_query_group_size": args.base_query_group_size,
         "adapted_query_group_size": args.adapted_query_group_size,
         "seed": args.seed,
@@ -419,16 +471,6 @@ def main() -> None:
         f"problem-metrics-rank-{accelerator.process_index}.jsonl"
     )
     started = time.perf_counter()
-    support_seeds = [
-        _generation_seed(
-            base_seed=args.seed,
-            step=0,
-            phase="checkpoint_evaluation_support",
-            rank=0,
-            problem_uid=problem.uid,
-        )
-        for problem in local_problems
-    ]
     query_seeds = [
         _generation_seed(
             base_seed=args.seed,
@@ -440,80 +482,158 @@ def main() -> None:
         for problem in local_problems
     ]
 
-    support_batches = support_engine.generate_batches(
-        problem_batches,
-        [[initial_fast] * len(batch) for batch in problem_batches],
-        show_progress=accelerator.is_main_process,
-        progress_description="checkpoint evaluation support",
-        seed_batches=_chunks(support_seeds, args.local_rollout_batch_size),
-    )
-    support_groups = [group for batch in support_batches for group in batch]
-
     with rollout_path.open("w", encoding="utf-8") as rollout_stream:
-        verified_supports = []
-        support_verifications = []
-        for problem, group, seed, valid in zip(
-            local_problems, support_groups, support_seeds, valid_flags, strict=True
-        ):
-            group, verification = _verify(group, problem, verifier)
-            verified_supports.append(group)
-            support_verifications.append(verification)
-        del support_groups, support_batches
+        current_fast_parameters = [initial_fast] * len(local_problems)
+        current_optimizer_states: list[FastOptimizerState] | None = None
+        confidence_probabilities = [[] for _ in local_problems]
+        support_correctness = [[] for _ in local_problems]
+        support_seeds_by_round: list[list[int]] = []
+        inner_metrics = [[] for _ in local_problems]
+        support_round_totals = torch.zeros(
+            (args.adaptation_rounds, 9),
+            dtype=torch.float64,
+            device=accelerator.device,
+        )
 
-        fast_parameters = []
-        confidence_probabilities = []
-        inner_metrics = []
-        adaptation_batches = _chunks(
-            verified_supports, args.local_adaptation_batch_size
-        )
-        adaptation_progress = tqdm(
-            adaptation_batches,
-            desc="checkpoint evaluation adaptation",
-            unit="batch",
-            disable=not accelerator.is_main_process,
-        )
-        for batch in adaptation_progress:
-            device_batch = tuple(group.to(accelerator.device) for group in batch)
-            adaptations = algorithm.adapt_tasks(
-                device_batch,
-                initial_fast,
-                differentiable=False,
-                supervise_confidence=False,
-                show_progress=False,
+        for round_index in range(args.adaptation_rounds):
+            round_number = round_index + 1
+            support_phase = (
+                "checkpoint_evaluation_support"
+                if round_index == 0
+                else f"checkpoint_evaluation_support_round_{round_number}"
             )
-            for adaptation in adaptations:
-                fast_parameters.append(
-                    {
-                        name: value.detach().to("cpu")
-                        for name, value in adaptation.fast_parameters.items()
-                    }
+            support_seeds = [
+                _generation_seed(
+                    base_seed=args.seed,
+                    step=0,
+                    phase=support_phase,
+                    rank=0,
+                    problem_uid=problem.uid,
                 )
-                confidence_probabilities.append(
-                    adaptation.confidence_probabilities.detach().cpu().tolist()
+                for problem in local_problems
+            ]
+            support_seeds_by_round.append(support_seeds)
+            support_batches = support_engine.generate_batches(
+                problem_batches,
+                _chunks(
+                    current_fast_parameters,
+                    args.local_rollout_batch_size,
+                ),
+                show_progress=accelerator.is_main_process,
+                progress_description=(
+                    "checkpoint evaluation support "
+                    f"round {round_number}/{args.adaptation_rounds}"
+                ),
+                seed_batches=_chunks(
+                    support_seeds,
+                    args.local_rollout_batch_size,
+                ),
+            )
+            support_groups = [group for batch in support_batches for group in batch]
+            verified_supports = []
+            support_verifications = []
+            for problem, group in zip(local_problems, support_groups, strict=True):
+                group, verification = _verify(group, problem, verifier)
+                verified_supports.append(group)
+                support_verifications.append(verification)
+            del support_groups, support_batches
+
+            next_fast_parameters = []
+            next_optimizer_states = []
+            round_confidence_probabilities = []
+            round_inner_metrics = []
+            index_batches = _chunks(
+                list(range(len(verified_supports))),
+                args.local_adaptation_batch_size,
+            )
+            adaptation_progress = tqdm(
+                index_batches,
+                desc=(
+                    "checkpoint evaluation adaptation "
+                    f"round {round_number}/{args.adaptation_rounds}"
+                ),
+                unit="batch",
+                disable=not accelerator.is_main_process,
+            )
+            for indices in adaptation_progress:
+                device_batch = tuple(
+                    verified_supports[index].to(accelerator.device)
+                    for index in indices
                 )
-                inner_metrics.append(
-                    [
+                if round_index == 0:
+                    adaptations = algorithm.adapt_tasks(
+                        device_batch,
+                        initial_fast,
+                        differentiable=False,
+                        supervise_confidence=False,
+                        show_progress=False,
+                    )
+                else:
+                    if current_optimizer_states is None:
+                        raise RuntimeError("Missing continued inner optimizer state.")
+                    device_fast = tuple(
                         {
-                            "loss": output.loss.item(),
-                            "clip_fraction": output.clip_fraction.item(),
-                            "mean_kl": output.mean_kl.item(),
+                            name: value.to(accelerator.device)
+                            for name, value in current_fast_parameters[index].items()
                         }
-                        for output in adaptation.inner_losses
-                    ]
-                )
-            del device_batch, adaptations
-        del adaptation_batches, adaptation_progress
+                        for index in indices
+                    )
+                    device_optimizer_states = tuple(
+                        _optimizer_state_to(
+                            current_optimizer_states[index],
+                            accelerator.device,
+                        )
+                        for index in indices
+                    )
+                    adaptations = algorithm.continue_adapt_tasks(
+                        device_batch,
+                        device_fast,
+                        device_optimizer_states,
+                        show_progress=False,
+                    )
+                    del device_fast, device_optimizer_states
+                for adaptation in adaptations:
+                    next_fast_parameters.append(
+                        {
+                            name: value.detach().to("cpu")
+                            for name, value in adaptation.fast_parameters.items()
+                        }
+                    )
+                    next_optimizer_states.append(
+                        _optimizer_state_to(adaptation.optimizer_state, "cpu")
+                    )
+                    round_confidence_probabilities.append(
+                        adaptation.confidence_probabilities.detach().cpu().tolist()
+                    )
+                    round_inner_metrics.append(
+                        [
+                            {
+                                "loss": output.loss.item(),
+                                "clip_fraction": output.clip_fraction.item(),
+                                "mean_kl": output.mean_kl.item(),
+                            }
+                            for output in adaptation.inner_losses
+                        ]
+                    )
+                del device_batch, adaptations
+            del index_batches, adaptation_progress
 
-        for index, (problem, group, seed, valid) in enumerate(
-            zip(
-                local_problems,
-                verified_supports,
-                support_seeds,
-                valid_flags,
-                strict=True,
-            )
-        ):
-            if valid:
+            for index, (problem, group, seed, valid) in enumerate(
+                zip(
+                    local_problems,
+                    verified_supports,
+                    support_seeds,
+                    valid_flags,
+                    strict=True,
+                )
+            ):
+                probabilities = round_confidence_probabilities[index]
+                correctness = _correctness(group)
+                confidence_probabilities[index].extend(probabilities)
+                support_correctness[index].extend(correctness)
+                inner_metrics[index].append(round_inner_metrics[index])
+                if not valid:
+                    continue
                 _write_group(
                     rollout_stream,
                     checkpoint_step=checkpoint_step,
@@ -524,12 +644,38 @@ def main() -> None:
                     seed=seed,
                     max_new_tokens=max_new_tokens,
                     eos_token_id=policy_bundle.tokenizer.eos_token_id,
-                    confidence_probabilities=confidence_probabilities[index],
+                    confidence_probabilities=probabilities,
+                    adaptation_round=round_number,
                 )
-        support_correctness = [
-            _correctness(group) for group in verified_supports
-        ]
-        del verified_supports, support_verifications
+                confidence_sum = sum(probabilities)
+                correct_confidence_sum = sum(
+                    probability
+                    for probability, correct in zip(
+                        probabilities, correctness, strict=True
+                    )
+                    if correct == 1
+                )
+                correct_count = sum(correctness)
+                support_round_totals[round_index] += torch.tensor(
+                    (
+                        correct_count,
+                        len(correctness),
+                        any(correctness),
+                        1,
+                        confidence_sum,
+                        correct_confidence_sum,
+                        correct_count,
+                        confidence_sum - correct_confidence_sum,
+                        len(correctness) - correct_count,
+                    ),
+                    dtype=torch.float64,
+                    device=accelerator.device,
+                )
+            current_fast_parameters = next_fast_parameters
+            current_optimizer_states = next_optimizer_states
+            del verified_supports, support_verifications
+
+        fast_parameters = current_fast_parameters
 
         base_batches = base_query_engine.generate_batches(
             problem_batches,
@@ -594,6 +740,7 @@ def main() -> None:
                     seed=seed,
                     max_new_tokens=max_new_tokens,
                     eos_token_id=policy_bundle.tokenizer.eos_token_id,
+                    adaptation_round=args.adaptation_rounds,
                 )
                 support_correct = support_correctness[index]
                 base_correct = base_correctness[index]
@@ -667,18 +814,31 @@ def main() -> None:
                     "support_pass": support_pass,
                     "base_query_pass": base_pass,
                     "adapted_query_pass": adapted_pass,
-                    "support_seed": support_seeds[index],
+                    "adaptation_rounds": args.adaptation_rounds,
+                    "support_seed": support_seeds_by_round[0][index],
+                    "support_seeds": [
+                        seeds[index] for seeds in support_seeds_by_round
+                    ],
                     "query_seed": query_seeds[index],
                     "confidence_probabilities": confidence_probabilities[index],
                     "mean_confidence": sum(confidence_probabilities[index])
                     / len(confidence_probabilities[index]),
-                    "inner_iterations": inner_metrics[index],
+                    "adaptation_round_metrics": inner_metrics[index],
+                    "inner_iterations": [
+                        metric
+                        for round_metrics in inner_metrics[index]
+                        for metric in round_metrics
+                    ],
                 }
                 problem_stream.write(
                     json.dumps(problem_record, ensure_ascii=False) + "\n"
                 )
 
     totals = accelerator.reduce(totals, reduction="sum")
+    support_round_totals = accelerator.reduce(
+        support_round_totals,
+        reduction="sum",
+    )
     if accelerator.is_main_process:
         summary = {
             "event": "checkpoint_evaluation_completed",
@@ -686,10 +846,18 @@ def main() -> None:
             "checkpoint_step": checkpoint_step,
             "dataset_parquet": str(dataset_path),
             "seed": args.seed,
+            "adaptation_rounds": args.adaptation_rounds,
+            "inner_iterations_per_round": inner_config.num_iterations,
+            "total_inner_iterations": (
+                args.adaptation_rounds * inner_config.num_iterations
+            ),
+            "support_rounds": _support_round_summaries(support_round_totals),
             "seconds": time.perf_counter() - started,
             **_summary_from_totals(
                 totals,
-                support_group_size=args.support_group_size,
+                support_group_size=(
+                    args.support_group_size * args.adaptation_rounds
+                ),
                 base_query_group_size=args.base_query_group_size,
                 adapted_query_group_size=args.adapted_query_group_size,
             ),
