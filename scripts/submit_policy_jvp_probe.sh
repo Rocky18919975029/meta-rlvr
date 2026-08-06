@@ -7,6 +7,9 @@ export META_RLVR_MODEL_PATH="/data/user/zhongal/.cache/qwen2.5-math-7b-local"
 export META_RLVR_RUN_CONFIG="${HOME}/meta-rlvr/outputs/tiny-meta-only-b512-472864/run_config.json"
 export JVP_ATTN_IMPLEMENTATION="${JVP_ATTN_IMPLEMENTATION:-sdpa}"
 export JVP_MAX_SEQUENCE_LENGTH="${JVP_MAX_SEQUENCE_LENGTH:-64}"
+export JVP_GROUP_SIZE="${JVP_GROUP_SIZE:-2}"
+export JVP_RESPONSE_MICRO_BATCH_SIZE="${JVP_RESPONSE_MICRO_BATCH_SIZE:-2}"
+export JVP_SKIP_DUALITY_CHECK="${JVP_SKIP_DUALITY_CHECK:-0}"
 export JVP_SEED="${JVP_SEED:-42}"
 
 export SLURM_PARTITION="${SLURM_PARTITION:-acd_u}"
@@ -37,7 +40,7 @@ submission=$(sbatch \
 job_id="${submission##* }"
 
 echo "${submission}"
-echo "configuration: gpu=1 attn=${JVP_ATTN_IMPLEMENTATION} sequence_length=${JVP_MAX_SEQUENCE_LENGTH}"
+echo "configuration: gpu=1 attn=${JVP_ATTN_IMPLEMENTATION} sequence_length=${JVP_MAX_SEQUENCE_LENGTH} group_size=${JVP_GROUP_SIZE} response_micro_batch=${JVP_RESPONSE_MICRO_BATCH_SIZE} skip_duality=${JVP_SKIP_DUALITY_CHECK}"
 echo "stdout: ${META_RLVR_PROJECT_DIR}/logs/policy-jvp-probe-${job_id}.out"
 echo "stderr: ${META_RLVR_PROJECT_DIR}/logs/policy-jvp-probe-${job_id}.err"
 echo "queue: squeue -j ${job_id}"

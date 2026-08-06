@@ -14,11 +14,22 @@ export HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
-python -m meta_rlvr.probe_policy_jvp \
-  --model "${META_RLVR_MODEL_PATH}" \
-  --run-config "${META_RLVR_RUN_CONFIG}" \
-  --attn-implementation "${JVP_ATTN_IMPLEMENTATION}" \
-  --max-sequence-length "${JVP_MAX_SEQUENCE_LENGTH}" \
+PROBE_ARGS=(
+  --model "${META_RLVR_MODEL_PATH}"
+  --run-config "${META_RLVR_RUN_CONFIG}"
+  --attn-implementation "${JVP_ATTN_IMPLEMENTATION}"
+  --max-sequence-length "${JVP_MAX_SEQUENCE_LENGTH}"
+  --group-size "${JVP_GROUP_SIZE}"
+  --response-micro-batch-size "${JVP_RESPONSE_MICRO_BATCH_SIZE}"
   --seed "${JVP_SEED}"
+)
+if [[ "${JVP_SKIP_DUALITY_CHECK}" == "1" ]]; then
+  PROBE_ARGS+=(--skip-duality-check)
+elif [[ "${JVP_SKIP_DUALITY_CHECK}" != "0" ]]; then
+  echo "JVP_SKIP_DUALITY_CHECK must be 0 or 1." >&2
+  exit 2
+fi
+
+python -m meta_rlvr.probe_policy_jvp "${PROBE_ARGS[@]}"
 
 echo "[$(date --iso-8601=seconds)] policy JVP probe completed successfully"
