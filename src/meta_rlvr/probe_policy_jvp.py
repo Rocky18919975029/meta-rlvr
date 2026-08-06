@@ -75,8 +75,11 @@ def _probe_group(tokenizer, device: torch.device, max_length: int) -> RolloutGro
     )
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     completion_ids = tokenizer.encode(completion, add_special_tokens=False)
-    if len(prompt_ids) + len(completion_ids) > max_length:
-        prompt_ids = prompt_ids[-(max_length - len(completion_ids)) :]
+    if len(prompt_ids) >= max_length:
+        prompt_ids = prompt_ids[-(max_length - 1) :]
+    completion_length = max_length - len(prompt_ids)
+    repeats = math.ceil(completion_length / len(completion_ids))
+    completion_ids = (completion_ids * repeats)[:completion_length]
     input_ids = torch.tensor(
         [prompt_ids + completion_ids],
         dtype=torch.long,
@@ -213,6 +216,7 @@ def main() -> None:
         "cuda_runtime": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(device),
         "attn_implementation": args.attn_implementation,
+        "requested_sequence_tokens": args.max_sequence_length,
         "sequence_tokens": int(group.input_ids.shape[1]),
         "completion_tokens": int(group.completion_mask[0].sum().item()),
         "fast_parameter_tensors": len(primals),
