@@ -472,6 +472,7 @@ def test_vllm_problem_batch_uses_one_hybrid_transaction(
         generated_batches = engine.generate_batches(
             [[problems[0]], [problems[1]]],
             [[first_fast], [second_fast]],
+            compute_old_logprobs=False,
         )
         groups = tuple(group for batch in generated_batches for group in batch)
     else:
@@ -488,7 +489,9 @@ def test_vllm_problem_batch_uses_one_hybrid_transaction(
     assert paths.count("/v1/unload_lora_adapter") == expected_adapter_count
     assert paths.count("/sleep?level=1") == 1
     assert len(groups) == 2
-    assert all(group.rollout_logprobs is not None for group in groups)
+    assert all(
+        (group.rollout_logprobs is None) == split_batches for group in groups
+    )
     assert sleeping
     assert not loaded_adapters
 

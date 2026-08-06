@@ -882,6 +882,7 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         show_progress: bool = False,
         progress_description: str = "rollout phase",
         seed_batches: list[list[int]] | None = None,
+        compute_old_logprobs: bool = True,
     ) -> tuple[tuple[RolloutGroup, ...], ...]:
         if not problem_batches or any(not batch for batch in problem_batches):
             raise ValueError("Rollout phase batches must be non-empty.")
@@ -998,6 +999,18 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
+        if not compute_old_logprobs:
+            if show_progress:
+                self._print_logprob_parity(
+                    (),
+                    progress_description=progress_description,
+                    skipped=True,
+                )
+            return tuple(
+                tuple(replace(group, rollout_logprobs=None) for group in batch)
+                for batch in raw_batches
+            )
+
         total_problems = sum(len(batch) for batch in problem_batches)
         old_logprob_progress = None
         if show_progress:
@@ -1059,7 +1072,20 @@ class VLLMHybridRolloutEngine(TransformersRolloutEngine):
         groups: tuple[RolloutGroup, ...],
         *,
         progress_description: str,
+        skipped: bool = False,
     ) -> None:
+        if skipped:
+            print(
+                json.dumps(
+                    {
+                        "stage": progress_description,
+                        "old_logprob_recomputation": "skipped",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return
         delta_sum = 0.0
         absolute_delta_sum = 0.0
         max_absolute_delta = 0.0
