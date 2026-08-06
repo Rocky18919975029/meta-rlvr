@@ -489,6 +489,7 @@ def main() -> None:
         support_correctness = [[] for _ in local_problems]
         support_seeds_by_round: list[list[int]] = []
         inner_metrics = [[] for _ in local_problems]
+        inner_optimizer_steps = [[] for _ in local_problems]
         support_round_totals = torch.zeros(
             (args.adaptation_rounds, 9),
             dtype=torch.float64,
@@ -542,6 +543,7 @@ def main() -> None:
             next_optimizer_states = []
             round_confidence_probabilities = []
             round_inner_metrics = []
+            round_optimizer_steps = []
             index_batches = _chunks(
                 list(range(len(verified_supports))),
                 args.local_adaptation_batch_size,
@@ -615,6 +617,7 @@ def main() -> None:
                             for output in adaptation.inner_losses
                         ]
                     )
+                    round_optimizer_steps.append(adaptation.optimizer_state.step)
                 del device_batch, adaptations
             del index_batches, adaptation_progress
 
@@ -632,6 +635,7 @@ def main() -> None:
                 confidence_probabilities[index].extend(probabilities)
                 support_correctness[index].extend(correctness)
                 inner_metrics[index].append(round_inner_metrics[index])
+                inner_optimizer_steps[index].append(round_optimizer_steps[index])
                 if not valid:
                     continue
                 _write_group(
@@ -824,6 +828,7 @@ def main() -> None:
                     "mean_confidence": sum(confidence_probabilities[index])
                     / len(confidence_probabilities[index]),
                     "adaptation_round_metrics": inner_metrics[index],
+                    "inner_optimizer_steps": inner_optimizer_steps[index],
                     "inner_iterations": [
                         metric
                         for round_metrics in inner_metrics[index]
