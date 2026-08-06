@@ -74,10 +74,16 @@ def load_policy_with_lora(
         policy.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-        if not hasattr(policy, "enable_input_require_grads"):
+        if not all(
+            hasattr(policy, method)
+            for method in (
+                "enable_input_require_grads",
+                "disable_input_require_grads",
+            )
+        ):
             raise TypeError(
-                "Policy model must support enable_input_require_grads when gradient "
-                "checkpointing is enabled."
+                "Policy model must support enabling and disabling input gradients "
+                "when gradient checkpointing is enabled."
             )
         policy.enable_input_require_grads()
 

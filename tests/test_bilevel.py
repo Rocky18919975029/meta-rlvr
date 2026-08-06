@@ -55,6 +55,26 @@ class ToyPolicy(nn.Module):
         return SimpleNamespace(logits=logits)
 
 
+class HookedToyPolicy(ToyPolicy):
+    def __init__(self) -> None:
+        super().__init__()
+        self._input_gradient_hook = None
+        self.enable_input_require_grads()
+
+    def enable_input_require_grads(self) -> None:
+        if self._input_gradient_hook is not None:
+            raise RuntimeError("Input-gradient hook is already enabled.")
+        self._input_gradient_hook = self.embedding.register_forward_hook(
+            lambda _module, _inputs, output: output.requires_grad_(True)
+        )
+
+    def disable_input_require_grads(self) -> None:
+        if self._input_gradient_hook is None:
+            raise RuntimeError("Input-gradient hook is not enabled.")
+        self._input_gradient_hook.remove()
+        self._input_gradient_hook = None
+
+
 class ToyConfidenceBackbone(nn.Module):
     def __init__(self, vocabulary_size: int = 7, hidden_size: int = 5) -> None:
         super().__init__()
@@ -300,6 +320,43 @@ def test_sequence_only_path_never_invokes_token_jvp(monkeypatch) -> None:
     output = algorithm.outer_loss(support, query, initial_fast)
     output.loss.backward()
     assert confidence.token_score is None
+
+
+def test_token_jvp_temporarily_disables_transformers_input_gradient_hook() -> None:
+    torch.manual_seed(49)
+    policy = HookedToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(),
+        hidden_size=5,
+        enable_sequence_head=False,
+        enable_token_head=True,
+    )
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    query = make_group(policy, torch.tensor([0.0, 1.0, 1.0]))
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(
+            num_iterations=1,
+            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+        ),
+        meta_config=MetaLossConfig(
+            meta_coefficient=0.0,
+            token_meta_coefficient=1.0,
+            confidence=ConfidenceLossConfig(
+                bce_coefficient=0.0,
+                ranking_coefficient=0.0,
+            ),
+        ),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+        token_jvp_response_micro_batch_size=2,
+    )
+    output = algorithm.token_outer_losses_batch((support,), (query,), initial_fast)[0]
+    output.loss.backward()
+    assert policy.training
+    assert policy._input_gradient_hook is not None
 
 
 def test_first_order_inner_update_has_same_value_as_direct_policy_gradient() -> None:

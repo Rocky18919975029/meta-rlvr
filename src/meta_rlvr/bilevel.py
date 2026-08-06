@@ -781,72 +781,90 @@ class BilevelGRPO:
                     max_sequences=algorithm.token_jvp_response_micro_batch_size,
                     max_tokens=None,
                 )
-                with torch.enable_grad():
-                    for row_indices in row_batches:
-                        selector = torch.tensor(
-                            row_indices,
-                            dtype=torch.long,
-                            device=group.device,
-                        )
-
-                        def selected_logprobs(*values):
-                            parameters = dict(zip(names, values, strict=True))
-                            return token_logprobs(
-                                algorithm.policy,
-                                group,
-                                fast_parameters=parameters,
-                                row_indices=row_indices,
-                                activation_checkpointing=False,
-                                logprob_position_chunk_size=(
-                                    algorithm.token_jvp_logprob_position_chunk_size
-                                ),
+                was_training = algorithm.policy.training
+                input_hook_enabled = hasattr(
+                    algorithm.policy, "disable_input_require_grads"
+                )
+                algorithm.policy.eval()
+                if input_hook_enabled:
+                    algorithm.policy.disable_input_require_grads()
+                try:
+                    with torch.enable_grad():
+                        for row_indices in row_batches:
+                            selector = torch.tensor(
+                                row_indices,
+                                dtype=torch.long,
+                                device=group.device,
                             )
 
-                        current, directional = torch.func.jvp(
-                            selected_logprobs,
-                            parameter_values,
-                            parameter_cotangents,
-                        )
-                        old = group.old_logprobs.index_select(0, selector)
-                        selected_advantages = advantages.index_select(0, selector)
-                        mask = group.completion_mask.index_select(0, selector)
-                        if config.use_importance_ratio:
-                            ratios = torch.exp(current - old)
-                            coefficient = ratios
-                            if config.use_clipping:
-                                clipped_ratios = torch.clamp(
-                                    ratios,
-                                    min=1.0 - config.clip_epsilon_low,
-                                    max=1.0 + config.clip_epsilon_high,
+                            def selected_logprobs(*values):
+                                parameters = dict(zip(names, values, strict=True))
+                                return token_logprobs(
+                                    algorithm.policy,
+                                    group,
+                                    fast_parameters=parameters,
+                                    row_indices=row_indices,
+                                    activation_checkpointing=False,
+                                    logprob_position_chunk_size=(
+                                        algorithm.token_jvp_logprob_position_chunk_size
+                                    ),
                                 )
-                                unclipped_active = torch.where(
-                                    selected_advantages >= 0,
-                                    ratios <= clipped_ratios,
-                                    ratios >= clipped_ratios,
+
+                            current, directional = torch.func.jvp(
+                                selected_logprobs,
+                                parameter_values,
+                                parameter_cotangents,
+                            )
+                            old = group.old_logprobs.index_select(0, selector)
+                            selected_advantages = advantages.index_select(0, selector)
+                            mask = group.completion_mask.index_select(0, selector)
+                            if config.use_importance_ratio:
+                                ratios = torch.exp(current - old)
+                                coefficient = ratios
+                                if config.use_clipping:
+                                    clipped_ratios = torch.clamp(
+                                        ratios,
+                                        min=1.0 - config.clip_epsilon_low,
+                                        max=1.0 + config.clip_epsilon_high,
+                                    )
+                                    unclipped_active = torch.where(
+                                        selected_advantages >= 0,
+                                        ratios <= clipped_ratios,
+                                        ratios >= clipped_ratios,
+                                    )
+                                    coefficient = coefficient * unclipped_active
+                            else:
+                                coefficient = torch.ones_like(current)
+                            if config.token_normalization == "per_response":
+                                normalization = 1.0 / (
+                                    group.group_size * mask.sum(dim=1, keepdim=True)
                                 )
-                                coefficient = coefficient * unclipped_active
-                        else:
-                            coefficient = torch.ones_like(current)
-                        if config.token_normalization == "per_response":
-                            normalization = 1.0 / (
-                                group.group_size * mask.sum(dim=1, keepdim=True)
+                            elif config.token_normalization == "global_tokens":
+                                normalization = torch.ones_like(current) / mask.sum()
+                                normalization = normalization * (
+                                    mask.sum() / group.completion_mask.sum()
+                                )
+                            elif config.token_normalization == "sequence_sum":
+                                normalization = (
+                                    torch.ones_like(current) / group.group_size
+                                )
+                            else:
+                                raise ValueError(
+                                    "Unsupported token normalization: "
+                                    f"{config.token_normalization}"
+                                )
+                            row_gradient = (
+                                -directional * coefficient * normalization * mask
                             )
-                        elif config.token_normalization == "global_tokens":
-                            normalization = torch.ones_like(current) / mask.sum()
-                            normalization = normalization * (
-                                mask.sum() / group.completion_mask.sum()
+                            advantage_gradient.index_copy_(
+                                0,
+                                selector,
+                                row_gradient.to(advantage_gradient.dtype),
                             )
-                        elif config.token_normalization == "sequence_sum":
-                            normalization = torch.ones_like(current) / group.group_size
-                        else:
-                            raise ValueError(
-                                "Unsupported token normalization: "
-                                f"{config.token_normalization}"
-                            )
-                        row_gradient = -directional * coefficient * normalization * mask
-                        advantage_gradient.index_copy_(
-                            0, selector, row_gradient.to(advantage_gradient.dtype)
-                        )
+                finally:
+                    if input_hook_enabled:
+                        algorithm.policy.enable_input_require_grads()
+                    algorithm.policy.train(was_training)
                 return (advantage_gradient, *(None for _ in names))
 
         outputs = TokenPolicyGradient.apply(
