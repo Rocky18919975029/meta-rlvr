@@ -942,6 +942,7 @@ def main() -> None:
         )
         print(json.dumps(summary, sort_keys=True), flush=True)
     accelerator.wait_for_everyone()
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

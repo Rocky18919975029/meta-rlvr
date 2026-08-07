@@ -5,8 +5,9 @@ from meta_rlvr.plot_checkpoint_curve import _load_records
 
 
 def _summary(step: int, method: str) -> dict:
-    base_accuracy = 0.20
-    base_pass = 0.40
+    method_offset = 0.002 if method == "token" else 0.0
+    base_accuracy = 0.20 + 0.001 * step + method_offset
+    base_pass = 0.40 + 0.002 * step + method_offset
     adapted_accuracy = base_accuracy + 0.01 * step
     adapted_pass = base_pass + 0.02 * step
     return {
@@ -16,7 +17,10 @@ def _summary(step: int, method: str) -> dict:
         "dataset_parquet": "/data/aime24.parquet",
         "seed": 42,
         "seconds": 10.0,
-        "support": {"group_size": 16, "accuracy": 0.2},
+        "support": {
+            "group_size": 16,
+            "accuracy": 0.2 + 0.001 * step + method_offset,
+        },
         "base_query": {
             "group_size": 32,
             "accuracy": base_accuracy,
@@ -29,7 +33,10 @@ def _summary(step: int, method: str) -> dict:
         },
         "query_accuracy_delta": adapted_accuracy - base_accuracy,
         "query_pass_delta": adapted_pass - base_pass,
-        "base_total": {"accuracy": 0.2, "pass_at_group": 0.4},
+        "base_total": {
+            "accuracy": base_accuracy,
+            "pass_at_group": base_pass,
+        },
         "meta_total": {"accuracy": 0.3, "pass_at_group": 0.5},
     }
 

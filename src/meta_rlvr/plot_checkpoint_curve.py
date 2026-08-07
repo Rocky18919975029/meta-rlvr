@@ -75,16 +75,6 @@ def _load_records(manifest_path: Path) -> tuple[list[dict], dict]:
     }
     if len(comparable) != 1:
         raise ValueError("Evaluation configurations are not directly comparable.")
-    for field in (
-        "support_accuracy",
-        "base_query_accuracy",
-        "base_query_pass_at_group",
-        "base_total_accuracy",
-        "base_total_pass_at_group",
-    ):
-        values = [record[field] for record in records]
-        if max(values) - min(values) > 1e-12:
-            raise ValueError(f"Paired base-query metric changed across runs: {field}.")
     return records, manifest
 
 
@@ -103,8 +93,16 @@ def _plot(path_png: Path, path_pdf: Path, records: list[dict]) -> None:
     import matplotlib.pyplot as plt
 
     methods = {
-        "sequence": {"label": "Sequence confidence", "marker": "o"},
-        "token": {"label": "Token confidence", "marker": "s"},
+        "sequence": {
+            "label": "Sequence confidence",
+            "marker": "o",
+            "color": "#1f77b4",
+        },
+        "token": {
+            "label": "Token confidence",
+            "marker": "s",
+            "color": "#d62728",
+        },
     }
     figure, axes = plt.subplots(2, 3, figsize=(14, 8), constrained_layout=True)
     panels = (
@@ -119,6 +117,12 @@ def _plot(path_png: Path, path_pdf: Path, records: list[dict]) -> None:
             "Pass@48",
         ),
     )
+    base_fields = {
+        "adapted_query_accuracy": "base_query_accuracy",
+        "adapted_query_pass_at_group": "base_query_pass_at_group",
+        "meta_total_accuracy": "base_total_accuracy",
+        "meta_total_pass_at_group": "base_total_pass_at_group",
+    }
     for axis, (field, title, ylabel) in zip(axes.flat, panels, strict=True):
         for method, style in methods.items():
             selected = [record for record in records if record["method"] == method]
@@ -129,40 +133,19 @@ def _plot(path_png: Path, path_pdf: Path, records: list[dict]) -> None:
                 linewidth=2,
                 markersize=6,
                 label=style["label"],
+                color=style["color"],
             )
-        if field == "adapted_query_accuracy":
-            axis.axhline(
-                100 * records[0]["base_query_accuracy"],
-                color="0.45",
-                linestyle="--",
-                linewidth=1.5,
-                label="Base policy",
-            )
-        elif field == "adapted_query_pass_at_group":
-            axis.axhline(
-                100 * records[0]["base_query_pass_at_group"],
-                color="0.45",
-                linestyle="--",
-                linewidth=1.5,
-                label="Base policy",
-            )
-        elif field == "meta_total_accuracy":
-            axis.axhline(
-                100 * records[0]["base_total_accuracy"],
-                color="0.45",
-                linestyle="--",
-                linewidth=1.5,
-                label="Base policy",
-            )
-        elif field == "meta_total_pass_at_group":
-            axis.axhline(
-                100 * records[0]["base_total_pass_at_group"],
-                color="0.45",
-                linestyle="--",
-                linewidth=1.5,
-                label="Base policy",
-            )
-        else:
+            if field in base_fields:
+                axis.plot(
+                    [record["step"] for record in selected],
+                    [100 * record[base_fields[field]] for record in selected],
+                    linestyle="--",
+                    linewidth=1.5,
+                    alpha=0.65,
+                    label=f"{style['label']} base",
+                    color=style["color"],
+                )
+        if field not in base_fields:
             axis.axhline(0, color="0.45", linestyle="--", linewidth=1.2)
         axis.set_title(title)
         axis.set_xlabel("Global training step")
