@@ -1,6 +1,11 @@
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from meta_rlvr.evaluate_checkpoint import (
+    _adaptation_mode,
+    _response_confidences,
     _summary_from_totals,
     _support_round_summaries,
 )
@@ -78,3 +83,33 @@ def test_support_round_summaries_keep_rounds_separate() -> None:
     assert summaries[1]["round"] == 2
     assert summaries[1]["accuracy"] == 0.75
     assert summaries[1]["pass_at_group"] == 1.0
+
+
+def test_checkpoint_adaptation_mode_requires_one_meta_branch() -> None:
+    assert _adaptation_mode({"meta_coefficient": 1.0}) == "sequence"
+    assert _adaptation_mode(
+        {"meta_coefficient": 0.0, "token_meta_coefficient": 1.0}
+    ) == "token"
+    with pytest.raises(ValueError, match="exactly one"):
+        _adaptation_mode({"meta_coefficient": 0.0})
+    with pytest.raises(ValueError, match="exactly one"):
+        _adaptation_mode(
+            {"meta_coefficient": 1.0, "token_meta_coefficient": 1.0}
+        )
+
+
+def test_token_response_confidence_averages_only_completion_tokens() -> None:
+    adaptation = SimpleNamespace(
+        token_confidence_probabilities=torch.tensor(
+            [[0.2, 0.4, 0.9], [0.1, 0.3, 0.5]]
+        )
+    )
+    support = SimpleNamespace(
+        completion_mask=torch.tensor(
+            [[True, True, False], [True, True, True]]
+        )
+    )
+
+    values = _response_confidences(adaptation, support, "token")
+
+    assert values == pytest.approx([0.3, 0.3])

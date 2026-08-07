@@ -94,18 +94,22 @@ cd "${META_RLVR_PROJECT_DIR}"
 python src/meta_rlvr/vllm_preflight.py
 mkdir -p logs outputs
 
-submission=$(sbatch \
-  --job-name="meta-rlvr-eval" \
-  --partition="${SLURM_PARTITION}" \
-  --gres="gpu:${EVAL_GPUS}" \
-  --cpus-per-task="${SLURM_CPUS_PER_TASK}" \
-  --mem="${SLURM_MEM}" \
-  --time="${SLURM_TIME}" \
-  --exclude="${SLURM_EXCLUDE}" \
-  --output="${META_RLVR_PROJECT_DIR}/logs/${LABEL}-%j.out" \
-  --error="${META_RLVR_PROJECT_DIR}/logs/${LABEL}-%j.err" \
-  --export=ALL \
-  scripts/slurm_checkpoint_evaluation.sbatch)
+SBATCH_ARGS=(
+  --job-name="meta-rlvr-eval"
+  --partition="${SLURM_PARTITION}"
+  --gres="gpu:${EVAL_GPUS}"
+  --cpus-per-task="${SLURM_CPUS_PER_TASK}"
+  --mem="${SLURM_MEM}"
+  --time="${SLURM_TIME}"
+  --exclude="${SLURM_EXCLUDE}"
+  --output="${META_RLVR_PROJECT_DIR}/logs/${LABEL}-%j.out"
+  --error="${META_RLVR_PROJECT_DIR}/logs/${LABEL}-%j.err"
+  --export=ALL
+)
+if [[ -n "${SLURM_DEPENDENCY:-}" ]]; then
+  SBATCH_ARGS+=(--dependency="${SLURM_DEPENDENCY}")
+fi
+submission=$(sbatch "${SBATCH_ARGS[@]}" scripts/slurm_checkpoint_evaluation.sbatch)
 job_id="${submission##* }"
 result_dir="${META_RLVR_PROJECT_DIR}/outputs/${LABEL}-${job_id}"
 

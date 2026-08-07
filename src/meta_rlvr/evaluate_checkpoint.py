@@ -82,6 +82,30 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max_new_tokens must be positive.")
 
 
+def _adaptation_mode(source_config: dict[str, object]) -> str:
+    sequence_enabled = float(source_config.get("meta_coefficient", 0.0)) > 0
+    token_enabled = float(source_config.get("token_meta_coefficient", 0.0)) > 0
+    if sequence_enabled == token_enabled:
+        raise ValueError(
+            "Checkpoint evaluation requires exactly one enabled meta branch."
+        )
+    return "sequence" if sequence_enabled else "token"
+
+
+def _response_confidences(
+    adaptation,
+    support: RolloutGroup,
+    mode: str,
+) -> list[float]:
+    if mode == "sequence":
+        return adaptation.confidence_probabilities.detach().cpu().tolist()
+    probabilities = adaptation.token_confidence_probabilities.detach()
+    mask = support.completion_mask.to(probabilities.dtype)
+    return (
+        (probabilities * mask).sum(dim=1) / mask.sum(dim=1)
+    ).cpu().tolist()
+
+
 def _chunks(items: list, size: int) -> list[list]:
     return [items[start : start + size] for start in range(0, len(items), size)]
 
@@ -292,6 +316,9 @@ def main() -> None:
     source_config = json.loads(
         (source_run_dir / "run_config.json").read_text(encoding="utf-8")
     )
+    adaptation_mode = _adaptation_mode(source_config)
+    if adaptation_mode == "token" and args.adaptation_rounds != 1:
+        raise ValueError("Token checkpoint evaluation currently requires one round.")
     trainer_state = json.loads(
         (checkpoint / "trainer_state.json").read_text(encoding="utf-8")
     )
@@ -326,6 +353,8 @@ def main() -> None:
         dtype=source_config["dtype"],
         trust_remote_code=bool(source_config["trust_remote_code"]),
         model_kwargs=model_kwargs,
+        enable_sequence_head=adaptation_mode == "sequence",
+        enable_token_head=adaptation_mode == "token",
     )
     confidence_model = accelerator.prepare(confidence_model)
     target_modules = tuple(
@@ -346,6 +375,7 @@ def main() -> None:
     accelerator.wait_for_everyone()
 
     effective_config = dict(source_config)
+    effective_config.setdefault("token_meta_coefficient", 0.0)
     if args.inner_iterations is not None:
         effective_config["inner_iterations"] = args.inner_iterations
     if args.inner_learning_rate is not None:
@@ -372,6 +402,12 @@ def main() -> None:
         ),
         confidence_max_tokens_per_micro_batch=source_config.get(
             "confidence_max_tokens_per_micro_batch"
+        ),
+        token_jvp_response_micro_batch_size=int(
+            source_config.get("token_jvp_response_micro_batch_size", 4)
+        ),
+        token_jvp_logprob_position_chunk_size=int(
+            source_config.get("token_jvp_logprob_position_chunk_size", 256)
         ),
     )
     max_new_tokens = (
@@ -436,6 +472,7 @@ def main() -> None:
         "checkpoint": str(checkpoint),
         "checkpoint_step": checkpoint_step,
         "checkpoint_world_size": int(trainer_state["world_size"]),
+        "adaptation_mode": adaptation_mode,
         "source_run_dir": str(source_run_dir),
         "dataset_parquet": str(dataset_path),
         "dataset_sha256": _sha256(dataset_path),
@@ -464,7 +501,13 @@ def main() -> None:
             json.dumps(evaluation_config, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        print(json.dumps({"event": "evaluation_started", **evaluation_config}, sort_keys=True), flush=True)
+        print(
+            json.dumps(
+                {"event": "evaluation_started", **evaluation_config},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     rollout_path = output_dir / f"rollouts-rank-{accelerator.process_index}.jsonl"
     problem_path = output_dir / (
@@ -563,14 +606,25 @@ def main() -> None:
                     for index in indices
                 )
                 if round_index == 0:
-                    adaptations = algorithm.adapt_tasks(
-                        device_batch,
-                        initial_fast,
-                        differentiable=False,
-                        supervise_confidence=False,
-                        show_progress=False,
-                    )
+                    if adaptation_mode == "sequence":
+                        adaptations = algorithm.adapt_tasks(
+                            device_batch,
+                            initial_fast,
+                            differentiable=False,
+                            supervise_confidence=False,
+                            show_progress=False,
+                        )
+                    else:
+                        adaptations = algorithm.adapt_token_tasks(
+                            device_batch,
+                            initial_fast,
+                            differentiable=False,
+                        )
                 else:
+                    if adaptation_mode != "sequence":
+                        raise RuntimeError(
+                            "Continued token adaptation is not enabled here."
+                        )
                     if current_optimizer_states is None:
                         raise RuntimeError("Missing continued inner optimizer state.")
                     device_fast = tuple(
@@ -594,7 +648,7 @@ def main() -> None:
                         show_progress=False,
                     )
                     del device_fast, device_optimizer_states
-                for adaptation in adaptations:
+                for local_index, adaptation in enumerate(adaptations):
                     next_fast_parameters.append(
                         {
                             name: value.detach().to("cpu")
@@ -605,7 +659,11 @@ def main() -> None:
                         _optimizer_state_to(adaptation.optimizer_state, "cpu")
                     )
                     round_confidence_probabilities.append(
-                        adaptation.confidence_probabilities.detach().cpu().tolist()
+                        _response_confidences(
+                            adaptation,
+                            device_batch[local_index],
+                            adaptation_mode,
+                        )
                     )
                     round_inner_metrics.append(
                         [
@@ -849,6 +907,7 @@ def main() -> None:
             "event": "checkpoint_evaluation_completed",
             "checkpoint": str(checkpoint),
             "checkpoint_step": checkpoint_step,
+            "adaptation_mode": adaptation_mode,
             "dataset_parquet": str(dataset_path),
             "seed": args.seed,
             "adaptation_rounds": args.adaptation_rounds,
