@@ -13,7 +13,6 @@ from tqdm.auto import tqdm
 
 from .bilevel import BilevelGRPO
 from .data import MathProblem, load_semantically_unique_dapo_problems
-from .functional import enable_sdpa_math_policy_forwards
 from .models import load_confidence_model, load_policy_with_lora
 from .optim import FastOptimizerState
 from .rollout import VLLMHybridRolloutEngine
@@ -375,12 +374,11 @@ def main() -> None:
         lora_alpha=int(source_config["lora_alpha"]),
         target_modules=target_modules,
         dtype=source_config["dtype"],
+        force_sdpa_math=adaptation_mode == "token",
         trust_remote_code=bool(source_config["trust_remote_code"]),
         model_kwargs=model_kwargs,
     )
     policy = policy_bundle.model.to(accelerator.device)
-    if adaptation_mode == "token":
-        enable_sdpa_math_policy_forwards(policy)
     _load_accelerator_state_without_optimizer(accelerator, checkpoint)
     confidence_model.eval()
     accelerator.wait_for_everyone()

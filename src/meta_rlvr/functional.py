@@ -29,6 +29,15 @@ def policy_forward_context(model: nn.Module):
     return nullcontext()
 
 
+def sdpa_math_checkpoint_contexts():
+    """Use the same math attention backend in checkpoint forward/recompute."""
+
+    return (
+        sdpa_kernel(backends=[SDPBackend.MATH]),
+        sdpa_kernel(backends=[SDPBackend.MATH]),
+    )
+
+
 def trainable_parameter_state(
     model: nn.Module,
     *,

@@ -7,7 +7,12 @@ import torch
 from torch import Tensor, nn
 
 from .confidence import SequenceConfidenceModel
-from .functional import ParameterDict, trainable_parameter_state
+from .functional import (
+    ParameterDict,
+    enable_sdpa_math_policy_forwards,
+    sdpa_math_checkpoint_contexts,
+    trainable_parameter_state,
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +41,7 @@ def load_policy_with_lora(
     target_modules: tuple[str, ...],
     dtype: str = "bfloat16",
     gradient_checkpointing: bool = True,
+    force_sdpa_math: bool = False,
     trust_remote_code: bool = False,
     model_kwargs: dict[str, Any] | None = None,
 ) -> PolicyBundle:
@@ -70,9 +76,14 @@ def load_policy_with_lora(
         init_lora_weights=True,
     )
     policy = get_peft_model(policy, lora_config)
+    if force_sdpa_math:
+        enable_sdpa_math_policy_forwards(policy)
     if gradient_checkpointing:
+        gradient_checkpointing_kwargs = {"use_reentrant": False}
+        if force_sdpa_math:
+            gradient_checkpointing_kwargs["context_fn"] = sdpa_math_checkpoint_contexts
         policy.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
         )
         if not all(
             hasattr(policy, method)

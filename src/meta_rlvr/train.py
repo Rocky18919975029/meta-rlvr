@@ -31,7 +31,6 @@ from .data import (
     load_unique_dapo_problems,
     rank_shard,
 )
-from .functional import enable_sdpa_math_policy_forwards
 from .models import load_confidence_model, load_policy_with_lora
 from .rollout import TransformersRolloutEngine, VLLMHybridRolloutEngine
 from .types import RolloutGroup
@@ -1921,12 +1920,11 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
         target_modules=target_modules,
         dtype=args.dtype,
+        force_sdpa_math=args.token_meta_coefficient > 0,
         trust_remote_code=args.trust_remote_code,
         model_kwargs=model_kwargs,
     )
     policy = policy_bundle.model.to(accelerator.device)
-    if args.token_meta_coefficient > 0:
-        enable_sdpa_math_policy_forwards(policy)
 
     algorithm = BilevelGRPO(
         policy=policy,

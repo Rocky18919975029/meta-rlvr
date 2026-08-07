@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from meta_rlvr.bilevel import BilevelGRPO
 from meta_rlvr.confidence import SequenceConfidenceModel
@@ -20,6 +21,7 @@ import meta_rlvr.functional as functional_module
 from meta_rlvr.functional import (
     chunked_token_logprobs,
     enable_sdpa_math_policy_forwards,
+    sdpa_math_checkpoint_contexts,
     sequence_microbatches,
     token_logprobs,
     trainable_parameter_state,
@@ -80,6 +82,33 @@ def test_token_policy_sdpa_math_context_wraps_the_actual_forward(monkeypatch) ->
 
     assert [event[0] for event in events] == ["enter", "exit"]
     assert events[0][1] == (functional_module.SDPBackend.MATH,)
+
+
+def test_token_policy_checkpoint_recomputation_uses_sdpa_math(monkeypatch) -> None:
+    policy = ToyPolicy()
+    events = []
+
+    @contextmanager
+    def observed_sdpa_kernel(*, backends):
+        events.append(("enter", tuple(backends)))
+        try:
+            yield
+        finally:
+            events.append(("exit", tuple(backends)))
+
+    monkeypatch.setattr(functional_module, "sdpa_kernel", observed_sdpa_kernel)
+    enable_sdpa_math_policy_forwards(policy)
+    value = torch.randn(4, requires_grad=True)
+    output = checkpoint(
+        lambda tensor: torch.sin(tensor).square(),
+        value,
+        use_reentrant=False,
+        context_fn=sdpa_math_checkpoint_contexts,
+    )
+    output.sum().backward()
+
+    assert [event[0] for event in events] == ["enter", "exit", "enter", "exit"]
+    assert all(event[1] == (functional_module.SDPBackend.MATH,) for event in events)
 
 
 class HookedToyPolicy(ToyPolicy):
