@@ -156,6 +156,7 @@ echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_S
 echo "token_jvp_response_micro_batch_size=${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-4}"
 echo "token_jvp_logprob_position_chunk_size=${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}"
 echo "attn_implementation=${SMOKE_ATTN_IMPLEMENTATION:-sdpa}"
+echo "max_mean_absolute_logprob_delta=${SMOKE_MAX_MEAN_ABSOLUTE_LOGPROB_DELTA:-unset}"
 echo "max_peak_allocated_gib=${SMOKE_MAX_PEAK_ALLOCATED_GIB:-unset}"
 echo "resume_from_checkpoint=${SMOKE_RESUME_FROM_CHECKPOINT:-none}"
 echo "resume_preflight_only=${SMOKE_RESUME_PREFLIGHT_ONLY:-0}"
@@ -461,6 +462,44 @@ if peak_gib > limit_gib:
     raise RuntimeError(
         f"Peak allocated GPU memory {peak_gib:.2f} GiB exceeds "
         f"the smoke limit {limit_gib:.2f} GiB."
+    )
+PY
+fi
+
+if [[ -n "${SMOKE_MAX_MEAN_ABSOLUTE_LOGPROB_DELTA:-}" ]]; then
+  python - "${RUN_DIR}" "${SMOKE_MAX_MEAN_ABSOLUTE_LOGPROB_DELTA}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+run_dir = Path(sys.argv[1])
+limit = float(sys.argv[2])
+weighted_delta = 0.0
+tokens = 0
+for path in sorted(run_dir.glob("rollouts-rank-*.jsonl")):
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            record = json.loads(line)
+            delta = record.get("vllm_raw_vs_pytorch_raw_mean_absolute_delta")
+            if delta is None:
+                continue
+            completion_tokens = int(record["completion_tokens"])
+            weighted_delta += float(delta) * completion_tokens
+            tokens += completion_tokens
+if tokens == 0:
+    raise RuntimeError("Smoke run recorded no vLLM/PyTorch log-probability pairs.")
+mean_absolute_delta = weighted_delta / tokens
+result = {
+    "event": "logprob_parity_smoke_passed",
+    "mean_absolute_delta": mean_absolute_delta,
+    "limit": limit,
+    "completion_tokens": tokens,
+}
+print(json.dumps(result, sort_keys=True), flush=True)
+if mean_absolute_delta > limit:
+    raise RuntimeError(
+        f"vLLM/PyTorch mean absolute log-probability delta "
+        f"{mean_absolute_delta:.6f} exceeds the smoke limit {limit:.6f}."
     )
 PY
 fi
