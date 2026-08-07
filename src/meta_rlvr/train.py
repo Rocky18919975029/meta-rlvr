@@ -31,6 +31,7 @@ from .data import (
     load_unique_dapo_problems,
     rank_shard,
 )
+from .functional import enable_sdpa_math_policy_forwards
 from .models import load_confidence_model, load_policy_with_lora
 from .rollout import TransformersRolloutEngine, VLLMHybridRolloutEngine
 from .types import RolloutGroup
@@ -422,9 +423,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.token_meta_coefficient > 0:
         if args.meta_gradient_mode != "first_order":
             raise ValueError("Token confidence requires first_order meta-gradients.")
-        if args.attn_implementation != "eager":
+        if args.attn_implementation != "sdpa":
             raise ValueError(
-                "Token confidence exact JVP requires --attn-implementation eager."
+                "Token confidence requires --attn-implementation sdpa; policy "
+                "forwards are forced to the SDPA math backend for exact JVP."
             )
     target_modules = tuple(
         module.strip() for module in args.lora_target_modules.split(",")
@@ -1923,6 +1925,8 @@ def main() -> None:
         model_kwargs=model_kwargs,
     )
     policy = policy_bundle.model.to(accelerator.device)
+    if args.token_meta_coefficient > 0:
+        enable_sdpa_math_policy_forwards(policy)
 
     algorithm = BilevelGRPO(
         policy=policy,
@@ -2016,7 +2020,9 @@ def main() -> None:
         f"microbatch is {global_problem_micro_batch_size} "
         f"({local_problem_micro_batch_size} per rank, "
         f"{num_problem_micro_batches} accumulation microbatches); first-order "
-        f"VJP forward batch is {args.first_order_vjp_forward_batch_size}."
+        f"VJP forward batch is {args.first_order_vjp_forward_batch_size}; policy "
+        f"forward backend is "
+        f"{'sdpa_math' if args.token_meta_coefficient > 0 else args.attn_implementation}."
     )
 
     initial_fast = {

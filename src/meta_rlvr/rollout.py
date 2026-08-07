@@ -21,6 +21,7 @@ from torch import Tensor, nn
 from .data import MathProblem
 from .functional import (
     materialized_fast_parameters,
+    policy_forward_context,
     sequence_microbatches,
     token_logprobs,
 )
@@ -189,25 +190,26 @@ class TransformersRolloutEngine:
                         )
                         batch_ids = prompt_ids.expand(batch_size, -1)
                         batch_mask = prompt_mask.expand(batch_size, -1)
-                        sequences = self.model.generate(
-                            input_ids=batch_ids,
-                            attention_mask=batch_mask,
-                            do_sample=True,
-                            temperature=self.temperature,
-                            top_p=self.top_p,
-                            top_k=self.top_k,
-                            max_new_tokens=self.max_new_tokens,
-                            num_return_sequences=1,
-                            pad_token_id=self.tokenizer.pad_token_id,
-                            eos_token_id=self.tokenizer.eos_token_id,
-                            use_cache=True,
-                            # The frozen policy is replicated, not FSDP-sharded;
-                            # ranks decode independently without waiting for
-                            # the longest completion on another rank.
-                            synced_gpus=False,
-                            return_dict_in_generate=False,
-                            **self.generation_kwargs,
-                        )
+                        with policy_forward_context(self.model):
+                            sequences = self.model.generate(
+                                input_ids=batch_ids,
+                                attention_mask=batch_mask,
+                                do_sample=True,
+                                temperature=self.temperature,
+                                top_p=self.top_p,
+                                top_k=self.top_k,
+                                max_new_tokens=self.max_new_tokens,
+                                num_return_sequences=1,
+                                pad_token_id=self.tokenizer.pad_token_id,
+                                eos_token_id=self.tokenizer.eos_token_id,
+                                use_cache=True,
+                                # The frozen policy is replicated, not FSDP-sharded;
+                                # ranks decode independently without waiting for
+                                # the longest completion on another rank.
+                                synced_gpus=False,
+                                return_dict_in_generate=False,
+                                **self.generation_kwargs,
+                            )
                         if not isinstance(sequences, Tensor) or sequences.ndim != 2:
                             raise TypeError(
                                 "model.generate must return a rank-two tensor."

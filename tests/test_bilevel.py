@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -16,8 +16,10 @@ from meta_rlvr.config import (
     MetaLossConfig,
 )
 from meta_rlvr.data import ChatMessage, MathProblem
+import meta_rlvr.functional as functional_module
 from meta_rlvr.functional import (
     chunked_token_logprobs,
+    enable_sdpa_math_policy_forwards,
     sequence_microbatches,
     token_logprobs,
     trainable_parameter_state,
@@ -53,6 +55,31 @@ class ToyPolicy(nn.Module):
         hidden = self.embedding(input_ids)
         logits = self.base_head(hidden) + hidden @ self.adapter
         return SimpleNamespace(logits=logits)
+
+
+def test_token_policy_sdpa_math_context_wraps_the_actual_forward(monkeypatch) -> None:
+    torch.manual_seed(0)
+    policy = ToyPolicy()
+    group = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    events = []
+
+    @contextmanager
+    def observed_sdpa_kernel(*, backends):
+        events.append(("enter", tuple(backends)))
+        try:
+            yield
+        finally:
+            events.append(("exit", tuple(backends)))
+
+    monkeypatch.setattr(functional_module, "sdpa_kernel", observed_sdpa_kernel)
+    token_logprobs(policy, group)
+    assert events == []
+
+    enable_sdpa_math_policy_forwards(policy)
+    token_logprobs(policy, group)
+
+    assert [event[0] for event in events] == ["enter", "exit"]
+    assert events[0][1] == (functional_module.SDPBackend.MATH,)
 
 
 class HookedToyPolicy(ToyPolicy):

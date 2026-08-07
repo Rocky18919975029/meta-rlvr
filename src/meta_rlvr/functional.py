@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 from torch import Tensor, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.func import functional_call
 from torch.utils.checkpoint import checkpoint
 
@@ -13,6 +14,19 @@ from .types import RolloutGroup
 
 
 ParameterDict = dict[str, Tensor]
+_FORCE_SDPA_MATH_ATTRIBUTE = "_meta_rlvr_force_sdpa_math"
+
+
+def enable_sdpa_math_policy_forwards(model: nn.Module) -> None:
+    """Make policy forwards use the SDPA math backend for exact JVP parity."""
+
+    setattr(model, _FORCE_SDPA_MATH_ATTRIBUTE, True)
+
+
+def policy_forward_context(model: nn.Module):
+    if getattr(model, _FORCE_SDPA_MATH_ATTRIBUTE, False):
+        return sdpa_kernel(backends=[SDPBackend.MATH])
+    return nullcontext()
 
 
 def trainable_parameter_state(
@@ -117,10 +131,7 @@ def token_logprobs(
     activation_checkpointing: bool = False,
     logprob_position_chunk_size: int | None = None,
 ) -> Tensor:
-    if (
-        logprob_position_chunk_size is not None
-        and logprob_position_chunk_size <= 0
-    ):
+    if logprob_position_chunk_size is not None and logprob_position_chunk_size <= 0:
         raise ValueError("logprob_position_chunk_size must be positive.")
     if row_indices is not None:
         if row_start != 0 or row_end is not None:
@@ -152,9 +163,7 @@ def token_logprobs(
     input_ids = input_ids[:, :sequence_length]
     attention_mask = attention_mask[:, :sequence_length]
     expected = expected_full[:, : sequence_length - 1]
-    prediction_positions = torch.nonzero(
-        expected.any(dim=0), as_tuple=False
-    ).flatten()
+    prediction_positions = torch.nonzero(expected.any(dim=0), as_tuple=False).flatten()
     if prediction_positions.numel() == 0:
         raise ValueError("A policy microbatch contains no completion positions.")
     kwargs = {
@@ -168,30 +177,34 @@ def token_logprobs(
         kwargs["logits_to_keep"] = prediction_positions
 
     def forward_with_fast_parameters(*parameter_values: Tensor) -> Tensor:
-        if fast_parameters is None:
-            if parameter_values:
-                raise RuntimeError("Unexpected functional parameter values.")
-            outputs = model(**kwargs)
-        else:
-            parameter_names = tuple(fast_parameters)
-            if len(parameter_values) != len(parameter_names):
-                raise RuntimeError("Functional parameter count changed during forward.")
-            state = dict(zip(parameter_names, parameter_values, strict=True))
-            outputs = functional_call(
-                model,
-                state,
-                args=(),
-                kwargs=kwargs,
-                strict=False,
-            )
+        # Keep this context inside the checkpointed function.  Non-reentrant
+        # activation checkpointing executes this function again during backward;
+        # an outer context would not cover that recomputation.
+        with policy_forward_context(model):
+            if fast_parameters is None:
+                if parameter_values:
+                    raise RuntimeError("Unexpected functional parameter values.")
+                outputs = model(**kwargs)
+            else:
+                parameter_names = tuple(fast_parameters)
+                if len(parameter_values) != len(parameter_names):
+                    raise RuntimeError(
+                        "Functional parameter count changed during forward."
+                    )
+                state = dict(zip(parameter_names, parameter_values, strict=True))
+                outputs = functional_call(
+                    model,
+                    state,
+                    args=(),
+                    kwargs=kwargs,
+                    strict=False,
+                )
 
         logits = getattr(outputs, "logits", None)
         if logits is None:
             raise TypeError("Policy model must return logits.")
         if logits.ndim != 3 or logits.shape[0] != input_ids.shape[0]:
-            raise ValueError(
-                f"Unexpected policy logits shape {tuple(logits.shape)}."
-            )
+            raise ValueError(f"Unexpected policy logits shape {tuple(logits.shape)}.")
         if logits.shape[1] == input_ids.shape[1]:
             completion_logits = logits.index_select(1, prediction_positions)
         elif uses_selected_logits and logits.shape[1] == prediction_positions.numel():
@@ -307,8 +320,7 @@ def materialized_fast_parameters(
         raise KeyError(f"Unknown fast parameter names: {sorted(unknown)}")
 
     backups = {
-        name: named_parameters[name].detach().clone()
-        for name in fast_parameters
+        name: named_parameters[name].detach().clone() for name in fast_parameters
     }
     try:
         with torch.no_grad():

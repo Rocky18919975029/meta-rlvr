@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 
 from .bilevel import BilevelGRPO
 from .data import MathProblem, load_semantically_unique_dapo_problems
+from .functional import enable_sdpa_math_policy_forwards
 from .models import load_confidence_model, load_policy_with_lora
 from .optim import FastOptimizerState
 from .rollout import VLLMHybridRolloutEngine
@@ -25,16 +26,12 @@ from .types import RolloutGroup
 from .verifier import DAPOMathVerifier, VerificationBatch
 
 
-DEFAULT_EVALUATION_PARQUET = Path(
-    "/data/user/zhongal/data/reschedule/aime24.parquet"
-)
+DEFAULT_EVALUATION_PARQUET = Path("/data/user/zhongal/data/reschedule/aime24.parquet")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate a Meta-RLVR confidence checkpoint on any DAPO parquet."
-        )
+        description=("Evaluate a Meta-RLVR confidence checkpoint on any DAPO parquet.")
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument(
@@ -76,11 +73,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     for name, value in positive.items():
         if value <= 0:
             raise ValueError(f"{name} must be positive.")
-    if min(
-        args.support_group_size,
-        args.base_query_group_size,
-        args.adapted_query_group_size,
-    ) < 2:
+    if (
+        min(
+            args.support_group_size,
+            args.base_query_group_size,
+            args.adapted_query_group_size,
+        )
+        < 2
+    ):
         raise ValueError("Every rollout group size must be at least two.")
     if args.max_problems is not None and args.max_problems <= 0:
         raise ValueError("max_problems must be positive.")
@@ -111,9 +111,7 @@ def _response_confidences(
         return adaptation.confidence_probabilities.detach().cpu().tolist()
     probabilities = adaptation.token_confidence_probabilities.detach()
     mask = support.completion_mask.to(probabilities.dtype)
-    return (
-        (probabilities * mask).sum(dim=1) / mask.sum(dim=1)
-    ).cpu().tolist()
+    return ((probabilities * mask).sum(dim=1) / mask.sum(dim=1)).cpu().tolist()
 
 
 def _chunks(items: list, size: int) -> list[list]:
@@ -187,9 +185,7 @@ def _write_group(
             "response": response,
         }
         if confidence_probabilities is not None:
-            record["confidence_probability"] = confidence_probabilities[
-                response_index
-            ]
+            record["confidence_probability"] = confidence_probabilities[response_index]
         if adaptation_round is not None:
             record["adaptation_round"] = adaptation_round
         stream.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -209,8 +205,7 @@ def _optimizer_state_to(
     return FastOptimizerState(
         step=state.step,
         first_moment={
-            name: value.to(device)
-            for name, value in state.first_moment.items()
+            name: value.to(device) for name, value in state.first_moment.items()
         },
         second_moment={
             name: value.to(device) for name, value in state.second_moment.items()
@@ -276,9 +271,7 @@ def _summary_from_totals(
         "support": support,
         "base_query": base_query,
         "adapted_query": adapted_query,
-        "query_accuracy_delta": (
-            adapted_query["accuracy"] - base_query["accuracy"]
-        ),
+        "query_accuracy_delta": (adapted_query["accuracy"] - base_query["accuracy"]),
         "query_pass_delta": (
             adapted_query["pass_at_group"] - base_query["pass_at_group"]
         ),
@@ -303,12 +296,8 @@ def _summary_from_totals(
         "adapted_query_equal_problems": int(values[14]),
         "confidence": {
             "mean": values[15] / values[16],
-            "correct_mean": (
-                None if values[18] == 0 else values[17] / values[18]
-            ),
-            "incorrect_mean": (
-                None if values[20] == 0 else values[19] / values[20]
-            ),
+            "correct_mean": (None if values[18] == 0 else values[17] / values[18]),
+            "incorrect_mean": (None if values[20] == 0 else values[19] / values[20]),
             "brier": values[21] / values[16],
             "bce": values[22] / values[16],
             "responses": int(values[16]),
@@ -327,6 +316,16 @@ def main() -> None:
         (source_run_dir / "run_config.json").read_text(encoding="utf-8")
     )
     adaptation_mode = _adaptation_mode(source_config)
+    if (
+        adaptation_mode == "token"
+        and source_config.get("attn_implementation") != "sdpa"
+    ):
+        raise ValueError(
+            "Corrected token-confidence evaluation requires a checkpoint trained "
+            "with attn_implementation='sdpa'. Legacy eager token checkpoints used "
+            "a rollout/policy-logprob mismatch and must not be compared as corrected "
+            "runs."
+        )
     if adaptation_mode == "token" and args.adaptation_rounds != 1:
         raise ValueError("Token checkpoint evaluation currently requires one round.")
     trainer_state = json.loads(
@@ -380,6 +379,8 @@ def main() -> None:
         model_kwargs=model_kwargs,
     )
     policy = policy_bundle.model.to(accelerator.device)
+    if adaptation_mode == "token":
+        enable_sdpa_math_policy_forwards(policy)
     _load_accelerator_state_without_optimizer(accelerator, checkpoint)
     confidence_model.eval()
     accelerator.wait_for_everyone()
@@ -404,9 +405,7 @@ def main() -> None:
         first_order_vjp_forward_batch_size=int(
             source_config["first_order_vjp_forward_batch_size"]
         ),
-        confidence_micro_batch_size=int(
-            source_config["confidence_micro_batch_size"]
-        ),
+        confidence_micro_batch_size=int(source_config["confidence_micro_batch_size"]),
         policy_max_tokens_per_micro_batch=source_config.get(
             "policy_max_tokens_per_micro_batch"
         ),
@@ -438,9 +437,7 @@ def main() -> None:
             generation_micro_batch_size=int(
                 source_config["generation_micro_batch_size"]
             ),
-            logprob_micro_batch_size=int(
-                source_config["policy_micro_batch_size"]
-            ),
+            logprob_micro_batch_size=int(source_config["policy_micro_batch_size"]),
             logprob_max_tokens_per_micro_batch=source_config.get(
                 "policy_max_tokens_per_micro_batch"
             ),
@@ -483,6 +480,11 @@ def main() -> None:
         "checkpoint_step": checkpoint_step,
         "checkpoint_world_size": int(trainer_state["world_size"]),
         "adaptation_mode": adaptation_mode,
+        "policy_forward_backend": (
+            "sdpa_math"
+            if adaptation_mode == "token"
+            else model_kwargs["attn_implementation"]
+        ),
         "source_run_dir": str(source_run_dir),
         "dataset_parquet": str(dataset_path),
         "dataset_sha256": _sha256(dataset_path),
@@ -490,9 +492,7 @@ def main() -> None:
         "model": str(args.model),
         "support_group_size": args.support_group_size,
         "adaptation_rounds": args.adaptation_rounds,
-        "total_support_group_size": (
-            args.support_group_size * args.adaptation_rounds
-        ),
+        "total_support_group_size": (args.support_group_size * args.adaptation_rounds),
         "base_query_group_size": args.base_query_group_size,
         "adapted_query_group_size": args.adapted_query_group_size,
         "seed": args.seed,
@@ -612,8 +612,7 @@ def main() -> None:
             )
             for indices in adaptation_progress:
                 device_batch = tuple(
-                    verified_supports[index].to(accelerator.device)
-                    for index in indices
+                    verified_supports[index].to(accelerator.device) for index in indices
                 )
                 if round_index == 0:
                     if adaptation_mode == "sequence":
@@ -849,10 +848,15 @@ def main() -> None:
                 )
                 totals += torch.tensor(
                     (
-                        sum(support_correct), len(support_correct),
-                        base_score, len(base_correct),
-                        adapted_score, len(adapted_correct),
-                        support_pass, base_pass, adapted_pass,
+                        sum(support_correct),
+                        len(support_correct),
+                        base_score,
+                        len(base_correct),
+                        adapted_score,
+                        len(adapted_correct),
+                        support_pass,
+                        base_pass,
+                        adapted_pass,
                         support_pass or base_pass,
                         support_pass or adapted_pass,
                         1,
@@ -888,9 +892,7 @@ def main() -> None:
                     "adapted_query_pass": adapted_pass,
                     "adaptation_rounds": args.adaptation_rounds,
                     "support_seed": support_seeds_by_round[0][index],
-                    "support_seeds": [
-                        seeds[index] for seeds in support_seeds_by_round
-                    ],
+                    "support_seeds": [seeds[index] for seeds in support_seeds_by_round],
                     "query_seed": query_seeds[index],
                     "confidence_probabilities": confidence_probabilities[index],
                     "mean_confidence": sum(confidence_probabilities[index])
@@ -929,9 +931,7 @@ def main() -> None:
             "seconds": time.perf_counter() - started,
             **_summary_from_totals(
                 totals,
-                support_group_size=(
-                    args.support_group_size * args.adaptation_rounds
-                ),
+                support_group_size=(args.support_group_size * args.adaptation_rounds),
                 base_query_group_size=args.base_query_group_size,
                 adapted_query_group_size=args.adapted_query_group_size,
             ),

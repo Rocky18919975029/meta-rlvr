@@ -156,6 +156,7 @@ echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_S
 echo "token_jvp_response_micro_batch_size=${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-4}"
 echo "token_jvp_logprob_position_chunk_size=${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}"
 echo "attn_implementation=${SMOKE_ATTN_IMPLEMENTATION:-sdpa}"
+echo "max_peak_allocated_gib=${SMOKE_MAX_PEAK_ALLOCATED_GIB:-unset}"
 echo "resume_from_checkpoint=${SMOKE_RESUME_FROM_CHECKPOINT:-none}"
 echo "resume_preflight_only=${SMOKE_RESUME_PREFLIGHT_ONLY:-0}"
 echo "confidence_micro_batch_size=${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}"
@@ -431,6 +432,37 @@ if [[ "${trainer_status}" -ne 0 ]]; then
   fi
   echo "Distributed trainer exited with status ${trainer_status}." >&2
   exit "${trainer_status}"
+fi
+
+if [[ -n "${SMOKE_MAX_PEAK_ALLOCATED_GIB:-}" ]]; then
+  python - "${RUN_DIR}/metrics.jsonl" "${SMOKE_MAX_PEAK_ALLOCATED_GIB}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metrics_path = Path(sys.argv[1])
+limit_gib = float(sys.argv[2])
+peaks = []
+with metrics_path.open(encoding="utf-8") as stream:
+    for line in stream:
+        record = json.loads(line)
+        if "checkpoint/peak_allocated_gib" in record:
+            peaks.append(float(record["checkpoint/peak_allocated_gib"]))
+if not peaks:
+    raise RuntimeError("Smoke run did not record checkpoint peak GPU memory.")
+peak_gib = max(peaks)
+result = {
+    "event": "peak_memory_smoke_passed",
+    "peak_allocated_gib": peak_gib,
+    "limit_gib": limit_gib,
+}
+print(json.dumps(result, sort_keys=True), flush=True)
+if peak_gib > limit_gib:
+    raise RuntimeError(
+        f"Peak allocated GPU memory {peak_gib:.2f} GiB exceeds "
+        f"the smoke limit {limit_gib:.2f} GiB."
+    )
+PY
 fi
 
 echo "[$(date --iso-8601=seconds)] ${RUN_LABEL} test completed successfully"
