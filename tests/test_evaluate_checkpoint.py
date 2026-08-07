@@ -4,11 +4,16 @@ import pytest
 import torch
 
 from meta_rlvr.evaluate_checkpoint import (
+    DEFAULT_EVALUATION_PARQUET,
     _adaptation_mode,
     _response_confidences,
     _summary_from_totals,
     _support_round_summaries,
 )
+
+
+def test_default_evaluation_dataset_is_aime24() -> None:
+    assert DEFAULT_EVALUATION_PARQUET.name == "aime24.parquet"
 
 
 def test_checkpoint_evaluation_summary_reports_query_and_total_budgets() -> None:

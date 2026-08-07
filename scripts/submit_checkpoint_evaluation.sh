@@ -2,12 +2,12 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 --checkpoint PATH --dataset PARQUET --label NAME [options]" >&2
+  echo "Usage: $0 --checkpoint PATH --label NAME [--dataset PARQUET] [options]" >&2
   exit 2
 }
 
 CHECKPOINT=""
-DATASET=""
+DATASET="/data/user/zhongal/data/reschedule/aime24.parquet"
 LABEL=""
 while (($#)); do
   case "$1" in
@@ -29,7 +29,7 @@ while (($#)); do
     *) usage ;;
   esac
 done
-[[ -n "${CHECKPOINT}" && -n "${DATASET}" && -n "${LABEL}" ]] || usage
+[[ -n "${CHECKPOINT}" && -n "${LABEL}" ]] || usage
 
 export META_RLVR_PROJECT_DIR="${HOME}/meta-rlvr"
 export META_RLVR_CONDA_ENV="verl"
@@ -94,22 +94,18 @@ cd "${META_RLVR_PROJECT_DIR}"
 python src/meta_rlvr/vllm_preflight.py
 mkdir -p logs outputs
 
-SBATCH_ARGS=(
-  --job-name="meta-rlvr-eval"
-  --partition="${SLURM_PARTITION}"
-  --gres="gpu:${EVAL_GPUS}"
-  --cpus-per-task="${SLURM_CPUS_PER_TASK}"
-  --mem="${SLURM_MEM}"
-  --time="${SLURM_TIME}"
-  --exclude="${SLURM_EXCLUDE}"
-  --output="${META_RLVR_PROJECT_DIR}/logs/${LABEL}-%j.out"
-  --error="${META_RLVR_PROJECT_DIR}/logs/${LABEL}-%j.err"
-  --export=ALL
-)
-if [[ -n "${SLURM_DEPENDENCY:-}" ]]; then
-  SBATCH_ARGS+=(--dependency="${SLURM_DEPENDENCY}")
-fi
-submission=$(sbatch "${SBATCH_ARGS[@]}" scripts/slurm_checkpoint_evaluation.sbatch)
+submission=$(sbatch \
+  --job-name="meta-rlvr-eval" \
+  --partition="${SLURM_PARTITION}" \
+  --gres="gpu:${EVAL_GPUS}" \
+  --cpus-per-task="${SLURM_CPUS_PER_TASK}" \
+  --mem="${SLURM_MEM}" \
+  --time="${SLURM_TIME}" \
+  --exclude="${SLURM_EXCLUDE}" \
+  --output="${META_RLVR_PROJECT_DIR}/logs/${LABEL}-%j.out" \
+  --error="${META_RLVR_PROJECT_DIR}/logs/${LABEL}-%j.err" \
+  --export=ALL \
+  scripts/slurm_checkpoint_evaluation.sbatch)
 job_id="${submission##* }"
 result_dir="${META_RLVR_PROJECT_DIR}/outputs/${LABEL}-${job_id}"
 

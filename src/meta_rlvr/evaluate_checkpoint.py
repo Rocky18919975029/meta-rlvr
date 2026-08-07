@@ -25,6 +25,11 @@ from .types import RolloutGroup
 from .verifier import DAPOMathVerifier, VerificationBatch
 
 
+DEFAULT_EVALUATION_PARQUET = Path(
+    "/data/user/zhongal/data/reschedule/aime24.parquet"
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -32,7 +37,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--dataset-parquet", type=Path, required=True)
+    parser.add_argument(
+        "--dataset-parquet",
+        type=Path,
+        default=DEFAULT_EVALUATION_PARQUET,
+        help=f"Evaluation parquet (default: {DEFAULT_EVALUATION_PARQUET}).",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--vllm-base-urls", required=True)
