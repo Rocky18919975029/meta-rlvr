@@ -37,6 +37,7 @@ python -m meta_rlvr.probe_vllm_logprob_parity \
   --group-size "${PARITY_GROUP_SIZE:-16}" \
   --max-new-tokens "${PARITY_MAX_NEW_TOKENS:-3072}" \
   --response-micro-batch-size "${PARITY_RESPONSE_MICRO_BATCH_SIZE:-4}" \
+  --jvp-sequence-tokens "${PARITY_JVP_SEQUENCE_TOKENS:-3072}" \
   --max-tokens-per-micro-batch "${PARITY_MAX_TOKENS_PER_MICRO_BATCH:-16384}" \
   --logprob-position-chunk-size "${PARITY_LOGPROB_POSITION_CHUNK_SIZE:-256}" \
   --adapter-root "/dev/shm/meta-rlvr-parity-${SLURM_JOB_ID}" \

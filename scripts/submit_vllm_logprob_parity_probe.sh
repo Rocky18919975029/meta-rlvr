@@ -9,6 +9,7 @@ export META_RLVR_TRAIN_PARQUET="/data/user/zhongal/data/reschedule/DAPO-Math-17k
 export PARITY_GROUP_SIZE="${PARITY_GROUP_SIZE:-16}"
 export PARITY_MAX_NEW_TOKENS="${PARITY_MAX_NEW_TOKENS:-3072}"
 export PARITY_RESPONSE_MICRO_BATCH_SIZE="${PARITY_RESPONSE_MICRO_BATCH_SIZE:-4}"
+export PARITY_JVP_SEQUENCE_TOKENS="${PARITY_JVP_SEQUENCE_TOKENS:-3072}"
 export PARITY_MAX_TOKENS_PER_MICRO_BATCH="${PARITY_MAX_TOKENS_PER_MICRO_BATCH:-16384}"
 export PARITY_LOGPROB_POSITION_CHUNK_SIZE="${PARITY_LOGPROB_POSITION_CHUNK_SIZE:-256}"
 
@@ -54,7 +55,7 @@ submission=$(sbatch \
 job_id="${submission##* }"
 
 echo "${submission}"
-echo "configuration: K=${PARITY_GROUP_SIZE} max_new_tokens=${PARITY_MAX_NEW_TOKENS} response_micro_batch=${PARITY_RESPONSE_MICRO_BATCH_SIZE}"
+echo "configuration: K=${PARITY_GROUP_SIZE} max_new_tokens=${PARITY_MAX_NEW_TOKENS} jvp_sequence_tokens=${PARITY_JVP_SEQUENCE_TOKENS} response_micro_batch=${PARITY_RESPONSE_MICRO_BATCH_SIZE}"
 echo "stdout: ${META_RLVR_PROJECT_DIR}/logs/vllm-logprob-parity-${job_id}.out"
 echo "stderr/progress: ${META_RLVR_PROJECT_DIR}/logs/vllm-logprob-parity-${job_id}.err"
 echo "vLLM: ${META_RLVR_PROJECT_DIR}/logs/vllm-${job_id}/gpu-0.log"
