@@ -201,6 +201,9 @@ def test_token_credit_definition_is_strict_on_resume(tmp_path) -> None:
         token_meta_coefficient=1.0,
     )
     _initialize_or_validate_run(legacy, accelerator=accelerator)
+    saved = json.loads((output / "run_config.json").read_text())
+    assert saved["token_credit_parameterization"] == "scaled_tanh_v1"
+    assert saved["token_credit_cross_trajectory_normalization"] is False
 
     changed = Namespace(
         output_dir=output,

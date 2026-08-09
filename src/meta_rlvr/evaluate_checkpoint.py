@@ -13,6 +13,10 @@ from tqdm.auto import tqdm
 
 from .bilevel import BilevelGRPO
 from .data import MathProblem, load_semantically_unique_dapo_problems
+from .losses import (
+    TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION,
+    TOKEN_CREDIT_PARAMETERIZATION,
+)
 from .models import load_confidence_model, load_policy_with_lora
 from .optim import FastOptimizerState
 from .rollout import VLLMHybridRolloutEngine
@@ -367,6 +371,13 @@ def main() -> None:
             "Evaluate it with the matching legacy code; do not silently reinterpret "
             "its token head."
         )
+    if adaptation_mode == "token" and (
+        source_config.get("token_credit_parameterization")
+        != TOKEN_CREDIT_PARAMETERIZATION
+        or source_config.get("token_credit_cross_trajectory_normalization")
+        is not TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION
+    ):
+        raise ValueError("Token-credit checkpoint metadata does not match this code.")
     if adaptation_mode == "token" and args.adaptation_rounds != 1:
         raise ValueError("Token checkpoint evaluation currently requires one round.")
     trainer_state = json.loads(
@@ -566,7 +577,7 @@ def main() -> None:
         "inner_iterations": inner_config.num_iterations,
         "inner_learning_rate": inner_config.optimizer.learning_rate,
         "token_credit_parameterization": (
-            "maximum * tanh(logit)" if adaptation_mode == "token" else None
+            TOKEN_CREDIT_PARAMETERIZATION if adaptation_mode == "token" else None
         ),
         "token_credit_max": (
             float(source_config["token_credit_max"])
@@ -574,7 +585,9 @@ def main() -> None:
             else None
         ),
         "token_credit_cross_trajectory_normalization": (
-            False if adaptation_mode == "token" else None
+            TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION
+            if adaptation_mode == "token"
+            else None
         ),
         "max_new_tokens": max_new_tokens,
         "adaptation_temperature": args.adaptation_temperature,

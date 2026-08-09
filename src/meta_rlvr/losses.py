@@ -9,6 +9,10 @@ from torch import Tensor
 from .config import AdvantageConfig, ConfidenceLossConfig, GRPOLossConfig
 
 
+TOKEN_CREDIT_PARAMETERIZATION = "scaled_tanh_v1"
+TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION = False
+
+
 @dataclass(frozen=True)
 class ConfidenceLossOutput:
     loss: Tensor
@@ -170,17 +174,17 @@ def token_grpo_policy_loss(
     current_logprobs: Tensor,
     old_logprobs: Tensor,
     completion_mask: Tensor,
-    token_advantages: Tensor,
+    token_credits: Tensor,
     config: GRPOLossConfig,
     *,
     reference_logprobs: Tensor | None = None,
 ) -> GRPOLossOutput:
-    """Standard GRPO/PPO loss with one independently learned advantage per token."""
+    """GRPO/PPO loss with one independent learned credit per sampled token."""
     if current_logprobs.ndim != 2:
         raise ValueError("current_logprobs must have shape [K, T].")
     for name, value in (
         ("old_logprobs", old_logprobs),
-        ("token_advantages", token_advantages),
+        ("token_credits", token_credits),
     ):
         if value.shape != current_logprobs.shape:
             raise ValueError(f"{name} must match current_logprobs.")
@@ -200,21 +204,21 @@ def token_grpo_policy_loss(
 
     if config.use_importance_ratio:
         ratios = torch.exp(current_logprobs - old_logprobs)
-        unclipped = ratios * token_advantages
+        unclipped = ratios * token_credits
         if config.use_clipping:
             clipped_ratios = torch.clamp(
                 ratios,
                 min=1.0 - config.clip_epsilon_low,
                 max=1.0 + config.clip_epsilon_high,
             )
-            clipped = clipped_ratios * token_advantages
+            clipped = clipped_ratios * token_credits
             surrogate = torch.minimum(unclipped, clipped)
             clipped_tokens = (unclipped != clipped) & completion_mask
         else:
             surrogate = unclipped
             clipped_tokens = torch.zeros_like(completion_mask)
     else:
-        surrogate = current_logprobs * token_advantages
+        surrogate = current_logprobs * token_credits
         clipped_tokens = torch.zeros_like(completion_mask)
 
     if config.kl_coefficient > 0:

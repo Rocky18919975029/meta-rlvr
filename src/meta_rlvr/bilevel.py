@@ -676,10 +676,10 @@ class BilevelGRPO:
     def _token_gradient_operator(
         self,
         support: RolloutGroup,
-        token_advantages: Tensor,
+        token_credits: Tensor,
         fast_parameters: Mapping[str, Tensor],
     ) -> tuple[ParameterDict, GRPOLossOutput]:
-        """First-order policy gradient with an exact JVP to token rewards."""
+        """First-order policy gradient with an exact JVP to token credits."""
         algorithm = self
         names = tuple(fast_parameters)
         config = self.inner_config.grpo
@@ -871,7 +871,7 @@ class BilevelGRPO:
                 return (advantage_gradient, *(None for _ in names))
 
         outputs = TokenPolicyGradient.apply(
-            token_advantages,
+            token_credits,
             *(fast_parameters[name] for name in names),
         )
         gradient_values = outputs[: len(names)]
@@ -889,13 +889,13 @@ class BilevelGRPO:
     def _nondifferentiable_token_inner_gradients(
         self,
         support: RolloutGroup,
-        token_advantages: Tensor,
+        token_credits: Tensor,
         fast_parameters: Mapping[str, Tensor],
     ) -> tuple[ParameterDict, GRPOLossOutput]:
-        detached_advantages = token_advantages.detach().requires_grad_(True)
+        detached_credits = token_credits.detach().requires_grad_(True)
         gradients, output = self._token_gradient_operator(
             support,
-            detached_advantages,
+            detached_credits,
             fast_parameters,
         )
         return (

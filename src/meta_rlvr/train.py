@@ -31,6 +31,10 @@ from .data import (
     load_unique_dapo_problems,
     rank_shard,
 )
+from .losses import (
+    TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION,
+    TOKEN_CREDIT_PARAMETERIZATION,
+)
 from .models import load_confidence_model, load_policy_with_lora
 from .rollout import TransformersRolloutEngine, VLLMHybridRolloutEngine
 from .types import RolloutGroup
@@ -637,6 +641,11 @@ def _serializable_run_config(args: argparse.Namespace, *, world_size: int) -> di
     }
     if float(serializable.get("token_meta_coefficient", 0.0)) <= 0:
         serializable.pop("token_credit_max", None)
+    else:
+        serializable["token_credit_parameterization"] = TOKEN_CREDIT_PARAMETERIZATION
+        serializable["token_credit_cross_trajectory_normalization"] = (
+            TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION
+        )
     serializable["distributed_world_size"] = world_size
     return serializable
 
@@ -1320,7 +1329,7 @@ def _accumulate_outer_batch(
             "confidence_model is required when gradient synchronization is deferred."
         )
 
-    local_metric_sums = torch.zeros(26, dtype=torch.float32, device=accelerator.device)
+    local_metric_sums = torch.zeros(28, dtype=torch.float32, device=accelerator.device)
     problem_progress = tqdm(
         total=local_problem_batch_size,
         desc=progress_description,
@@ -1437,6 +1446,27 @@ def _accumulate_outer_batch(
                 .square()
                 .mean()
             )
+            token_credit_absolute = (
+                zero
+                if token_output is None
+                else token_output.adaptation.token_credits.detach()[
+                    support.completion_mask
+                ]
+                .abs()
+                .mean()
+            )
+            token_credit_saturation = (
+                zero
+                if token_output is None
+                else (
+                    token_output.adaptation.token_credits.detach()[
+                        support.completion_mask
+                    ].abs()
+                    >= 0.95 * algorithm.token_credit_max
+                )
+                .float()
+                .mean()
+            )
             local_metric_sums += torch.stack(
                 (
                     problem_losses[index].detach(),
@@ -1531,6 +1561,8 @@ def _accumulate_outer_batch(
                         if token_query is None
                         else torch.any(token_query.correctness_labels == 1).float()
                     ),
+                    token_credit_absolute,
+                    token_credit_saturation,
                 )
             )
             problem_progress.update(1)
@@ -2542,6 +2574,8 @@ def main() -> None:
                     "support_pass_at_group": metrics[23].item(),
                     "query_pass_at_group": metrics[24].item(),
                     "token_query_pass_at_group": metrics[25].item(),
+                    "token_credit_abs_mean": metrics[26].item(),
+                    "token_credit_saturation_fraction": metrics[27].item(),
                     "confidence_gradient_norm": reduced_gradient_norm.item(),
                     "confidence_learning_rate": confidence_optimizer.param_groups[0][
                         "lr"
