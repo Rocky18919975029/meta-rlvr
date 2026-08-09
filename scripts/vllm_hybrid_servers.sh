@@ -42,6 +42,7 @@ start_meta_rlvr_vllm_servers() {
   local startup_timeout="${VLLM_STARTUP_TIMEOUT:-300}"
   local control_timeout="${VLLM_CONTROL_TIMEOUT:-120}"
   local first_port
+  local first_dp_port
   if [[ -n "${VLLM_FIRST_PORT:-}" ]]; then
     first_port="${VLLM_FIRST_PORT}"
   elif [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]]; then
@@ -49,6 +50,7 @@ start_meta_rlvr_vllm_servers() {
   else
     first_port=18100
   fi
+  first_dp_port="${VLLM_FIRST_DP_PORT:-$((first_port + 10000))}"
   local log_dir="${META_RLVR_PROJECT_DIR%/}/logs/vllm-${SLURM_JOB_ID:-manual}"
   local gpu
   local port
@@ -57,6 +59,7 @@ start_meta_rlvr_vllm_servers() {
   local visible_devices=()
   local cuda_device
   local replica_cache
+  local dp_port
   mkdir -p "${log_dir}"
 
   if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -69,13 +72,20 @@ start_meta_rlvr_vllm_servers() {
     return 2
   fi
 
-  python - "${first_port}" "${gpu_count}" <<'PY'
+  python - "${first_port}" "${first_dp_port}" "${gpu_count}" <<'PY'
 import socket
 import sys
 
 first_port = int(sys.argv[1])
-gpu_count = int(sys.argv[2])
-for port in range(first_port, first_port + gpu_count):
+first_dp_port = int(sys.argv[2])
+gpu_count = int(sys.argv[3])
+ports = [
+    *range(first_port, first_port + gpu_count),
+    *range(first_dp_port, first_dp_port + gpu_count),
+]
+if len(set(ports)) != len(ports):
+    raise RuntimeError("vLLM API and internal DP port ranges overlap")
+for port in ports:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         try:
             sock.bind(("127.0.0.1", port))
@@ -95,6 +105,7 @@ PY
 
   for ((gpu = 0; gpu < gpu_count; gpu++)); do
     port=$((first_port + gpu))
+    dp_port=$((first_dp_port + gpu))
     url="http://127.0.0.1:${port}"
     urls+=("${url}")
     cuda_device="${visible_devices[${gpu}]}"
@@ -105,6 +116,8 @@ PY
       -u PYTORCH_CUDA_ALLOC_CONF \
       -u PYTORCH_ALLOC_CONF \
       CUDA_VISIBLE_DEVICES="${cuda_device}" \
+      VLLM_DP_MASTER_IP="127.0.0.1" \
+      VLLM_DP_MASTER_PORT="${dp_port}" \
       VLLM_CACHE_ROOT="${replica_cache}/vllm" \
       TORCHINDUCTOR_CACHE_DIR="${replica_cache}/torchinductor" \
       TRITON_CACHE_DIR="${replica_cache}/triton" \

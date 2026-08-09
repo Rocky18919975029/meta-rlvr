@@ -58,3 +58,11 @@ def test_vllm_sleep_process_does_not_inherit_expandable_segments() -> None:
 
     assert "-u PYTORCH_CUDA_ALLOC_CONF" in server_environment
     assert "-u PYTORCH_ALLOC_CONF" in server_environment
+
+
+def test_each_vllm_replica_receives_an_isolated_internal_dp_port() -> None:
+    launcher = launcher_path.read_text(encoding="utf-8")
+
+    assert 'first_dp_port="${VLLM_FIRST_DP_PORT:-$((first_port + 10000))}"' in launcher
+    assert "dp_port=$((first_dp_port + gpu))" in launcher
+    assert 'VLLM_DP_MASTER_PORT="${dp_port}"' in launcher
