@@ -53,8 +53,17 @@ def parameter_gradients(model: nn.Module) -> dict[str, Tensor]:
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
+        # FSDP with use_orig_params=True exposes an empty local view on ranks
+        # that own no shard of an original parameter. Such a view correctly
+        # has grad=None and contributes no elements to the distributed totals.
+        if parameter.numel() == 0:
+            continue
         if parameter.grad is None:
-            raise RuntimeError(f"Trainable parameter {name!r} received no gradient.")
+            raise RuntimeError(
+                f"Non-empty trainable parameter {name!r} received no gradient."
+            )
+        if parameter.grad.shape != parameter.shape:
+            raise RuntimeError(f"Gradient shape mismatch for parameter {name!r}.")
         gradients[name] = parameter.grad.detach().float().cpu().clone()
     if not gradients:
         raise RuntimeError("Model exposes no trainable parameter gradients.")
