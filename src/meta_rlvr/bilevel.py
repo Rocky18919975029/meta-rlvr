@@ -11,6 +11,7 @@ from .config import (
     GRPOLossConfig,
     InnerLoopConfig,
     MetaLossConfig,
+    TokenMetaGradientMode,
 )
 from .functional import (
     ParameterDict,
@@ -66,9 +67,36 @@ class TokenTaskAdaptation:
 @dataclass(frozen=True)
 class TokenTaskOuterLoss:
     loss: Tensor
+    meta_objective: Tensor
     meta_grpo: GRPOLossOutput
-    adaptation: TokenTaskAdaptation
+    token_confidence_logits: Tensor
+    token_credits: Tensor
+    inner_grpo: GRPOLossOutput
     query_advantages: Tensor
+    adaptation: TokenTaskAdaptation | None
+
+
+@dataclass(frozen=True)
+class TokenGradientAlignmentContext:
+    """Policy-only quantities reused by every confidence outer iteration."""
+
+    support_logprobs: Tensor
+    support_directional_logprobs: Tensor
+    query_grpo: GRPOLossOutput
+    query_advantages: Tensor
+
+    def to(self, device: torch.device | str) -> TokenGradientAlignmentContext:
+        return TokenGradientAlignmentContext(
+            support_logprobs=self.support_logprobs.to(device),
+            support_directional_logprobs=(self.support_directional_logprobs.to(device)),
+            query_grpo=GRPOLossOutput(
+                loss=self.query_grpo.loss.to(device),
+                policy_loss=self.query_grpo.policy_loss.to(device),
+                mean_kl=self.query_grpo.mean_kl.to(device),
+                clip_fraction=self.query_grpo.clip_fraction.to(device),
+            ),
+            query_advantages=self.query_advantages.to(device),
+        )
 
 
 class BilevelGRPO:
@@ -91,6 +119,7 @@ class BilevelGRPO:
         token_jvp_response_micro_batch_size: int = 4,
         token_jvp_logprob_position_chunk_size: int = 256,
         token_credit_max: float = 1.0,
+        token_meta_gradient_mode: TokenMetaGradientMode = "gradient_alignment",
     ) -> None:
         if policy_micro_batch_size <= 0 or confidence_micro_batch_size <= 0:
             raise ValueError("Micro-batch sizes must be positive.")
@@ -102,6 +131,8 @@ class BilevelGRPO:
             raise ValueError("Token JVP position chunk size must be positive.")
         if token_credit_max <= 0:
             raise ValueError("Maximum token-credit magnitude must be positive.")
+        if token_meta_gradient_mode not in ("gradient_alignment", "unrolled"):
+            raise ValueError("Unsupported token meta-gradient mode.")
         self.policy = policy
         self.confidence_model = confidence_model
         self.inner_config = inner_config
@@ -120,6 +151,7 @@ class BilevelGRPO:
             token_jvp_logprob_position_chunk_size
         )
         self.token_credit_max = token_credit_max
+        self.token_meta_gradient_mode = token_meta_gradient_mode
 
     @staticmethod
     def _equalize_distributed_batch_count(
@@ -1300,10 +1332,220 @@ class BilevelGRPO:
         )
         return TokenTaskOuterLoss(
             loss=self.meta_config.token_meta_coefficient * meta_grpo.loss,
+            meta_objective=meta_grpo.loss,
             meta_grpo=meta_grpo,
-            adaptation=adaptation,
+            token_confidence_logits=adaptation.token_confidence_logits,
+            token_credits=adaptation.token_credits,
+            inner_grpo=adaptation.inner_losses[-1],
             query_advantages=query_advantages,
+            adaptation=adaptation,
         )
+
+    @staticmethod
+    def _detached_grpo(output: GRPOLossOutput) -> GRPOLossOutput:
+        return GRPOLossOutput(
+            loss=output.loss.detach(),
+            policy_loss=output.policy_loss.detach(),
+            mean_kl=output.mean_kl.detach(),
+            clip_fraction=output.clip_fraction.detach(),
+        )
+
+    def _support_logprob_jvp(
+        self,
+        support: RolloutGroup,
+        fast_parameters: Mapping[str, Tensor],
+        parameter_tangents: tuple[Tensor, ...],
+    ) -> tuple[Tensor, Tensor]:
+        names = tuple(fast_parameters)
+        parameter_values = tuple(fast_parameters[name] for name in names)
+        if len(parameter_values) != len(parameter_tangents):
+            raise ValueError("Token JVP tangent count does not match fast parameters.")
+        primal = torch.zeros_like(support.old_logprobs)
+        directional = torch.zeros_like(support.old_logprobs)
+        row_batches = sequence_microbatches(
+            support,
+            max_sequences=self.token_jvp_response_micro_batch_size,
+            max_tokens=None,
+        )
+        was_training = self.policy.training
+        input_hook_enabled = hasattr(self.policy, "disable_input_require_grads")
+        self.policy.eval()
+        if input_hook_enabled:
+            self.policy.disable_input_require_grads()
+        try:
+            with torch.enable_grad():
+                for row_indices in row_batches:
+                    selector = torch.tensor(
+                        row_indices,
+                        dtype=torch.long,
+                        device=support.device,
+                    )
+
+                    def selected_logprobs(*values: Tensor) -> Tensor:
+                        parameters = dict(zip(names, values, strict=True))
+                        return token_logprobs(
+                            self.policy,
+                            support,
+                            fast_parameters=parameters,
+                            row_indices=row_indices,
+                            activation_checkpointing=False,
+                            logprob_position_chunk_size=(
+                                self.token_jvp_logprob_position_chunk_size
+                            ),
+                        )
+
+                    selected_primal, selected_directional = torch.func.jvp(
+                        selected_logprobs,
+                        parameter_values,
+                        parameter_tangents,
+                    )
+                    primal.index_copy_(0, selector, selected_primal.detach())
+                    directional.index_copy_(
+                        0,
+                        selector,
+                        selected_directional.detach(),
+                    )
+        finally:
+            if input_hook_enabled:
+                self.policy.enable_input_require_grads()
+            self.policy.train(was_training)
+        return primal, directional
+
+    def token_gradient_alignment_context(
+        self,
+        support: RolloutGroup,
+        query: RolloutGroup,
+        initial_fast_parameters: Mapping[str, Tensor],
+    ) -> TokenGradientAlignmentContext:
+        """Build the fixed policy-side direction for the single-layer surrogate."""
+        if query.verifier_rewards is None:
+            raise ValueError("Query verifier rewards are required for token meta loss.")
+        fast_parameters = clone_fast_parameters(initial_fast_parameters)
+        current_query_logprobs = chunked_token_logprobs(
+            self.policy,
+            query,
+            fast_parameters=fast_parameters,
+            micro_batch_size=self.policy_micro_batch_size,
+            max_tokens_per_micro_batch=self.policy_max_tokens_per_micro_batch,
+            activation_checkpointing=True,
+            show_progress=False,
+            progress_description="token alignment query gradient",
+        )
+        query_advantages = group_advantages(
+            query.verifier_rewards.detach(),
+            self.query_advantage_config,
+        )
+        query_grpo = grpo_policy_loss(
+            current_query_logprobs,
+            query.old_logprobs,
+            query.completion_mask,
+            query_advantages,
+            self.query_grpo_config,
+            reference_logprobs=query.reference_logprobs,
+        )
+        query_gradients = torch.autograd.grad(
+            query_grpo.loss,
+            tuple(fast_parameters.values()),
+            create_graph=False,
+            retain_graph=False,
+        )
+        support_logprobs, support_directional = self._support_logprob_jvp(
+            support,
+            fast_parameters,
+            tuple(gradient.detach() for gradient in query_gradients),
+        )
+        return TokenGradientAlignmentContext(
+            support_logprobs=support_logprobs,
+            support_directional_logprobs=support_directional,
+            query_grpo=self._detached_grpo(query_grpo),
+            query_advantages=query_advantages.detach(),
+        )
+
+    def token_gradient_alignment_contexts_batch(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        queries: tuple[RolloutGroup, ...],
+        initial_fast_parameters: Mapping[str, Tensor],
+    ) -> tuple[TokenGradientAlignmentContext, ...]:
+        if not supports or len(supports) != len(queries):
+            raise ValueError("Token alignment requires matching support/query groups.")
+        return tuple(
+            self.token_gradient_alignment_context(
+                support, query, initial_fast_parameters
+            )
+            for support, query in zip(supports, queries, strict=True)
+        )
+
+    def _alignment_reduction(
+        self,
+        values: Tensor,
+        completion_mask: Tensor,
+    ) -> Tensor:
+        mask = completion_mask.to(values.dtype)
+        if self.inner_config.grpo.token_normalization == "per_response":
+            return (values.mul(mask).sum(dim=1) / mask.sum(dim=1)).mean()
+        if self.inner_config.grpo.token_normalization == "global_tokens":
+            return values.mul(mask).sum() / mask.sum()
+        if self.inner_config.grpo.token_normalization == "sequence_sum":
+            return values.mul(mask).sum(dim=1).mean()
+        raise ValueError(
+            "Unsupported token normalization: "
+            f"{self.inner_config.grpo.token_normalization}"
+        )
+
+    def token_gradient_alignment_losses_batch(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        contexts: tuple[TokenGradientAlignmentContext, ...],
+    ) -> tuple[TokenTaskOuterLoss, ...]:
+        if not supports or len(supports) != len(contexts):
+            raise ValueError("Token alignment requires one context per support.")
+        logits_batch = self._token_confidence_logits_batch(
+            supports,
+            differentiable=True,
+            show_progress=False,
+            progress_description="token confidence scoring",
+        )
+        outputs = []
+        effective_step_size = (
+            self.inner_config.optimizer.learning_rate * self.inner_config.num_iterations
+        )
+        for support, context, logits in zip(
+            supports,
+            contexts,
+            logits_batch,
+            strict=True,
+        ):
+            credits = bounded_token_credits(
+                logits,
+                support.completion_mask,
+                maximum=self.token_credit_max,
+            )
+            meta_objective = effective_step_size * self._alignment_reduction(
+                credits * context.support_directional_logprobs,
+                support.completion_mask,
+            )
+            inner_grpo = token_grpo_policy_loss(
+                context.support_logprobs,
+                support.old_logprobs,
+                support.completion_mask,
+                credits.detach(),
+                self.inner_config.grpo,
+                reference_logprobs=support.reference_logprobs,
+            )
+            outputs.append(
+                TokenTaskOuterLoss(
+                    loss=self.meta_config.token_meta_coefficient * meta_objective,
+                    meta_objective=meta_objective,
+                    meta_grpo=context.query_grpo,
+                    token_confidence_logits=logits,
+                    token_credits=credits,
+                    inner_grpo=inner_grpo,
+                    query_advantages=context.query_advantages,
+                    adaptation=None,
+                )
+            )
+        return tuple(outputs)
 
     def token_outer_losses_batch(
         self,
@@ -1316,6 +1558,13 @@ class BilevelGRPO:
     ) -> tuple[TokenTaskOuterLoss, ...]:
         if not supports or len(supports) != len(queries):
             raise ValueError("Token outer loss requires matching support/query groups.")
+        if self.token_meta_gradient_mode == "gradient_alignment":
+            contexts = self.token_gradient_alignment_contexts_batch(
+                supports,
+                queries,
+                initial_fast_parameters,
+            )
+            return self.token_gradient_alignment_losses_batch(supports, contexts)
         adaptations = self.adapt_token_tasks(
             supports,
             initial_fast_parameters,

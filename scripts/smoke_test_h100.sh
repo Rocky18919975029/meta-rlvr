@@ -156,6 +156,7 @@ echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_S
 echo "token_jvp_response_micro_batch_size=${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-4}"
 echo "token_jvp_logprob_position_chunk_size=${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}"
 echo "token_credit_max=${SMOKE_TOKEN_CREDIT_MAX:-1.0}"
+echo "token_meta_gradient_mode=${SMOKE_TOKEN_META_GRADIENT_MODE:-gradient_alignment}"
 echo "attn_implementation=${SMOKE_ATTN_IMPLEMENTATION:-sdpa}"
 echo "max_mean_absolute_logprob_delta=${SMOKE_MAX_MEAN_ABSOLUTE_LOGPROB_DELTA:-unset}"
 echo "max_peak_allocated_gib=${SMOKE_MAX_PEAK_ALLOCATED_GIB:-unset}"
@@ -413,6 +414,7 @@ setsid accelerate launch \
   --token-jvp-response-micro-batch-size "${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-4}" \
   --token-jvp-logprob-position-chunk-size "${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}" \
   --token-credit-max "${SMOKE_TOKEN_CREDIT_MAX:-1.0}" \
+  --token-meta-gradient-mode "${SMOKE_TOKEN_META_GRADIENT_MODE:-gradient_alignment}" \
   --confidence-micro-batch-size "${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}" \
   --max-new-tokens "${SMOKE_MAX_NEW_TOKENS:-128}" \
   --temperature "${SMOKE_TEMPERATURE:-1.0}" \

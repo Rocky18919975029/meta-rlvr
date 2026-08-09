@@ -10,6 +10,7 @@ GroupGateMode = Literal["none", "max_confidence", "probability_any"]
 TokenNormalization = Literal["per_response", "global_tokens", "sequence_sum"]
 FastOptimizerName = Literal["sgd", "adamw"]
 MetaGradientMode = Literal["first_order", "second_order"]
+TokenMetaGradientMode = Literal["gradient_alignment", "unrolled"]
 
 
 @dataclass(frozen=True)

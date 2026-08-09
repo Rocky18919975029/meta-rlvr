@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 from tqdm.auto import tqdm
 
-from .bilevel import BilevelGRPO
+from .bilevel import BilevelGRPO, TokenGradientAlignmentContext
 from .config import (
     AdvantageConfig,
     ConfidenceLossConfig,
@@ -47,6 +47,7 @@ class CachedRolloutMicrobatch:
     supports: tuple[RolloutGroup, ...]
     queries: tuple[RolloutGroup, ...] | None = None
     token_queries: tuple[RolloutGroup, ...] | None = None
+    token_alignment_contexts: tuple[TokenGradientAlignmentContext, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.problems or len(self.problems) != len(self.supports):
@@ -64,6 +65,13 @@ class CachedRolloutMicrobatch:
             raise ValueError(
                 "Cached token query groups must match the problem microbatch size."
             )
+        if self.token_alignment_contexts is not None and len(
+            self.token_alignment_contexts
+        ) != len(self.problems):
+            raise ValueError(
+                "Cached token alignment contexts must match the problem microbatch "
+                "size."
+            )
         groups = self.supports
         if self.queries is not None:
             groups += self.queries
@@ -71,6 +79,10 @@ class CachedRolloutMicrobatch:
             groups += self.token_queries
         if any(group.device.type != "cpu" for group in groups):
             raise ValueError("Cached rollout microbatches must reside on CPU.")
+        if self.token_alignment_contexts is not None:
+            for context in self.token_alignment_contexts:
+                if context.support_logprobs.device.type != "cpu":
+                    raise ValueError("Cached token alignment contexts must be on CPU.")
 
 
 @dataclass
@@ -191,6 +203,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Maximum absolute token credit in A=max*tanh(logit).",
+    )
+    parser.add_argument(
+        "--token-meta-gradient-mode",
+        choices=["gradient_alignment", "unrolled"],
+        default="gradient_alignment",
+        help=(
+            "gradient_alignment uses the single-layer exact-JVP surrogate and "
+            "caches its policy-side direction; unrolled retains differentiable "
+            "task-adapter updates."
+        ),
     )
     parser.add_argument("--confidence-micro-batch-size", type=int, default=2)
     parser.add_argument("--policy-max-tokens-per-micro-batch", type=int)
@@ -641,11 +663,21 @@ def _serializable_run_config(args: argparse.Namespace, *, world_size: int) -> di
     }
     if float(serializable.get("token_meta_coefficient", 0.0)) <= 0:
         serializable.pop("token_credit_max", None)
+        serializable.pop("token_meta_gradient_mode", None)
     else:
+        serializable.setdefault("token_meta_gradient_mode", "gradient_alignment")
         serializable["token_credit_parameterization"] = TOKEN_CREDIT_PARAMETERIZATION
         serializable["token_credit_cross_trajectory_normalization"] = (
             TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION
         )
+        if serializable["token_meta_gradient_mode"] == "gradient_alignment":
+            serializable["token_meta_gradient_objective"] = (
+                "base_query_grpo_support_logprob_jvp_v1"
+            )
+            serializable["token_meta_gradient_sampling_gradient"] = False
+            serializable["token_meta_gradient_inner_optimizer_approximation"] = (
+                "sgd_step_size_times_inner_iterations"
+            )
     serializable["distributed_world_size"] = world_size
     return serializable
 
@@ -719,6 +751,9 @@ def _initialize_or_validate_run(
     }.items():
         original.setdefault(key, value)
         current.setdefault(key, value)
+    if float(original.get("token_meta_coefficient", 0.0)) > 0:
+        # Token checkpoints predating this field used the unrolled objective.
+        original.setdefault("token_meta_gradient_mode", "unrolled")
     compared_keys = set(original) | set(current)
     mismatches = {
         key: {"checkpoint_run": original.get(key), "resume_run": current.get(key)}
@@ -1217,7 +1252,7 @@ def _measure_component_gradient_norms(
     for component in components:
         confidence_optimizer.zero_grad(set_to_none=True)
         problem_offset = 0
-        for microbatch in rollout_microbatches:
+        for microbatch_index, microbatch in enumerate(rollout_microbatches):
             supports = tuple(
                 group.to(accelerator.device) for group in microbatch.supports
             )
@@ -1233,6 +1268,30 @@ def _measure_component_gradient_norms(
                 if component == "token_meta"
                 else None
             )
+            token_alignment_contexts = None
+            if (
+                component == "token_meta"
+                and algorithm.token_meta_gradient_mode == "gradient_alignment"
+            ):
+                if microbatch.token_alignment_contexts is None:
+                    token_alignment_contexts = (
+                        algorithm.token_gradient_alignment_contexts_batch(
+                            supports,
+                            token_queries,
+                            initial_fast,
+                        )
+                    )
+                    rollout_microbatches[microbatch_index] = replace(
+                        microbatch,
+                        token_alignment_contexts=tuple(
+                            context.to("cpu") for context in token_alignment_contexts
+                        ),
+                    )
+                else:
+                    token_alignment_contexts = tuple(
+                        context.to(accelerator.device)
+                        for context in microbatch.token_alignment_contexts
+                    )
             for problem_index, support in enumerate(supports):
                 if component == "meta":
                     output = algorithm.outer_loss(
@@ -1247,12 +1306,19 @@ def _measure_component_gradient_norms(
                     )
                     component_loss = output.meta_grpo.loss
                 elif component == "token_meta":
-                    output = algorithm.token_outer_losses_batch(
-                        (support,),
-                        (token_queries[problem_index],),
-                        initial_fast,
-                    )[0]
-                    component_loss = output.meta_grpo.loss
+                    output = (
+                        algorithm.token_gradient_alignment_losses_batch(
+                            (support,),
+                            (token_alignment_contexts[problem_index],),
+                        )[0]
+                        if algorithm.token_meta_gradient_mode == "gradient_alignment"
+                        else algorithm.token_outer_losses_batch(
+                            (support,),
+                            (token_queries[problem_index],),
+                            initial_fast,
+                        )[0]
+                    )
+                    component_loss = output.meta_objective
                 else:
                     confidence_loss = algorithm.confidence_supervision_loss(support)
                     component_loss = getattr(confidence_loss, component)
@@ -1263,7 +1329,13 @@ def _measure_component_gradient_norms(
                 else:
                     del confidence_loss
             problem_offset += len(supports)
-            del support, supports, queries, token_queries
+            del (
+                support,
+                supports,
+                queries,
+                token_queries,
+                token_alignment_contexts,
+            )
 
         raw_norm = accelerator.clip_grad_norm_(
             confidence_model.parameters(),
@@ -1361,6 +1433,30 @@ def _accumulate_outer_batch(
                 if token_enabled
                 else None
             )
+            token_alignment_contexts = None
+            if (
+                token_enabled
+                and algorithm.token_meta_gradient_mode == "gradient_alignment"
+            ):
+                if microbatch.token_alignment_contexts is None:
+                    token_alignment_contexts = (
+                        algorithm.token_gradient_alignment_contexts_batch(
+                            supports,
+                            token_queries,
+                            initial_fast,
+                        )
+                    )
+                    rollout_microbatches[microbatch_index] = replace(
+                        microbatch,
+                        token_alignment_contexts=tuple(
+                            context.to("cpu") for context in token_alignment_contexts
+                        ),
+                    )
+                else:
+                    token_alignment_contexts = tuple(
+                        context.to(accelerator.device)
+                        for context in microbatch.token_alignment_contexts
+                    )
             sequence_outputs = (
                 algorithm.outer_losses_batch(
                     supports,
@@ -1373,12 +1469,19 @@ def _accumulate_outer_batch(
                 else None
             )
             token_outputs = (
-                algorithm.token_outer_losses_batch(
-                    supports,
-                    token_queries,
-                    initial_fast,
-                    show_progress=False,
-                    progress_prefix=progress_description,
+                (
+                    algorithm.token_gradient_alignment_losses_batch(
+                        supports,
+                        token_alignment_contexts,
+                    )
+                    if algorithm.token_meta_gradient_mode == "gradient_alignment"
+                    else algorithm.token_outer_losses_batch(
+                        supports,
+                        token_queries,
+                        initial_fast,
+                        show_progress=False,
+                        progress_prefix=progress_description,
+                    )
                 )
                 if token_enabled
                 else None
@@ -1426,9 +1529,7 @@ def _accumulate_outer_batch(
             token_credit = (
                 zero
                 if token_output is None
-                else token_output.adaptation.token_credits.detach()[
-                    support.completion_mask
-                ].mean()
+                else token_output.token_credits.detach()[support.completion_mask].mean()
             )
             sequence_probability_square = (
                 zero
@@ -1440,18 +1541,14 @@ def _accumulate_outer_batch(
             token_credit_square = (
                 zero
                 if token_output is None
-                else token_output.adaptation.token_credits.detach()[
-                    support.completion_mask
-                ]
+                else token_output.token_credits.detach()[support.completion_mask]
                 .square()
                 .mean()
             )
             token_credit_absolute = (
                 zero
                 if token_output is None
-                else token_output.adaptation.token_credits.detach()[
-                    support.completion_mask
-                ]
+                else token_output.token_credits.detach()[support.completion_mask]
                 .abs()
                 .mean()
             )
@@ -1459,9 +1556,7 @@ def _accumulate_outer_batch(
                 zero
                 if token_output is None
                 else (
-                    token_output.adaptation.token_credits.detach()[
-                        support.completion_mask
-                    ].abs()
+                    token_output.token_credits.detach()[support.completion_mask].abs()
                     >= 0.95 * algorithm.token_credit_max
                 )
                 .float()
@@ -1478,7 +1573,7 @@ def _accumulate_outer_batch(
                     (
                         zero
                         if token_output is None
-                        else token_output.meta_grpo.loss.detach()
+                        else token_output.meta_objective.detach()
                     ),
                     zero if confidence_loss is None else confidence_loss.bce.detach(),
                     (
@@ -1506,9 +1601,7 @@ def _accumulate_outer_batch(
                     (
                         zero
                         if token_output is None
-                        else token_output.adaptation.inner_losses[
-                            -1
-                        ].clip_fraction.detach()
+                        else token_output.inner_grpo.clip_fraction.detach()
                     ),
                     support.verifier_rewards.mean(),
                     zero if query is None else query.verifier_rewards.mean(),
@@ -1544,7 +1637,7 @@ def _accumulate_outer_batch(
                     (
                         zero
                         if token_output is None
-                        else token_output.adaptation.inner_losses[-1].mean_kl.detach()
+                        else token_output.inner_grpo.mean_kl.detach()
                     ),
                     sequence_probability,
                     sequence_probability_square,
@@ -1567,7 +1660,18 @@ def _accumulate_outer_batch(
             )
             problem_progress.update(1)
         problem_offset += len(supports)
-        del accumulated_loss, problem_losses, support, supports
+        del (
+            accumulated_loss,
+            problem_losses,
+            support,
+            supports,
+            queries,
+            token_queries,
+            token_alignment_contexts,
+            sequence_outputs,
+            token_outputs,
+            confidence_outputs,
+        )
     problem_progress.close()
     return local_metric_sums
 
@@ -1996,6 +2100,7 @@ def main() -> None:
             args.token_jvp_logprob_position_chunk_size
         ),
         token_credit_max=args.token_credit_max,
+        token_meta_gradient_mode=args.token_meta_gradient_mode,
     )
     rollout_kwargs: dict[str, object] = {}
     rollout_engine_type = TransformersRolloutEngine
@@ -2098,7 +2203,9 @@ def main() -> None:
         f"{num_problem_micro_batches} accumulation microbatches); first-order "
         f"VJP forward batch is {args.first_order_vjp_forward_batch_size}; policy "
         f"forward backend is "
-        f"{'sdpa_math' if args.token_meta_coefficient > 0 else args.attn_implementation}."
+        f"{'sdpa_math' if args.token_meta_coefficient > 0 else args.attn_implementation}; "
+        f"token meta-gradient mode is "
+        f"{args.token_meta_gradient_mode if args.token_meta_coefficient > 0 else 'disabled'}."
     )
 
     initial_fast = {
@@ -2231,44 +2338,57 @@ def main() -> None:
             metric_offset = 6 if token_branch else 3
             timing_prefix = "token_" if token_branch else ""
             generation_fast_parameters = []
-            step_indices.set_postfix_str(
-                f"problems={global_problem_batch_size} "
-                f"stage={branch}-generation-adaptation"
+            use_base_token_query = (
+                token_branch and args.token_meta_gradient_mode == "gradient_alignment"
             )
-            with timings.measure(f"{timing_prefix}generation_adaptation"):
-                for cached_microbatch in tqdm(
-                    rollout_microbatches,
-                    total=len(rollout_microbatches),
-                    desc=f"{batch_prefix} {branch} generation adaptation",
-                    unit="microbatch",
-                    leave=True,
-                    disable=not accelerator.is_main_process,
-                ):
-                    supports = tuple(
-                        support.to(accelerator.device)
-                        for support in cached_microbatch.supports
-                    )
-                    adaptations = (
-                        algorithm.adapt_token_tasks(
-                            supports, initial_fast, differentiable=False
+            if use_base_token_query:
+                base_fast_parameters = {
+                    name: value.detach().to("cpu")
+                    for name, value in initial_fast.items()
+                }
+                generation_fast_parameters = [
+                    base_fast_parameters
+                ] * local_problem_batch_size
+                timings.values[f"{timing_prefix}generation_adaptation"] = 0.0
+            else:
+                step_indices.set_postfix_str(
+                    f"problems={global_problem_batch_size} "
+                    f"stage={branch}-generation-adaptation"
+                )
+                with timings.measure(f"{timing_prefix}generation_adaptation"):
+                    for cached_microbatch in tqdm(
+                        rollout_microbatches,
+                        total=len(rollout_microbatches),
+                        desc=f"{batch_prefix} {branch} generation adaptation",
+                        unit="microbatch",
+                        leave=True,
+                        disable=not accelerator.is_main_process,
+                    ):
+                        supports = tuple(
+                            support.to(accelerator.device)
+                            for support in cached_microbatch.supports
                         )
-                        if token_branch
-                        else algorithm.adapt_tasks(
-                            supports,
-                            initial_fast,
-                            differentiable=False,
-                            supervise_confidence=False,
-                            show_progress=False,
+                        adaptations = (
+                            algorithm.adapt_token_tasks(
+                                supports, initial_fast, differentiable=False
+                            )
+                            if token_branch
+                            else algorithm.adapt_tasks(
+                                supports,
+                                initial_fast,
+                                differentiable=False,
+                                supervise_confidence=False,
+                                show_progress=False,
+                            )
                         )
-                    )
-                    generation_fast_parameters.extend(
-                        {
-                            name: value.detach().to("cpu")
-                            for name, value in adaptation.fast_parameters.items()
-                        }
-                        for adaptation in adaptations
-                    )
-                    del supports, adaptations
+                        generation_fast_parameters.extend(
+                            {
+                                name: value.detach().to("cpu")
+                                for name, value in adaptation.fast_parameters.items()
+                            }
+                            for adaptation in adaptations
+                        )
+                        del supports, adaptations
             if len(generation_fast_parameters) != local_problem_batch_size:
                 raise RuntimeError(
                     f"{branch} adapted parameter count does not match problem batch."

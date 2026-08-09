@@ -262,6 +262,8 @@ def test_token_meta_loss_backpropagates_through_exact_jvp() -> None:
         token_jvp_response_micro_batch_size=2,
     )
     output = algorithm.token_outer_losses_batch((support,), (query,), initial_fast)[0]
+    assert algorithm.token_meta_gradient_mode == "gradient_alignment"
+    assert output.adaptation is None
     gradients = torch.autograd.grad(
         output.loss,
         tuple(confidence.parameters()),
@@ -271,6 +273,38 @@ def test_token_meta_loss_backpropagates_through_exact_jvp() -> None:
     assert any(
         gradient is not None and torch.any(gradient != 0) for gradient in gradients
     )
+
+
+def test_token_unrolled_mode_retains_task_adapter_path() -> None:
+    torch.manual_seed(42)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(),
+        hidden_size=5,
+        enable_sequence_head=False,
+        enable_token_head=True,
+    )
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    query = make_group(policy, torch.tensor([0.0, 1.0, 1.0]))
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(
+            num_iterations=1,
+            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+        ),
+        meta_config=MetaLossConfig(
+            meta_coefficient=0.0,
+            token_meta_coefficient=1.0,
+        ),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+        token_meta_gradient_mode="unrolled",
+    )
+    output = algorithm.token_outer_losses_batch((support,), (query,), initial_fast)[0]
+    assert output.adaptation is not None
+    torch.testing.assert_close(output.meta_objective, output.meta_grpo.loss)
 
 
 def test_token_first_order_operator_has_standard_grpo_update_value() -> None:
@@ -1108,16 +1142,17 @@ def test_combined_sequence_and_token_meta_losses_accumulate_independently() -> N
     )
     confidence.zero_grad(set_to_none=True)
 
+    rollout_microbatches = [
+        CachedRolloutMicrobatch(
+            problems=(_problem("combined"),),
+            supports=(support,),
+            queries=(sequence_query,),
+            token_queries=(token_query,),
+        )
+    ]
     metrics = _accumulate_outer_batch(
         algorithm=algorithm,
-        rollout_microbatches=[
-            CachedRolloutMicrobatch(
-                problems=(_problem("combined"),),
-                supports=(support,),
-                queries=(sequence_query,),
-                token_queries=(token_query,),
-            )
-        ],
+        rollout_microbatches=rollout_microbatches,
         local_problem_batch_size=1,
         initial_fast=initial_fast,
         accelerator=CPUAccelerator(),
@@ -1126,7 +1161,26 @@ def test_combined_sequence_and_token_meta_losses_accumulate_independently() -> N
     )
     torch.testing.assert_close(metrics[0], expected_loss.detach())
     torch.testing.assert_close(metrics[1], sequence_output.meta_grpo.loss.detach())
-    torch.testing.assert_close(metrics[2], token_output.meta_grpo.loss.detach())
+    torch.testing.assert_close(metrics[2], token_output.meta_objective.detach())
+    assert rollout_microbatches[0].token_alignment_contexts is not None
+
+    def fail_if_alignment_context_is_recomputed(*args, **kwargs):
+        raise AssertionError("cached token alignment context was recomputed")
+
+    algorithm.token_gradient_alignment_contexts_batch = (
+        fail_if_alignment_context_is_recomputed
+    )
+    confidence.zero_grad(set_to_none=True)
+    cached_metrics = _accumulate_outer_batch(
+        algorithm=algorithm,
+        rollout_microbatches=rollout_microbatches,
+        local_problem_batch_size=1,
+        initial_fast=initial_fast,
+        accelerator=CPUAccelerator(),
+        confidence_model=confidence,
+        progress_description="combined cached",
+    )
+    torch.testing.assert_close(cached_metrics, metrics)
     for parameter, expected_gradient in zip(
         confidence.parameters(), expected_gradients, strict=True
     ):
