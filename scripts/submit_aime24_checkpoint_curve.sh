@@ -6,7 +6,8 @@ export META_RLVR_CONDA_ENV="verl"
 export META_RLVR_MODEL_PATH="/data/user/zhongal/.cache/qwen2.5-math-7b-local"
 export META_RLVR_EVAL_DATASET="${META_RLVR_EVAL_DATASET:-/data/user/zhongal/data/reschedule/aime24.parquet}"
 export SEQUENCE_RUN_DIR="${SEQUENCE_RUN_DIR:-${META_RLVR_PROJECT_DIR}/outputs/tiny-meta-only-b512-472864}"
-export TOKEN_RUN_DIR="${TOKEN_RUN_DIR:-${META_RLVR_PROJECT_DIR}/outputs/tiny-token-meta-only-b512-474799}"
+export SEQUENCE_EVAL_ROOT="${SEQUENCE_EVAL_ROOT:-${META_RLVR_PROJECT_DIR}/outputs/aime24-seq6-token3-seed42-20260807-190852-476537}"
+export TOKEN_RUN_DIR="${TOKEN_RUN_DIR:-${META_RLVR_PROJECT_DIR}/outputs/tiny-token-meta-only-b512-479737}"
 export CURVE_PREFIX="${CURVE_PREFIX:-aime24-curve-$(date +%Y%m%d-%H%M%S)}"
 
 export EVAL_GPUS=8
@@ -32,12 +33,13 @@ export VLLM_CONTROL_TIMEOUT=120
 export VLLM_STARTUP_TIMEOUT=600
 export TQDM_MININTERVAL=5
 export NCCL_DEBUG=WARN
+export NCCL_NVLS_ENABLE=0
 
 export SLURM_PARTITION=acd_u
 export SLURM_CPUS_PER_TASK=64
 export SLURM_MEM=400G
 export SLURM_TIME=08:00:00
-export SLURM_EXCLUDE=ACD1-1
+export SLURM_EXCLUDE="${SLURM_EXCLUDE:-ACD1-1,ACD1-52}"
 
 cd "${META_RLVR_PROJECT_DIR}"
 test -f "${META_RLVR_EVAL_DATASET}"
@@ -47,6 +49,33 @@ done
 for step in 1 2 3; do
   test -f "${TOKEN_RUN_DIR}/checkpoint-${step}/trainer_state.json"
 done
+
+python - "${SEQUENCE_EVAL_ROOT}" "${META_RLVR_EVAL_DATASET}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+dataset = str(Path(sys.argv[2]))
+for step in range(1, 7):
+    result_dir = root / f"sequence-step{step}"
+    summary = json.loads((result_dir / "summary.json").read_text())
+    config = json.loads((result_dir / "evaluation_config.json").read_text())
+    assert summary["event"] == "checkpoint_evaluation_completed"
+    assert summary["adaptation_mode"] == "sequence"
+    assert summary["checkpoint_step"] == step
+    assert summary["dataset_parquet"] == dataset
+    assert summary["seed"] == 42
+    assert summary["num_unique_problems"] == 30
+    assert summary["support"]["group_size"] == 16
+    assert summary["base_query"]["group_size"] == 32
+    assert summary["adapted_query"]["group_size"] == 32
+    assert config["max_new_tokens"] == 3072
+    assert config["inner_iterations"] == 2
+    assert config["adaptation_rounds"] == 1
+    print(f"reuse sequence checkpoint {step}: {result_dir}")
+print("PRECOMPUTED SEQUENCE 1-6: OK")
+PY
 
 read -r CHECKPOINT_WORLD_SIZE SMOKE_LORA_RANK < <(python - \
   "${SEQUENCE_RUN_DIR}" "${TOKEN_RUN_DIR}" <<'PY'
@@ -95,7 +124,8 @@ job_id="${submission##* }"
 output_root="${META_RLVR_PROJECT_DIR}/outputs/${CURVE_PREFIX}-${job_id}"
 
 echo "${submission}"
-echo "configuration: one_job=1 gpus=8 dataset=${META_RLVR_EVAL_DATASET} sequence_steps=1-6 token_steps=1-3 support=16 base_query=32 adapted_query=32 seed=42"
+echo "configuration: one_job=1 gpus=8 dataset=${META_RLVR_EVAL_DATASET} sequence_steps=1-6(reused) token_steps=1-3(evaluated) support=16 base_query=32 adapted_query=32 seed=42 nccl_nvls=0"
+echo "reused sequence results: ${SEQUENCE_EVAL_ROOT}"
 echo "stdout: ${META_RLVR_PROJECT_DIR}/logs/${CURVE_PREFIX}-${job_id}.out"
 echo "stderr/progress: ${META_RLVR_PROJECT_DIR}/logs/${CURVE_PREFIX}-${job_id}.err"
 echo "vLLM: ${META_RLVR_PROJECT_DIR}/logs/vllm-${job_id}/gpu-*.log"

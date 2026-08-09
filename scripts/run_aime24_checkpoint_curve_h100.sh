@@ -4,7 +4,7 @@ set -euo pipefail
 : "${META_RLVR_PROJECT_DIR:?}"
 : "${META_RLVR_MODEL_PATH:?}"
 : "${META_RLVR_EVAL_DATASET:?}"
-: "${SEQUENCE_RUN_DIR:?}"
+: "${SEQUENCE_EVAL_ROOT:?}"
 : "${TOKEN_RUN_DIR:?}"
 : "${CURVE_PREFIX:?}"
 : "${EVAL_GPUS:?}"
@@ -39,21 +39,23 @@ if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
 fi
 
 mkdir -p "${OUTPUT_ROOT}"
-python - "${MANIFEST}" "${OUTPUT_ROOT}" <<'PY'
+python - "${MANIFEST}" "${OUTPUT_ROOT}" "${SEQUENCE_EVAL_ROOT}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 manifest = Path(sys.argv[1])
 root = Path(sys.argv[2])
+sequence_root = Path(sys.argv[3])
 evaluations = []
 for method, steps in (("sequence", range(1, 7)), ("token", range(1, 4))):
     for step in steps:
+        result_root = sequence_root if method == "sequence" else root
         evaluations.append(
             {
                 "method": method,
                 "step": step,
-                "result_dir": str(root / f"{method}-step{step}"),
+                "result_dir": str(result_root / f"{method}-step{step}"),
             }
         )
 manifest.write_text(
@@ -108,9 +110,7 @@ run_evaluation() {
   echo "[$(date --iso-8601=seconds)] completed ${method} checkpoint ${step}"
 }
 
-for step in 1 2 3 4 5 6; do
-  run_evaluation sequence "${step}" "${SEQUENCE_RUN_DIR}"
-done
+echo "[$(date --iso-8601=seconds)] reusing sequence checkpoints 1-6 from ${SEQUENCE_EVAL_ROOT}"
 for step in 1 2 3; do
   run_evaluation token "${step}" "${TOKEN_RUN_DIR}"
 done
