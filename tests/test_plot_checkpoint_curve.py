@@ -73,3 +73,31 @@ def test_load_records_collects_sequence_and_token_curves(tmp_path: Path) -> None
     assert [
         record["step"] for record in records if record["method"] == "token"
     ] == list(range(1, 4))
+
+
+def test_load_records_accepts_token_only_curve(tmp_path: Path) -> None:
+    evaluations = []
+    for step in range(1, 4):
+        result_dir = tmp_path / f"token-{step}"
+        result_dir.mkdir()
+        (result_dir / "summary.json").write_text(
+            json.dumps(_summary(step, "token")),
+            encoding="utf-8",
+        )
+        evaluations.append(
+            {"method": "token", "step": step, "result_dir": str(result_dir)}
+        )
+    manifest_path = tmp_path / "submission.json"
+    manifest_path.write_text(
+        json.dumps({"dataset_label": "MATH-500", "evaluations": evaluations}),
+        encoding="utf-8",
+    )
+
+    records, manifest = _load_records(manifest_path)
+
+    assert manifest["dataset_label"] == "MATH-500"
+    assert [(record["method"], record["step"]) for record in records] == [
+        ("token", 1),
+        ("token", 2),
+        ("token", 3),
+    ]

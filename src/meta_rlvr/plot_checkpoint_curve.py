@@ -17,8 +17,16 @@ def parse_args() -> argparse.Namespace:
 
 def _load_records(manifest_path: Path) -> tuple[list[dict], dict]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    evaluations = manifest["evaluations"]
+    if not evaluations:
+        raise ValueError("Checkpoint curve manifest has no evaluations.")
+    identities = [(entry["method"], entry["step"]) for entry in evaluations]
+    if len(identities) != len(set(identities)):
+        raise ValueError("Checkpoint curve manifest contains duplicate entries.")
+    if any(method not in {"sequence", "token"} for method, _ in identities):
+        raise ValueError("Checkpoint curve methods must be sequence or token.")
     records = []
-    for entry in manifest["evaluations"]:
+    for entry in evaluations:
         summary_path = Path(entry["result_dir"]) / "summary.json"
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if summary["event"] != "checkpoint_evaluation_completed":
@@ -59,11 +67,6 @@ def _load_records(manifest_path: Path) -> tuple[list[dict], dict]:
             }
         )
     records.sort(key=lambda record: (record["method"], record["step"]))
-    expected = {"sequence": list(range(1, 7)), "token": list(range(1, 4))}
-    for method, steps in expected.items():
-        actual = [record["step"] for record in records if record["method"] == method]
-        if actual != steps:
-            raise ValueError(f"Expected {method} steps {steps}, got {actual}.")
     comparable = {
         (
             record["dataset_parquet"],
@@ -86,7 +89,12 @@ def _write_csv(path: Path, records: list[dict]) -> None:
         writer.writerows(records)
 
 
-def _plot(path_png: Path, path_pdf: Path, records: list[dict]) -> None:
+def _plot(
+    path_png: Path,
+    path_pdf: Path,
+    records: list[dict],
+    manifest: dict,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -104,17 +112,28 @@ def _plot(path_png: Path, path_pdf: Path, records: list[dict]) -> None:
             "color": "#d62728",
         },
     }
+    support_group_size = records[0]["support_group_size"]
+    query_group_size = records[0]["query_group_size"]
+    total_group_size = support_group_size + query_group_size
     figure, axes = plt.subplots(2, 3, figsize=(14, 8), constrained_layout=True)
     panels = (
         ("adapted_query_accuracy", "Query accuracy", "Accuracy"),
-        ("adapted_query_pass_at_group", "Query pass@32", "Pass@32"),
+        (
+            "adapted_query_pass_at_group",
+            f"Query pass@{query_group_size}",
+            f"Pass@{query_group_size}",
+        ),
         ("meta_total_accuracy", "Total accuracy (support + query)", "Accuracy"),
         ("query_accuracy_delta", "Accuracy improvement over base", "Delta"),
-        ("query_pass_delta", "Pass@32 improvement over base", "Delta"),
+        (
+            "query_pass_delta",
+            f"Pass@{query_group_size} improvement over base",
+            "Delta",
+        ),
         (
             "meta_total_pass_at_group",
-            "Total pass@48 (support + query)",
-            "Pass@48",
+            f"Total pass@{total_group_size} (support + query)",
+            f"Pass@{total_group_size}",
         ),
     )
     base_fields = {
@@ -123,9 +142,12 @@ def _plot(path_png: Path, path_pdf: Path, records: list[dict]) -> None:
         "meta_total_accuracy": "base_total_accuracy",
         "meta_total_pass_at_group": "base_total_pass_at_group",
     }
+    active_methods = {record["method"] for record in records}
     for axis, (field, title, ylabel) in zip(axes.flat, panels, strict=True):
         for method, style in methods.items():
             selected = [record for record in records if record["method"] == method]
+            if not selected:
+                continue
             axis.plot(
                 [record["step"] for record in selected],
                 [100 * record[field] for record in selected],
@@ -136,13 +158,18 @@ def _plot(path_png: Path, path_pdf: Path, records: list[dict]) -> None:
                 color=style["color"],
             )
             if field in base_fields:
+                base_label = (
+                    "Unadapted base policy"
+                    if len(active_methods) == 1
+                    else f"Unadapted base ({method} eval)"
+                )
                 axis.plot(
                     [record["step"] for record in selected],
                     [100 * record[base_fields[field]] for record in selected],
                     linestyle="--",
                     linewidth=1.5,
                     alpha=0.65,
-                    label=f"{style['label']} base",
+                    label=base_label,
                     color=style["color"],
                 )
         if field not in base_fields:
@@ -150,11 +177,18 @@ def _plot(path_png: Path, path_pdf: Path, records: list[dict]) -> None:
         axis.set_title(title)
         axis.set_xlabel("Global training step")
         axis.set_ylabel(f"{ylabel} (%)")
-        axis.set_xticks(range(1, 7))
+        axis.set_xticks(sorted({record["step"] for record in records}))
         axis.grid(axis="y", alpha=0.25)
     for axis in (axes[0, 0], axes[0, 1], axes[0, 2], axes[1, 2]):
         axis.legend(frameon=False)
-    figure.suptitle("AIME24 checkpoint evaluation · seed 42 · support K=16 → query K=32")
+    dataset_label = manifest.get(
+        "dataset_label",
+        Path(records[0]["dataset_parquet"]).stem,
+    )
+    figure.suptitle(
+        f"{dataset_label} checkpoint evaluation · seed {records[0]['seed']} · "
+        f"support K={support_group_size} → query K={query_group_size}"
+    )
     figure.savefig(path_png, dpi=200)
     figure.savefig(path_pdf)
     plt.close(figure)
@@ -180,6 +214,7 @@ def main() -> None:
         output_dir / "checkpoint_curve.png",
         output_dir / "checkpoint_curve.pdf",
         records,
+        manifest,
     )
     print(f"curve_csv={output_dir / 'checkpoint_curve.csv'}")
     print(f"curve_png={output_dir / 'checkpoint_curve.png'}")
