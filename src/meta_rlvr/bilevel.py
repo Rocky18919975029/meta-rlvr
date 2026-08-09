@@ -116,7 +116,7 @@ class BilevelGRPO:
         confidence_micro_batch_size: int = 4,
         policy_max_tokens_per_micro_batch: int | None = None,
         confidence_max_tokens_per_micro_batch: int | None = None,
-        token_jvp_response_micro_batch_size: int = 4,
+        token_jvp_response_micro_batch_size: int = 1,
         token_jvp_logprob_position_chunk_size: int = 256,
         token_credit_max: float = 1.0,
         token_meta_gradient_mode: TokenMetaGradientMode = "gradient_alignment",
@@ -1449,16 +1449,22 @@ class BilevelGRPO:
             create_graph=False,
             retain_graph=False,
         )
+        detached_query_grpo = self._detached_grpo(query_grpo)
+        detached_query_advantages = query_advantages.detach()
+        query_tangents = tuple(gradient.detach() for gradient in query_gradients)
+        del current_query_logprobs, query_grpo, query_gradients
+        if query.device.type == "cuda":
+            torch.cuda.empty_cache()
         support_logprobs, support_directional = self._support_logprob_jvp(
             support,
             fast_parameters,
-            tuple(gradient.detach() for gradient in query_gradients),
+            query_tangents,
         )
         return TokenGradientAlignmentContext(
             support_logprobs=support_logprobs,
             support_directional_logprobs=support_directional,
-            query_grpo=self._detached_grpo(query_grpo),
-            query_advantages=query_advantages.detach(),
+            query_grpo=detached_query_grpo,
+            query_advantages=detached_query_advantages,
         )
 
     def token_gradient_alignment_contexts_batch(

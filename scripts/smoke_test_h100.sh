@@ -153,7 +153,7 @@ echo "rollout_problem_batch_size=${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "local_rollout_problem_batch_size=${LOCAL_ROLLOUT_PROBLEM_BATCH_SIZE}"
 echo "policy_micro_batch_size=${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}"
 echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_SIZE:-1}"
-echo "token_jvp_response_micro_batch_size=${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-4}"
+echo "token_jvp_response_micro_batch_size=${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-1}"
 echo "token_jvp_logprob_position_chunk_size=${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}"
 echo "token_credit_max=${SMOKE_TOKEN_CREDIT_MAX:-1.0}"
 echo "token_meta_gradient_mode=${SMOKE_TOKEN_META_GRADIENT_MODE:-gradient_alignment}"
@@ -411,7 +411,7 @@ setsid accelerate launch \
   --rollout-problem-batch-size "${SMOKE_ROLLOUT_PROBLEM_BATCH_SIZE}" \
   --generation-micro-batch-size "${SMOKE_GENERATION_MICRO_BATCH_SIZE:-1}" \
   --policy-micro-batch-size "${SMOKE_POLICY_MICRO_BATCH_SIZE:-1}" \
-  --token-jvp-response-micro-batch-size "${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-4}" \
+  --token-jvp-response-micro-batch-size "${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-1}" \
   --token-jvp-logprob-position-chunk-size "${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}" \
   --token-credit-max "${SMOKE_TOKEN_CREDIT_MAX:-1.0}" \
   --token-meta-gradient-mode "${SMOKE_TOKEN_META_GRADIENT_MODE:-gradient_alignment}" \

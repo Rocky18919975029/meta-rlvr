@@ -191,7 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--token-jvp-response-micro-batch-size",
         type=int,
-        default=4,
+        default=1,
     )
     parser.add_argument(
         "--token-jvp-logprob-position-chunk-size",
