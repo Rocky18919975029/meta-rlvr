@@ -425,6 +425,13 @@ sampler requires no such build. This changes only the sampling kernel, not the
 temperature/top-p distribution. FlashInfer can be re-enabled later after a
 GCC 9+ toolchain is loaded and its kernels are precompiled.
 
+All gradient-bearing training rollouts and evaluation support rollouts use
+`temperature=1.0`, `top_p=1.0`, and disabled top-k so the sampled behavior
+policy matches the raw full-softmax log-probabilities used by GRPO. Final
+validation and checkpoint-evaluation query rollouts use the DAPO evaluation
+setting `temperature=1.0`, `top_p=0.7`, and disabled top-k; these query samples
+are not used for policy updates.
+
 After the rollout-only test passes, submit a one-step test that can carry a
 nonzero meta signal with 3,072 generated tokens, support/query group size 16,
 two inner updates and two outer updates:

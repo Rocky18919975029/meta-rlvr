@@ -22,6 +22,12 @@ export EVAL_INNER_ITERATIONS=2
 export EVAL_ADAPTATION_ROUNDS=1
 export EVAL_LOCAL_ROLLOUT_BATCH_SIZE=8
 export EVAL_LOCAL_ADAPTATION_BATCH_SIZE=2
+export EVAL_ADAPTATION_TEMPERATURE=1.0
+export EVAL_ADAPTATION_TOP_P=1.0
+export EVAL_ADAPTATION_TOP_K=0
+export EVAL_QUERY_TEMPERATURE=1.0
+export EVAL_QUERY_TOP_P=0.7
+export EVAL_QUERY_TOP_K=0
 
 export VLLM_GPU_MEMORY_UTILIZATION=0.30
 export VLLM_MAX_MODEL_LEN=4096
@@ -124,7 +130,7 @@ job_id="${submission##* }"
 output_root="${META_RLVR_PROJECT_DIR}/outputs/${CURVE_PREFIX}-${job_id}"
 
 echo "${submission}"
-echo "configuration: one_job=1 gpus=8 dataset=${META_RLVR_EVAL_DATASET} sequence_steps=1-6(reused) token_steps=1-3(evaluated) support=16 base_query=32 adapted_query=32 seed=42 nccl_nvls=0"
+echo "configuration: one_job=1 gpus=8 dataset=${META_RLVR_EVAL_DATASET} sequence_steps=1-6(reused) token_steps=1-3(evaluated) support=16 base_query=32 adapted_query=32 seed=42 adaptation_sampling=1.0/1.0/0 query_sampling=1.0/0.7/0 nccl_nvls=0"
 echo "reused sequence results: ${SEQUENCE_EVAL_ROOT}"
 echo "stdout: ${META_RLVR_PROJECT_DIR}/logs/${CURVE_PREFIX}-${job_id}.out"
 echo "stderr/progress: ${META_RLVR_PROJECT_DIR}/logs/${CURVE_PREFIX}-${job_id}.err"

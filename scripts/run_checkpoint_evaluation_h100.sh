@@ -71,6 +71,12 @@ setsid accelerate launch \
   --seed "${EVAL_SEED:-42}" \
   --local-rollout-batch-size "${EVAL_LOCAL_ROLLOUT_BATCH_SIZE:-8}" \
   --local-adaptation-batch-size "${EVAL_LOCAL_ADAPTATION_BATCH_SIZE:-2}" \
+  --adaptation-temperature "${EVAL_ADAPTATION_TEMPERATURE:-1.0}" \
+  --adaptation-top-p "${EVAL_ADAPTATION_TOP_P:-1.0}" \
+  --adaptation-top-k "${EVAL_ADAPTATION_TOP_K:-0}" \
+  --query-temperature "${EVAL_QUERY_TEMPERATURE:-1.0}" \
+  --query-top-p "${EVAL_QUERY_TOP_P:-0.7}" \
+  --query-top-k "${EVAL_QUERY_TOP_K:-0}" \
   --request-timeout "${VLLM_REQUEST_TIMEOUT:-1800}" \
   --control-timeout "${VLLM_CONTROL_TIMEOUT:-120}" \
   "${EXTRA_ARGS[@]}"

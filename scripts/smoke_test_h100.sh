@@ -413,6 +413,12 @@ setsid accelerate launch \
   --token-jvp-logprob-position-chunk-size "${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}" \
   --confidence-micro-batch-size "${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}" \
   --max-new-tokens "${SMOKE_MAX_NEW_TOKENS:-128}" \
+  --temperature "${SMOKE_TEMPERATURE:-1.0}" \
+  --top-p "${SMOKE_TOP_P:-1.0}" \
+  --top-k "${SMOKE_TOP_K:-0}" \
+  --validation-temperature "${SMOKE_VALIDATION_TEMPERATURE:-1.0}" \
+  --validation-top-p "${SMOKE_VALIDATION_TOP_P:-0.7}" \
+  --validation-top-k "${SMOKE_VALIDATION_TOP_K:-0}" \
   --inner-iterations "${SMOKE_INNER_ITERATIONS:-1}" \
   --outer-iterations "${SMOKE_OUTER_ITERATIONS:-1}" \
   --meta-coefficient "${SMOKE_META_COEFFICIENT:-1.0}" \

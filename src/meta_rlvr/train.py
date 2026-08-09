@@ -187,8 +187,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence-max-tokens-per-micro-batch", type=int)
     parser.add_argument("--max-new-tokens", type=int, required=True)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=0.7)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=0)
+    parser.add_argument("--validation-temperature", type=float, default=1.0)
+    parser.add_argument("--validation-top-p", type=float, default=0.7)
+    parser.add_argument("--validation-top-k", type=int, default=0)
     parser.add_argument(
         "--rollout-backend",
         choices=["transformers", "vllm"],
@@ -407,8 +410,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--vllm-request-timeout must be positive.")
     if args.vllm_control_timeout <= 0:
         raise ValueError("--vllm-control-timeout must be positive.")
+    if args.temperature <= 0 or args.validation_temperature <= 0:
+        raise ValueError("Sampling temperatures must be positive.")
+    if not 0 < args.top_p <= 1 or not 0 < args.validation_top_p <= 1:
+        raise ValueError("Sampling top-p values must be in (0, 1].")
     if args.top_k < 0:
         raise ValueError("--top-k must be non-negative.")
+    if args.validation_top_k < 0:
+        raise ValueError("--validation-top-k must be non-negative.")
     if args.confidence_weight_decay < 0:
         raise ValueError("confidence_weight_decay must be non-negative.")
     if (
@@ -1967,27 +1976,53 @@ def main() -> None:
             "control_timeout": args.vllm_control_timeout,
         }
 
-    def build_rollout_engine(group_size: int):
+    def build_rollout_engine(
+        group_size: int,
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ):
         return rollout_engine_type(
             policy,
             policy_bundle.tokenizer,
             group_size=group_size,
             max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
             generation_micro_batch_size=args.generation_micro_batch_size,
             logprob_micro_batch_size=args.policy_micro_batch_size,
             logprob_max_tokens_per_micro_batch=(args.policy_max_tokens_per_micro_batch),
             **rollout_kwargs,
         )
 
-    support_rollouts = build_rollout_engine(args.support_group_size)
-    query_rollouts = build_rollout_engine(args.query_group_size)
-    validation_support_rollouts = build_rollout_engine(
-        args.validation_support_group_size
+    gradient_sampling = {
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+    }
+    validation_sampling = {
+        "temperature": args.validation_temperature,
+        "top_p": args.validation_top_p,
+        "top_k": args.validation_top_k,
+    }
+    support_rollouts = build_rollout_engine(
+        args.support_group_size,
+        **gradient_sampling,
     )
-    validation_query_rollouts = build_rollout_engine(args.validation_query_group_size)
+    query_rollouts = build_rollout_engine(
+        args.query_group_size,
+        **gradient_sampling,
+    )
+    validation_support_rollouts = build_rollout_engine(
+        args.validation_support_group_size,
+        **gradient_sampling,
+    )
+    validation_query_rollouts = build_rollout_engine(
+        args.validation_query_group_size,
+        **validation_sampling,
+    )
     verifier = DAPOMathVerifier(strict_box_verify=args.verifier_mode == "strict_box")
 
     all_problems = load_unique_dapo_problems(args.train_parquet)

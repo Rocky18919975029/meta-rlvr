@@ -26,6 +26,12 @@ while (($#)); do
     --inner-learning-rate) EVAL_INNER_LEARNING_RATE="$2"; shift 2 ;;
     --local-rollout-batch-size) EVAL_LOCAL_ROLLOUT_BATCH_SIZE="$2"; shift 2 ;;
     --local-adaptation-batch-size) EVAL_LOCAL_ADAPTATION_BATCH_SIZE="$2"; shift 2 ;;
+    --adaptation-temperature) EVAL_ADAPTATION_TEMPERATURE="$2"; shift 2 ;;
+    --adaptation-top-p) EVAL_ADAPTATION_TOP_P="$2"; shift 2 ;;
+    --adaptation-top-k) EVAL_ADAPTATION_TOP_K="$2"; shift 2 ;;
+    --query-temperature) EVAL_QUERY_TEMPERATURE="$2"; shift 2 ;;
+    --query-top-p) EVAL_QUERY_TOP_P="$2"; shift 2 ;;
+    --query-top-k) EVAL_QUERY_TOP_K="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -62,6 +68,12 @@ export EVAL_ADAPTED_QUERY_GROUP_SIZE="${EVAL_ADAPTED_QUERY_GROUP_SIZE:-32}"
 export EVAL_SEED="${EVAL_SEED:-42}"
 export EVAL_LOCAL_ROLLOUT_BATCH_SIZE="${EVAL_LOCAL_ROLLOUT_BATCH_SIZE:-8}"
 export EVAL_LOCAL_ADAPTATION_BATCH_SIZE="${EVAL_LOCAL_ADAPTATION_BATCH_SIZE:-2}"
+export EVAL_ADAPTATION_TEMPERATURE="${EVAL_ADAPTATION_TEMPERATURE:-1.0}"
+export EVAL_ADAPTATION_TOP_P="${EVAL_ADAPTATION_TOP_P:-1.0}"
+export EVAL_ADAPTATION_TOP_K="${EVAL_ADAPTATION_TOP_K:-0}"
+export EVAL_QUERY_TEMPERATURE="${EVAL_QUERY_TEMPERATURE:-1.0}"
+export EVAL_QUERY_TOP_P="${EVAL_QUERY_TOP_P:-0.7}"
+export EVAL_QUERY_TOP_K="${EVAL_QUERY_TOP_K:-0}"
 export EVAL_MAX_PROBLEMS="${EVAL_MAX_PROBLEMS:-}"
 export EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-}"
 export EVAL_INNER_ITERATIONS="${EVAL_INNER_ITERATIONS:-}"
@@ -110,7 +122,7 @@ job_id="${submission##* }"
 result_dir="${META_RLVR_PROJECT_DIR}/outputs/${LABEL}-${job_id}"
 
 echo "${submission}"
-echo "configuration: checkpoint=${CHECKPOINT} dataset=${DATASET} gpus=${EVAL_GPUS} support=${EVAL_SUPPORT_GROUP_SIZE} adaptation_rounds=${EVAL_ADAPTATION_ROUNDS} inner_iterations=${EVAL_INNER_ITERATIONS:-checkpoint-default} base_query=${EVAL_BASE_QUERY_GROUP_SIZE} adapted_query=${EVAL_ADAPTED_QUERY_GROUP_SIZE} seed=${EVAL_SEED}"
+echo "configuration: checkpoint=${CHECKPOINT} dataset=${DATASET} gpus=${EVAL_GPUS} support=${EVAL_SUPPORT_GROUP_SIZE} adaptation_rounds=${EVAL_ADAPTATION_ROUNDS} inner_iterations=${EVAL_INNER_ITERATIONS:-checkpoint-default} base_query=${EVAL_BASE_QUERY_GROUP_SIZE} adapted_query=${EVAL_ADAPTED_QUERY_GROUP_SIZE} seed=${EVAL_SEED} adaptation_sampling=${EVAL_ADAPTATION_TEMPERATURE}/${EVAL_ADAPTATION_TOP_P}/${EVAL_ADAPTATION_TOP_K} query_sampling=${EVAL_QUERY_TEMPERATURE}/${EVAL_QUERY_TOP_P}/${EVAL_QUERY_TOP_K}"
 echo "stdout: ${META_RLVR_PROJECT_DIR}/logs/${LABEL}-${job_id}.out"
 echo "stderr/progress: ${META_RLVR_PROJECT_DIR}/logs/${LABEL}-${job_id}.err"
 echo "vLLM: ${META_RLVR_PROJECT_DIR}/logs/vllm-${job_id}/gpu-*.log"

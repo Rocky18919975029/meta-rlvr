@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--local-rollout-batch-size", type=int, default=8)
     parser.add_argument("--local-adaptation-batch-size", type=int, default=2)
+    parser.add_argument("--adaptation-temperature", type=float, default=1.0)
+    parser.add_argument("--adaptation-top-p", type=float, default=1.0)
+    parser.add_argument("--adaptation-top-k", type=int, default=0)
+    parser.add_argument("--query-temperature", type=float, default=1.0)
+    parser.add_argument("--query-top-p", type=float, default=0.7)
+    parser.add_argument("--query-top-k", type=int, default=0)
     parser.add_argument("--request-timeout", type=float, default=1800.0)
     parser.add_argument("--control-timeout", type=float, default=120.0)
     return parser.parse_args()
@@ -89,6 +95,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("inner_learning_rate must be positive.")
     if args.max_new_tokens is not None and args.max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive.")
+    for name in ("adaptation_temperature", "query_temperature"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"{name} must be positive.")
+    for name in ("adaptation_top_p", "query_top_p"):
+        value = getattr(args, name)
+        if not 0 < value <= 1:
+            raise ValueError(f"{name} must be in (0, 1].")
+    for name in ("adaptation_top_k", "query_top_k"):
+        if getattr(args, name) < 0:
+            raise ValueError(f"{name} must be non-negative.")
 
 
 def _adaptation_mode(source_config: dict[str, object]) -> str:
@@ -423,15 +439,21 @@ def main() -> None:
         else args.max_new_tokens
     )
 
-    def rollout_engine(group_size: int) -> VLLMHybridRolloutEngine:
+    def rollout_engine(
+        group_size: int,
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> VLLMHybridRolloutEngine:
         return VLLMHybridRolloutEngine(
             policy,
             policy_bundle.tokenizer,
             group_size=group_size,
             max_new_tokens=max_new_tokens,
-            temperature=float(source_config["temperature"]),
-            top_p=float(source_config["top_p"]),
-            top_k=int(source_config["top_k"]),
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
             generation_micro_batch_size=int(
                 source_config["generation_micro_batch_size"]
             ),
@@ -449,9 +471,28 @@ def main() -> None:
             control_timeout=args.control_timeout,
         )
 
-    support_engine = rollout_engine(args.support_group_size)
-    base_query_engine = rollout_engine(args.base_query_group_size)
-    adapted_query_engine = rollout_engine(args.adapted_query_group_size)
+    adaptation_sampling = {
+        "temperature": args.adaptation_temperature,
+        "top_p": args.adaptation_top_p,
+        "top_k": args.adaptation_top_k,
+    }
+    query_sampling = {
+        "temperature": args.query_temperature,
+        "top_p": args.query_top_p,
+        "top_k": args.query_top_k,
+    }
+    support_engine = rollout_engine(
+        args.support_group_size,
+        **adaptation_sampling,
+    )
+    base_query_engine = rollout_engine(
+        args.base_query_group_size,
+        **query_sampling,
+    )
+    adapted_query_engine = rollout_engine(
+        args.adapted_query_group_size,
+        **query_sampling,
+    )
     verifier = DAPOMathVerifier(strict_box_verify=True)
 
     problems = load_semantically_unique_dapo_problems(dataset_path)
@@ -498,9 +539,15 @@ def main() -> None:
         "inner_iterations": inner_config.num_iterations,
         "inner_learning_rate": inner_config.optimizer.learning_rate,
         "max_new_tokens": max_new_tokens,
-        "temperature": float(source_config["temperature"]),
-        "top_p": float(source_config["top_p"]),
-        "top_k": int(source_config["top_k"]),
+        "adaptation_temperature": args.adaptation_temperature,
+        "adaptation_top_p": args.adaptation_top_p,
+        "adaptation_top_k": args.adaptation_top_k,
+        "query_temperature": args.query_temperature,
+        "query_top_p": args.query_top_p,
+        "query_top_k": args.query_top_k,
+        "source_training_temperature": float(source_config["temperature"]),
+        "source_training_top_p": float(source_config["top_p"]),
+        "source_training_top_k": int(source_config["top_k"]),
         "local_rollout_batch_size": args.local_rollout_batch_size,
         "local_adaptation_batch_size": args.local_adaptation_batch_size,
     }
