@@ -22,11 +22,11 @@ from .functional import (
 from .losses import (
     ConfidenceLossOutput,
     GRPOLossOutput,
+    bounded_token_credits,
     confidence_losses,
     group_advantages,
     grpo_policy_loss,
     token_grpo_policy_loss,
-    token_group_advantages,
 )
 from .optim import (
     FastOptimizerState,
@@ -59,8 +59,7 @@ class TokenTaskAdaptation:
     fast_parameters: ParameterDict
     optimizer_state: FastOptimizerState
     token_confidence_logits: Tensor
-    token_confidence_probabilities: Tensor
-    token_advantages: Tensor
+    token_credits: Tensor
     inner_losses: tuple[GRPOLossOutput, ...]
 
 
@@ -91,6 +90,7 @@ class BilevelGRPO:
         confidence_max_tokens_per_micro_batch: int | None = None,
         token_jvp_response_micro_batch_size: int = 4,
         token_jvp_logprob_position_chunk_size: int = 256,
+        token_credit_max: float = 1.0,
     ) -> None:
         if policy_micro_batch_size <= 0 or confidence_micro_batch_size <= 0:
             raise ValueError("Micro-batch sizes must be positive.")
@@ -100,6 +100,8 @@ class BilevelGRPO:
             raise ValueError("Token JVP response micro-batch size must be positive.")
         if token_jvp_logprob_position_chunk_size <= 0:
             raise ValueError("Token JVP position chunk size must be positive.")
+        if token_credit_max <= 0:
+            raise ValueError("Maximum token-credit magnitude must be positive.")
         self.policy = policy
         self.confidence_model = confidence_model
         self.inner_config = inner_config
@@ -117,6 +119,7 @@ class BilevelGRPO:
         self.token_jvp_logprob_position_chunk_size = (
             token_jvp_logprob_position_chunk_size
         )
+        self.token_credit_max = token_credit_max
 
     @staticmethod
     def _equalize_distributed_batch_count(
@@ -1202,15 +1205,12 @@ class BilevelGRPO:
         for support, logits in zip(supports, logits_batch, strict=True):
             if logits.shape != support.completion_mask.shape:
                 raise ValueError("Token confidence logits must match completion_mask.")
-            probabilities = torch.sigmoid(logits)
-            adaptation_rewards = (
-                probabilities if differentiable else probabilities.detach()
-            )
-            advantages = token_group_advantages(
-                adaptation_rewards,
+            credits = bounded_token_credits(
+                logits,
                 support.completion_mask,
-                self.inner_config.advantage,
+                maximum=self.token_credit_max,
             )
+            adaptation_credits = credits if differentiable else credits.detach()
             fast_parameters = clone_fast_parameters(initial_fast_parameters)
             optimizer_state = initial_fast_optimizer_state(
                 fast_parameters,
@@ -1221,14 +1221,14 @@ class BilevelGRPO:
                 if differentiable:
                     gradients, inner_output = self._token_gradient_operator(
                         support,
-                        advantages,
+                        adaptation_credits,
                         fast_parameters,
                     )
                 else:
                     gradients, inner_output = (
                         self._nondifferentiable_token_inner_gradients(
                             support,
-                            advantages,
+                            adaptation_credits,
                             fast_parameters,
                         )
                     )
@@ -1260,8 +1260,7 @@ class BilevelGRPO:
                     fast_parameters=fast_parameters,
                     optimizer_state=optimizer_state,
                     token_confidence_logits=logits,
-                    token_confidence_probabilities=probabilities,
-                    token_advantages=advantages,
+                    token_credits=credits,
                     inner_losses=tuple(inner_outputs),
                 )
             )

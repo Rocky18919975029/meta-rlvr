@@ -47,6 +47,9 @@ fi
 
 cd "${META_RLVR_PROJECT_DIR}"
 python src/meta_rlvr/vllm_preflight.py
+python src/meta_rlvr/fidelity_preflight.py \
+  --checkpoint "${META_RLVR_FIDELITY_CHECKPOINT}" \
+  --expected-world-size "${SMOKE_GPUS}"
 mkdir -p logs outputs
 
 submission=$(sbatch \

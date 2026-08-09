@@ -182,6 +182,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=256,
     )
+    parser.add_argument(
+        "--token-credit-max",
+        type=float,
+        default=1.0,
+        help="Maximum absolute token credit in A=max*tanh(logit).",
+    )
     parser.add_argument("--confidence-micro-batch-size", type=int, default=2)
     parser.add_argument("--policy-max-tokens-per-micro-batch", type=int)
     parser.add_argument("--confidence-max-tokens-per-micro-batch", type=int)
@@ -392,6 +398,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("token_jvp_response_micro_batch_size must be positive.")
     if args.token_jvp_logprob_position_chunk_size <= 0:
         raise ValueError("token_jvp_logprob_position_chunk_size must be positive.")
+    if args.token_credit_max <= 0:
+        raise ValueError("token_credit_max must be positive.")
     if (
         args.policy_max_tokens_per_micro_batch is not None
         and args.policy_max_tokens_per_micro_batch <= 0
@@ -627,6 +635,8 @@ def _serializable_run_config(args: argparse.Namespace, *, world_size: int) -> di
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
+    if float(serializable.get("token_meta_coefficient", 0.0)) <= 0:
+        serializable.pop("token_credit_max", None)
     serializable["distributed_world_size"] = world_size
     return serializable
 
@@ -1404,10 +1414,10 @@ def _accumulate_outer_batch(
                 if sequence_output is None
                 else sequence_output.adaptation.confidence_probabilities.detach().mean()
             )
-            token_probability = (
+            token_credit = (
                 zero
                 if token_output is None
-                else token_output.adaptation.token_confidence_probabilities.detach()[
+                else token_output.adaptation.token_credits.detach()[
                     support.completion_mask
                 ].mean()
             )
@@ -1418,10 +1428,10 @@ def _accumulate_outer_batch(
                 .square()
                 .mean()
             )
-            token_probability_square = (
+            token_credit_square = (
                 zero
                 if token_output is None
-                else token_output.adaptation.token_confidence_probabilities.detach()[
+                else token_output.adaptation.token_credits.detach()[
                     support.completion_mask
                 ]
                 .square()
@@ -1508,8 +1518,8 @@ def _accumulate_outer_batch(
                     ),
                     sequence_probability,
                     sequence_probability_square,
-                    token_probability,
-                    token_probability_square,
+                    token_credit,
+                    token_credit_square,
                     torch.any(support.correctness_labels == 1).float(),
                     (
                         zero
@@ -1953,6 +1963,7 @@ def main() -> None:
         token_jvp_logprob_position_chunk_size=(
             args.token_jvp_logprob_position_chunk_size
         ),
+        token_credit_max=args.token_credit_max,
     )
     rollout_kwargs: dict[str, object] = {}
     rollout_engine_type = TransformersRolloutEngine
@@ -2524,8 +2535,8 @@ def main() -> None:
                     "confidence_probability_std": torch.sqrt(
                         torch.clamp(metrics[20] - metrics[19].square(), min=0)
                     ).item(),
-                    "token_confidence_probability_mean": metrics[21].item(),
-                    "token_confidence_probability_std": torch.sqrt(
+                    "token_credit_mean": metrics[21].item(),
+                    "token_credit_std": torch.sqrt(
                         torch.clamp(metrics[22] - metrics[21].square(), min=0)
                     ).item(),
                     "support_pass_at_group": metrics[23].item(),

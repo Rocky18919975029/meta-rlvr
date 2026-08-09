@@ -49,6 +49,7 @@ def test_checkpoint_evaluation_summary_reports_query_and_total_budgets() -> None
         support_group_size=2,
         base_query_group_size=2,
         adapted_query_group_size=2,
+        adaptation_mode="sequence",
     )
 
     assert summary["num_unique_problems"] == 4
@@ -71,6 +72,28 @@ def test_checkpoint_evaluation_summary_reports_query_and_total_budgets() -> None
     }
 
 
+def test_token_summary_reports_signed_credits_without_probability_calibration() -> None:
+    totals = torch.tensor(
+        [6, 8, 4, 8, 5, 8, 2, 1, 2, 2, 3, 4, 2, 1, 1, -2, 8, -1, 4, -1, 4, 0, 0],
+        dtype=torch.float64,
+    )
+    summary = _summary_from_totals(
+        totals,
+        support_group_size=2,
+        base_query_group_size=2,
+        adapted_query_group_size=2,
+        adaptation_mode="token",
+    )
+
+    assert "confidence" not in summary
+    assert summary["token_credit"] == {
+        "mean": -0.25,
+        "correct_mean": -0.25,
+        "incorrect_mean": -0.25,
+        "responses": 8,
+    }
+
+
 def test_support_round_summaries_keep_rounds_separate() -> None:
     summaries = _support_round_summaries(
         torch.tensor(
@@ -79,7 +102,8 @@ def test_support_round_summaries_keep_rounds_separate() -> None:
                 [3, 4, 2, 2, 2.4, 2.0, 3, 0.4, 1],
             ],
             dtype=torch.float64,
-        )
+        ),
+        adaptation_mode="sequence",
     )
 
     assert summaries[0]["round"] == 1
@@ -92,29 +116,24 @@ def test_support_round_summaries_keep_rounds_separate() -> None:
 
 def test_checkpoint_adaptation_mode_requires_one_meta_branch() -> None:
     assert _adaptation_mode({"meta_coefficient": 1.0}) == "sequence"
-    assert _adaptation_mode(
-        {"meta_coefficient": 0.0, "token_meta_coefficient": 1.0}
-    ) == "token"
+    assert (
+        _adaptation_mode({"meta_coefficient": 0.0, "token_meta_coefficient": 1.0})
+        == "token"
+    )
     with pytest.raises(ValueError, match="exactly one"):
         _adaptation_mode({"meta_coefficient": 0.0})
     with pytest.raises(ValueError, match="exactly one"):
-        _adaptation_mode(
-            {"meta_coefficient": 1.0, "token_meta_coefficient": 1.0}
-        )
+        _adaptation_mode({"meta_coefficient": 1.0, "token_meta_coefficient": 1.0})
 
 
-def test_token_response_confidence_averages_only_completion_tokens() -> None:
+def test_token_response_credit_averages_only_completion_tokens() -> None:
     adaptation = SimpleNamespace(
-        token_confidence_probabilities=torch.tensor(
-            [[0.2, 0.4, 0.9], [0.1, 0.3, 0.5]]
-        )
+        token_credits=torch.tensor([[0.2, -0.4, 0.9], [-0.1, 0.3, 0.5]])
     )
     support = SimpleNamespace(
-        completion_mask=torch.tensor(
-            [[True, True, False], [True, True, True]]
-        )
+        completion_mask=torch.tensor([[True, True, False], [True, True, True]])
     )
 
     values = _response_confidences(adaptation, support, "token")
 
-    assert values == pytest.approx([0.3, 0.3])
+    assert values == pytest.approx([-0.1, 0.7 / 3])

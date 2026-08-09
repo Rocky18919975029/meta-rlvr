@@ -7,11 +7,11 @@ from meta_rlvr.config import (
     GRPOLossConfig,
 )
 from meta_rlvr.losses import (
+    bounded_token_credits,
     confidence_losses,
     grpo_policy_loss,
     group_advantages,
     token_grpo_policy_loss,
-    token_group_advantages,
 )
 
 
@@ -156,18 +156,18 @@ def test_positive_kl_requires_reference_logprobs() -> None:
         )
 
 
-def test_token_advantages_normalize_same_position_across_active_responses() -> None:
-    rewards = torch.tensor([[0.1, 0.2, 0.9], [0.5, 0.6, 0.0], [0.9, 0.0, 0.0]])
+def test_token_credits_do_not_mix_trajectories_or_positions() -> None:
+    logits = torch.tensor(
+        [[0.1, 0.2, 0.9], [0.5, 0.6, 0.0], [0.9, 0.0, 0.0]],
+        requires_grad=True,
+    )
     mask = torch.tensor([[True, True, True], [True, True, False], [True, False, False]])
-    advantages = token_group_advantages(rewards, mask, AdvantageConfig())
-    torch.testing.assert_close(
-        advantages[:, 0], group_advantages(rewards[:, 0], AdvantageConfig())
-    )
-    torch.testing.assert_close(
-        advantages[:2, 1], group_advantages(rewards[:2, 1], AdvantageConfig())
-    )
-    assert torch.all(advantages[2:, 1] == 0)
-    assert torch.all(advantages[:, 2] == 0)
+    credits = bounded_token_credits(logits, mask, maximum=1.0)
+
+    torch.testing.assert_close(credits, torch.tanh(logits) * mask)
+    derivative = torch.autograd.grad(credits[0, 0], logits)[0]
+    assert torch.count_nonzero(derivative) == 1
+    assert derivative[0, 0] > 0
 
 
 def test_token_grpo_matches_sequence_grpo_for_constant_row_advantages() -> None:

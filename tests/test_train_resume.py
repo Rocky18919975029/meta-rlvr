@@ -187,3 +187,29 @@ def test_resume_configuration_is_strict_except_operational_fields(tmp_path) -> N
     resumed.inner_iterations = 3
     with pytest.raises(ValueError, match="inner_iterations"):
         _initialize_or_validate_run(resumed, accelerator=accelerator)
+
+
+def test_token_credit_definition_is_strict_on_resume(tmp_path) -> None:
+    output = tmp_path / "token-run"
+    accelerator = SimpleNamespace(num_processes=4, is_main_process=True)
+    legacy = Namespace(
+        output_dir=output,
+        resume_from_checkpoint=None,
+        max_steps=1,
+        save_steps=1,
+        eval_steps=0,
+        token_meta_coefficient=1.0,
+    )
+    _initialize_or_validate_run(legacy, accelerator=accelerator)
+
+    changed = Namespace(
+        output_dir=output,
+        resume_from_checkpoint=output / "checkpoint-1",
+        max_steps=2,
+        save_steps=1,
+        eval_steps=0,
+        token_meta_coefficient=1.0,
+        token_credit_max=1.0,
+    )
+    with pytest.raises(ValueError, match="token_credit_max"):
+        _initialize_or_validate_run(changed, accelerator=accelerator)

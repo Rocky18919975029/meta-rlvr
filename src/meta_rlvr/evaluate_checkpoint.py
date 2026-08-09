@@ -124,9 +124,9 @@ def _response_confidences(
 ) -> list[float]:
     if mode == "sequence":
         return adaptation.confidence_probabilities.detach().cpu().tolist()
-    probabilities = adaptation.token_confidence_probabilities.detach()
-    mask = support.completion_mask.to(probabilities.dtype)
-    return ((probabilities * mask).sum(dim=1) / mask.sum(dim=1)).cpu().tolist()
+    credits = adaptation.token_credits.detach()
+    mask = support.completion_mask.to(credits.dtype)
+    return ((credits * mask).sum(dim=1) / mask.sum(dim=1)).cpu().tolist()
 
 
 def _chunks(items: list, size: int) -> list[list]:
@@ -172,6 +172,7 @@ def _write_group(
     max_new_tokens: int,
     eos_token_id: int,
     confidence_probabilities: list[float] | None = None,
+    adaptation_mode: str | None = None,
     adaptation_round: int | None = None,
 ) -> None:
     completion_lengths = group.completion_mask.sum(dim=1).tolist()
@@ -200,7 +201,14 @@ def _write_group(
             "response": response,
         }
         if confidence_probabilities is not None:
-            record["confidence_probability"] = confidence_probabilities[response_index]
+            if adaptation_mode not in ("sequence", "token"):
+                raise ValueError("Adaptation mode is required for support scores.")
+            score_name = (
+                "confidence_probability"
+                if adaptation_mode == "sequence"
+                else "mean_token_credit"
+            )
+            record[score_name] = confidence_probabilities[response_index]
         if adaptation_round is not None:
             record["adaptation_round"] = adaptation_round
         stream.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -228,11 +236,16 @@ def _optimizer_state_to(
     )
 
 
-def _support_round_summaries(totals: torch.Tensor) -> list[dict[str, object]]:
+def _support_round_summaries(
+    totals: torch.Tensor,
+    *,
+    adaptation_mode: str,
+) -> list[dict[str, object]]:
     summaries = []
     for round_index, values_tensor in enumerate(totals, start=1):
         values = values_tensor.tolist()
         problems = int(values[3])
+        score_prefix = "confidence" if adaptation_mode == "sequence" else "token_credit"
         summaries.append(
             {
                 "round": round_index,
@@ -242,11 +255,11 @@ def _support_round_summaries(totals: torch.Tensor) -> list[dict[str, object]]:
                 "pass_at_group": values[2] / problems,
                 "passed_problems": int(values[2]),
                 "num_unique_problems": problems,
-                "confidence_mean": values[4] / values[1],
-                "confidence_correct_mean": (
+                f"{score_prefix}_mean": values[4] / values[1],
+                f"{score_prefix}_correct_mean": (
                     None if values[6] == 0 else values[5] / values[6]
                 ),
-                "confidence_incorrect_mean": (
+                f"{score_prefix}_incorrect_mean": (
                     None if values[8] == 0 else values[7] / values[8]
                 ),
             }
@@ -260,6 +273,7 @@ def _summary_from_totals(
     support_group_size: int,
     base_query_group_size: int,
     adapted_query_group_size: int,
+    adaptation_mode: str,
 ) -> dict[str, object]:
     values = totals.tolist()
     problems = int(values[11])
@@ -281,7 +295,7 @@ def _summary_from_totals(
     meta_total_responses = int(values[1] + values[5])
     base_total_correct = int(values[0] + values[2])
     meta_total_correct = int(values[0] + values[4])
-    return {
+    result = {
         "num_unique_problems": problems,
         "support": support,
         "base_query": base_query,
@@ -318,6 +332,12 @@ def _summary_from_totals(
             "responses": int(values[16]),
         },
     }
+    if adaptation_mode == "token":
+        token_credit = result.pop("confidence")
+        token_credit.pop("brier")
+        token_credit.pop("bce")
+        result["token_credit"] = token_credit
+    return result
 
 
 def main() -> None:
@@ -340,6 +360,12 @@ def main() -> None:
             "with attn_implementation='sdpa'. Legacy eager token checkpoints used "
             "a rollout/policy-logprob mismatch and must not be compared as corrected "
             "runs."
+        )
+    if adaptation_mode == "token" and "token_credit_max" not in source_config:
+        raise ValueError(
+            "This checkpoint predates the independent tanh token-credit definition. "
+            "Evaluate it with the matching legacy code; do not silently reinterpret "
+            "its token head."
         )
     if adaptation_mode == "token" and args.adaptation_rounds != 1:
         raise ValueError("Token checkpoint evaluation currently requires one round.")
@@ -432,6 +458,7 @@ def main() -> None:
         token_jvp_logprob_position_chunk_size=int(
             source_config.get("token_jvp_logprob_position_chunk_size", 256)
         ),
+        token_credit_max=float(source_config["token_credit_max"]),
     )
     max_new_tokens = (
         int(source_config["max_new_tokens"])
@@ -538,6 +565,17 @@ def main() -> None:
         "seed_schedule": "checkpoint-independent",
         "inner_iterations": inner_config.num_iterations,
         "inner_learning_rate": inner_config.optimizer.learning_rate,
+        "token_credit_parameterization": (
+            "maximum * tanh(logit)" if adaptation_mode == "token" else None
+        ),
+        "token_credit_max": (
+            float(source_config["token_credit_max"])
+            if adaptation_mode == "token"
+            else None
+        ),
+        "token_credit_cross_trajectory_normalization": (
+            False if adaptation_mode == "token" else None
+        ),
         "max_new_tokens": max_new_tokens,
         "adaptation_temperature": args.adaptation_temperature,
         "adaptation_top_p": args.adaptation_top_p,
@@ -761,6 +799,7 @@ def main() -> None:
                     max_new_tokens=max_new_tokens,
                     eos_token_id=policy_bundle.tokenizer.eos_token_id,
                     confidence_probabilities=probabilities,
+                    adaptation_mode=adaptation_mode,
                     adaptation_round=round_number,
                 )
                 confidence_sum = sum(probabilities)
@@ -878,19 +917,23 @@ def main() -> None:
                 incorrect_confidence_sum = confidence_sum - correct_confidence_sum
                 correct_count = sum(support_correct)
                 incorrect_count = len(support_correct) - correct_count
-                brier_sum = sum(
-                    (probability - correct) ** 2
-                    for probability, correct in zip(
-                        probabilities, support_correct, strict=True
+                if adaptation_mode == "sequence":
+                    brier_sum = sum(
+                        (probability - correct) ** 2
+                        for probability, correct in zip(
+                            probabilities, support_correct, strict=True
+                        )
                     )
-                )
-                bce_sum = sum(
-                    -correct * math.log(max(probability, 1e-12))
-                    - (1 - correct) * math.log(max(1 - probability, 1e-12))
-                    for probability, correct in zip(
-                        probabilities, support_correct, strict=True
+                    bce_sum = sum(
+                        -correct * math.log(max(probability, 1e-12))
+                        - (1 - correct) * math.log(max(1 - probability, 1e-12))
+                        for probability, correct in zip(
+                            probabilities, support_correct, strict=True
+                        )
                     )
-                )
+                else:
+                    brier_sum = 0.0
+                    bce_sum = 0.0
                 totals += torch.tensor(
                     (
                         sum(support_correct),
@@ -939,9 +982,6 @@ def main() -> None:
                     "support_seed": support_seeds_by_round[0][index],
                     "support_seeds": [seeds[index] for seeds in support_seeds_by_round],
                     "query_seed": query_seeds[index],
-                    "confidence_probabilities": confidence_probabilities[index],
-                    "mean_confidence": sum(confidence_probabilities[index])
-                    / len(confidence_probabilities[index]),
                     "adaptation_round_metrics": inner_metrics[index],
                     "inner_optimizer_steps": inner_optimizer_steps[index],
                     "inner_iterations": [
@@ -950,6 +990,20 @@ def main() -> None:
                         for metric in round_metrics
                     ],
                 }
+                if adaptation_mode == "sequence":
+                    problem_record["confidence_probabilities"] = (
+                        confidence_probabilities[index]
+                    )
+                    problem_record["mean_confidence"] = sum(
+                        confidence_probabilities[index]
+                    ) / len(confidence_probabilities[index])
+                else:
+                    problem_record["response_mean_token_credits"] = (
+                        confidence_probabilities[index]
+                    )
+                    problem_record["mean_token_credit"] = sum(
+                        confidence_probabilities[index]
+                    ) / len(confidence_probabilities[index])
                 problem_stream.write(
                     json.dumps(problem_record, ensure_ascii=False) + "\n"
                 )
@@ -972,13 +1026,17 @@ def main() -> None:
             "total_inner_iterations": (
                 args.adaptation_rounds * inner_config.num_iterations
             ),
-            "support_rounds": _support_round_summaries(support_round_totals),
+            "support_rounds": _support_round_summaries(
+                support_round_totals,
+                adaptation_mode=adaptation_mode,
+            ),
             "seconds": time.perf_counter() - started,
             **_summary_from_totals(
                 totals,
                 support_group_size=(args.support_group_size * args.adaptation_rounds),
                 base_query_group_size=args.base_query_group_size,
                 adapted_query_group_size=args.adapted_query_group_size,
+                adaptation_mode=adaptation_mode,
             ),
         }
         (output_dir / "summary.json").write_text(

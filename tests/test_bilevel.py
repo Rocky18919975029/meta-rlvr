@@ -26,7 +26,7 @@ from meta_rlvr.functional import (
     token_logprobs,
     trainable_parameter_state,
 )
-from meta_rlvr.losses import token_grpo_policy_loss, token_group_advantages
+from meta_rlvr.losses import bounded_token_credits, token_grpo_policy_loss
 from meta_rlvr.optim import fast_optimizer_step, initial_fast_optimizer_state
 from meta_rlvr.train import (
     CachedRolloutMicrobatch,
@@ -307,10 +307,10 @@ def test_token_first_order_operator_has_standard_grpo_update_value() -> None:
         support.attention_mask,
         output="token",
     )
-    advantages = token_group_advantages(
-        torch.sigmoid(logits),
+    credits = bounded_token_credits(
+        logits,
         support.completion_mask,
-        inner.advantage,
+        maximum=1.0,
     )
     current = token_logprobs(
         policy,
@@ -321,7 +321,7 @@ def test_token_first_order_operator_has_standard_grpo_update_value() -> None:
         current,
         support.old_logprobs,
         support.completion_mask,
-        advantages,
+        credits,
         inner.grpo,
         reference_logprobs=support.reference_logprobs,
     )
@@ -341,6 +341,7 @@ def test_token_first_order_operator_has_standard_grpo_update_value() -> None:
             adaptation.fast_parameters[name].detach(),
             expected[name].detach(),
         )
+    torch.testing.assert_close(adaptation.token_credits, credits)
 
 
 def test_sequence_only_path_never_invokes_token_jvp(monkeypatch) -> None:

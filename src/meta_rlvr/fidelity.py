@@ -5,25 +5,7 @@ from collections.abc import Mapping
 import torch
 from torch import Tensor, nn
 
-
-def bounded_token_credits(
-    logits: Tensor,
-    completion_mask: Tensor,
-    *,
-    maximum: float,
-) -> Tensor:
-    """Map independent token logits to bounded signed policy-gradient credits."""
-    if logits.ndim != 2:
-        raise ValueError("Token-credit logits must have shape [K, T].")
-    if completion_mask.shape != logits.shape:
-        raise ValueError("completion_mask must match token-credit logits.")
-    if completion_mask.dtype != torch.bool:
-        raise TypeError("completion_mask must be torch.bool.")
-    if maximum <= 0:
-        raise ValueError("maximum token-credit magnitude must be positive.")
-    if not logits.is_floating_point() or not torch.isfinite(logits).all():
-        raise ValueError("Token-credit logits must be finite floating-point values.")
-    return maximum * torch.tanh(logits) * completion_mask
+from .losses import bounded_token_credits
 
 
 def gradient_comparison(

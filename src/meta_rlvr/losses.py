@@ -146,87 +146,24 @@ def group_advantages(rewards: Tensor, config: AdvantageConfig) -> Tensor:
     return advantages
 
 
-def token_group_advantages(
-    rewards: Tensor,
+def bounded_token_credits(
+    logits: Tensor,
     completion_mask: Tensor,
-    config: AdvantageConfig,
+    *,
+    maximum: float,
 ) -> Tensor:
-    """Normalize token rewards across active responses at each token position."""
-    if rewards.ndim != 2:
-        raise ValueError("Token rewards must have shape [K, T].")
-    if completion_mask.shape != rewards.shape:
-        raise ValueError("completion_mask must match token rewards.")
+    """Map every token logit independently to a bounded signed credit."""
+    if logits.ndim != 2:
+        raise ValueError("Token-credit logits must have shape [K, T].")
+    if completion_mask.shape != logits.shape:
+        raise ValueError("completion_mask must match token-credit logits.")
     if completion_mask.dtype != torch.bool:
         raise TypeError("completion_mask must be torch.bool.")
-    if rewards.shape[0] < 2:
-        raise ValueError("Token advantages require at least two responses.")
-    if not rewards.is_floating_point() or not torch.isfinite(rewards).all():
-        raise ValueError("Token rewards must be finite floating-point values.")
-
-    mask = completion_mask.to(rewards.dtype)
-    counts = mask.sum(dim=0)
-    valid = counts >= 2
-    safe_counts = counts.clamp_min(1)
-    stats_rewards = rewards if config.differentiate_group_stats else rewards.detach()
-    sums = (stats_rewards * mask).sum(dim=0)
-    if config.baseline == "group_mean":
-        centered = rewards - sums / safe_counts
-    elif config.baseline == "leave_one_out":
-        centered = rewards - (sums.unsqueeze(0) - stats_rewards) / (
-            counts - 1
-        ).clamp_min(1)
-    elif config.baseline == "none":
-        centered = rewards
-    else:
-        raise ValueError(f"Unsupported baseline: {config.baseline}")
-    centered = centered * mask
-
-    if config.scale in ("group_std", "floored_group_std"):
-        scale_source = (
-            centered if config.differentiate_group_stats else centered.detach()
-        )
-        variance = scale_source.square().sum(dim=0) / (counts - 1).clamp_min(1)
-        if config.scale == "group_std":
-            epsilon = torch.as_tensor(
-                config.std_epsilon,
-                dtype=variance.dtype,
-                device=variance.device,
-            )
-            scale = torch.sqrt(variance + epsilon.square())
-        else:
-            floor = torch.as_tensor(
-                config.std_floor,
-                dtype=variance.dtype,
-                device=variance.device,
-            )
-            scale = torch.sqrt(torch.maximum(variance, floor.square()))
-        advantages = centered / scale.clamp_min(torch.finfo(scale.dtype).tiny)
-    elif config.scale in ("center_only", "none"):
-        advantages = centered
-    else:
-        raise ValueError(f"Unsupported scale mode: {config.scale}")
-
-    if config.group_gate != "none":
-        active_rewards = rewards[completion_mask]
-        if torch.any((active_rewards < 0) | (active_rewards > 1)):
-            raise ValueError(f"{config.group_gate} gate requires rewards in [0, 1].")
-        if config.group_gate == "max_confidence":
-            gated = rewards.masked_fill(~completion_mask, float("-inf"))
-            gate = gated.max(dim=0).values
-            gate = torch.where(counts > 0, gate, torch.zeros_like(gate))
-        elif config.group_gate == "probability_any":
-            gate = 1.0 - torch.prod(
-                torch.where(completion_mask, 1.0 - rewards, torch.ones_like(rewards)),
-                dim=0,
-            )
-        else:
-            raise ValueError(f"Unsupported group gate: {config.group_gate}")
-        advantages = advantages * gate.unsqueeze(0)
-
-    advantages = advantages * completion_mask * valid.unsqueeze(0)
-    if not torch.isfinite(advantages).all():
-        raise ValueError("Token advantage computation produced non-finite values.")
-    return advantages
+    if maximum <= 0:
+        raise ValueError("maximum token-credit magnitude must be positive.")
+    if not logits.is_floating_point() or not torch.isfinite(logits).all():
+        raise ValueError("Token-credit logits must be finite floating-point values.")
+    return maximum * torch.tanh(logits) * completion_mask
 
 
 def token_grpo_policy_loss(

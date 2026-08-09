@@ -18,6 +18,7 @@ from .fidelity import (
     gradient_comparison,
     parameter_gradients,
 )
+from .fidelity_preflight import PROBE_SAMPLING, inspect_fidelity_checkpoint
 from .functional import chunked_token_logprobs, clone_fast_parameters
 from .losses import grpo_policy_loss, group_advantages
 from .models import load_confidence_model, load_policy_with_lora
@@ -205,6 +206,10 @@ def main() -> None:
     checkpoint = args.checkpoint.resolve()
     dataset_parquet = args.dataset_parquet.resolve()
     output_dir = args.output_dir.resolve()
+    checkpoint_metadata = inspect_fidelity_checkpoint(
+        checkpoint,
+        expected_world_size=args.problem_batch_size,
+    )
     source_run_dir = checkpoint.parent
     source_config = json.loads(
         (source_run_dir / "run_config.json").read_text(encoding="utf-8")
@@ -212,20 +217,6 @@ def main() -> None:
     trainer_state = json.loads(
         (checkpoint / "trainer_state.json").read_text(encoding="utf-8")
     )
-    if float(source_config.get("token_meta_coefficient", 0.0)) <= 0:
-        raise ValueError("Fidelity probe requires a token-confidence checkpoint.")
-    if source_config.get("attn_implementation") != "sdpa":
-        raise ValueError("Fidelity probe requires the corrected SDPA token policy.")
-    if (
-        float(source_config.get("temperature", 1.0)) != 1.0
-        or float(source_config.get("top_p", 1.0)) != 1.0
-        or int(source_config.get("top_k", 0)) != 0
-    ):
-        raise ValueError(
-            "Fidelity probe requires an on-policy checkpoint trained with "
-            "temperature=1, top_p=1, top_k=0."
-        )
-
     from accelerate import Accelerator
     from accelerate.utils import set_seed
 
@@ -328,6 +319,7 @@ def main() -> None:
         token_jvp_logprob_position_chunk_size=configured(
             "token_jvp_logprob_position_chunk_size", 256
         ),
+        token_credit_max=args.token_credit_max,
     )
     initial_fast = {
         name: value.to(accelerator.device)
@@ -391,6 +383,10 @@ def main() -> None:
                     "token_credit_max": args.token_credit_max,
                     "inner_optimizer": effective["inner_optimizer"],
                     "inner_learning_rate": effective["inner_learning_rate"],
+                    "source_checkpoint_sampling": checkpoint_metadata[
+                        "source_sampling"
+                    ],
+                    "probe_sampling": PROBE_SAMPLING,
                 },
                 sort_keys=True,
             ),
@@ -657,7 +653,8 @@ def main() -> None:
             "problem_batch_size": args.problem_batch_size,
             "support_group_size": args.group_size,
             "query_group_size": args.group_size,
-            "sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0},
+            "source_checkpoint_sampling": checkpoint_metadata["source_sampling"],
+            "sampling": PROBE_SAMPLING,
             "token_credit": {
                 "parameterization": "maximum * tanh(logit)",
                 "maximum": args.token_credit_max,
