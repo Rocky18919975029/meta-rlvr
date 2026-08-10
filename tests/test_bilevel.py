@@ -1156,7 +1156,8 @@ def test_problem_microbatch_accumulation_matches_full_batch_gradient() -> None:
         progress_description="test",
     )
 
-    torch.testing.assert_close(actual_metrics, expected_metrics)
+    torch.testing.assert_close(actual_metrics[:26], expected_metrics)
+    assert torch.count_nonzero(actual_metrics[26:]) == 0
     for parameter, expected_gradient in zip(
         parameters, expected_gradients, strict=True
     ):

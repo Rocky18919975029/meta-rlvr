@@ -46,8 +46,12 @@ The token-meta branch is independent of the existing sequence branch. Its
 linear head produces one signed, bounded credit for every generated token:
 
 ```text
-A_phi(x, trajectory, t) = token_credit_max * tanh(z_phi(x, trajectory, t)).
+A_phi(x, trajectory, t) = token_credit_max * (2/pi) * arctan(z_phi(x, trajectory, t)).
 ```
+
+Scaled arctan is the default. The original
+`token_credit_max * tanh(z_phi)` mapping remains available as the explicit
+`scaled_tanh` ablation through `--token-credit-parameterization`.
 
 Credits are not centered or standardized across trajectories or token
 positions. The inner loss retains per-response token normalization, so each

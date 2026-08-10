@@ -11,6 +11,7 @@ from meta_rlvr.losses import (
     confidence_losses,
     grpo_policy_loss,
     group_advantages,
+    token_credit_derivatives,
     token_grpo_policy_loss,
 )
 
@@ -162,12 +163,40 @@ def test_token_credits_do_not_mix_trajectories_or_positions() -> None:
         requires_grad=True,
     )
     mask = torch.tensor([[True, True, True], [True, True, False], [True, False, False]])
-    credits = bounded_token_credits(logits, mask, maximum=1.0)
+    credits = bounded_token_credits(
+        logits,
+        mask,
+        maximum=1.0,
+        parameterization="scaled_tanh",
+    )
 
     torch.testing.assert_close(credits, torch.tanh(logits) * mask)
     derivative = torch.autograd.grad(credits[0, 0], logits)[0]
     assert torch.count_nonzero(derivative) == 1
     assert derivative[0, 0] > 0
+
+
+def test_scaled_arctan_token_credit_and_derivative_match_definition() -> None:
+    logits = torch.tensor([[-2.0, 0.0, 2.0]])
+    mask = torch.tensor([[True, True, False]])
+
+    credits = bounded_token_credits(
+        logits,
+        mask,
+        maximum=1.0,
+        parameterization="scaled_arctan",
+    )
+    derivatives = token_credit_derivatives(
+        logits,
+        mask,
+        maximum=1.0,
+        parameterization="scaled_arctan",
+    )
+
+    expected_credits = (2.0 / torch.pi) * torch.atan(logits) * mask
+    expected_derivatives = (2.0 / torch.pi) / (1.0 + logits.square()) * mask
+    torch.testing.assert_close(credits, expected_credits)
+    torch.testing.assert_close(derivatives, expected_derivatives)
 
 
 def test_token_grpo_matches_sequence_grpo_for_constant_row_advantages() -> None:

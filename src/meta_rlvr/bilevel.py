@@ -21,6 +21,7 @@ from .functional import (
     token_logprobs,
 )
 from .losses import (
+    DEFAULT_TOKEN_CREDIT_PARAMETERIZATION,
     ConfidenceLossOutput,
     GRPOLossOutput,
     bounded_token_credits,
@@ -119,6 +120,7 @@ class BilevelGRPO:
         token_jvp_response_micro_batch_size: int = 1,
         token_jvp_logprob_position_chunk_size: int = 256,
         token_credit_max: float = 1.0,
+        token_credit_parameterization: str = DEFAULT_TOKEN_CREDIT_PARAMETERIZATION,
         token_meta_gradient_mode: TokenMetaGradientMode = "gradient_alignment",
     ) -> None:
         if policy_micro_batch_size <= 0 or confidence_micro_batch_size <= 0:
@@ -131,6 +133,8 @@ class BilevelGRPO:
             raise ValueError("Token JVP position chunk size must be positive.")
         if token_credit_max <= 0:
             raise ValueError("Maximum token-credit magnitude must be positive.")
+        if token_credit_parameterization not in ("scaled_arctan", "scaled_tanh"):
+            raise ValueError("Unsupported token-credit parameterization.")
         if token_meta_gradient_mode not in ("gradient_alignment", "unrolled"):
             raise ValueError("Unsupported token meta-gradient mode.")
         self.policy = policy
@@ -151,6 +155,7 @@ class BilevelGRPO:
             token_jvp_logprob_position_chunk_size
         )
         self.token_credit_max = token_credit_max
+        self.token_credit_parameterization = token_credit_parameterization
         self.token_meta_gradient_mode = token_meta_gradient_mode
 
     @staticmethod
@@ -1241,6 +1246,7 @@ class BilevelGRPO:
                 logits,
                 support.completion_mask,
                 maximum=self.token_credit_max,
+                parameterization=self.token_credit_parameterization,
             )
             adaptation_credits = credits if differentiable else credits.detach()
             fast_parameters = clone_fast_parameters(initial_fast_parameters)
@@ -1533,6 +1539,7 @@ class BilevelGRPO:
                 logits,
                 support.completion_mask,
                 maximum=self.token_credit_max,
+                parameterization=self.token_credit_parameterization,
             )
             meta_objective = effective_step_size * self._alignment_reduction(
                 credits * context.support_directional_logprobs,

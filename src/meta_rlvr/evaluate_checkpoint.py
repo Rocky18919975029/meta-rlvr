@@ -14,8 +14,9 @@ from tqdm.auto import tqdm
 from .bilevel import BilevelGRPO
 from .data import MathProblem, load_semantically_unique_dapo_problems
 from .losses import (
+    DEFAULT_TOKEN_CREDIT_PARAMETERIZATION,
     TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION,
-    TOKEN_CREDIT_PARAMETERIZATION,
+    TOKEN_CREDIT_PARAMETERIZATION_VERSIONS,
 )
 from .models import load_confidence_model, load_policy_with_lora
 from .optim import FastOptimizerState
@@ -371,9 +372,16 @@ def main() -> None:
             "Evaluate it with the matching legacy code; do not silently reinterpret "
             "its token head."
         )
+    token_parameterization = None
+    if adaptation_mode == "token":
+        version = source_config.get("token_credit_parameterization")
+        inverse_versions = {
+            saved_version: name
+            for name, saved_version in TOKEN_CREDIT_PARAMETERIZATION_VERSIONS.items()
+        }
+        token_parameterization = inverse_versions.get(version)
     if adaptation_mode == "token" and (
-        source_config.get("token_credit_parameterization")
-        != TOKEN_CREDIT_PARAMETERIZATION
+        token_parameterization is None
         or source_config.get("token_credit_cross_trajectory_normalization")
         is not TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION
     ):
@@ -469,7 +477,10 @@ def main() -> None:
         token_jvp_logprob_position_chunk_size=int(
             source_config.get("token_jvp_logprob_position_chunk_size", 256)
         ),
-        token_credit_max=float(source_config["token_credit_max"]),
+        token_credit_max=float(source_config.get("token_credit_max", 1.0)),
+        token_credit_parameterization=(
+            token_parameterization or DEFAULT_TOKEN_CREDIT_PARAMETERIZATION
+        ),
     )
     max_new_tokens = (
         int(source_config["max_new_tokens"])
@@ -577,7 +588,9 @@ def main() -> None:
         "inner_iterations": inner_config.num_iterations,
         "inner_learning_rate": inner_config.optimizer.learning_rate,
         "token_credit_parameterization": (
-            TOKEN_CREDIT_PARAMETERIZATION if adaptation_mode == "token" else None
+            source_config["token_credit_parameterization"]
+            if adaptation_mode == "token"
+            else None
         ),
         "token_credit_max": (
             float(source_config["token_credit_max"])

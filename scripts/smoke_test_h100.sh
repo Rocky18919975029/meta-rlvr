@@ -32,6 +32,11 @@ trap 'echo "[$(date --iso-8601=seconds)] smoke test interrupted" >&2; exit 130' 
 : "${META_RLVR_OUTPUT_DIR:?Set META_RLVR_OUTPUT_DIR to an output base directory}"
 
 SMOKE_GPUS="${SMOKE_GPUS:-4}"
+if [[ "${SMOKE_TOKEN_CREDIT_PARAMETERIZATION:-scaled_arctan}" != "scaled_arctan" && \
+      "${SMOKE_TOKEN_CREDIT_PARAMETERIZATION:-scaled_arctan}" != "scaled_tanh" ]]; then
+  echo "SMOKE_TOKEN_CREDIT_PARAMETERIZATION must be scaled_arctan or scaled_tanh." >&2
+  exit 2
+fi
 case "${SMOKE_GPUS}" in
   1) ACCELERATE_CONFIG="configs/accelerate_single_h100.yaml" ;;
   4) ACCELERATE_CONFIG="configs/accelerate_fsdp_4xh100.yaml" ;;
@@ -156,6 +161,7 @@ echo "first_order_vjp_forward_batch_size=${SMOKE_FIRST_ORDER_VJP_FORWARD_BATCH_S
 echo "token_jvp_response_micro_batch_size=${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-1}"
 echo "token_jvp_logprob_position_chunk_size=${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}"
 echo "token_credit_max=${SMOKE_TOKEN_CREDIT_MAX:-1.0}"
+echo "token_credit_parameterization=${SMOKE_TOKEN_CREDIT_PARAMETERIZATION:-scaled_arctan}"
 echo "token_meta_gradient_mode=${SMOKE_TOKEN_META_GRADIENT_MODE:-gradient_alignment}"
 echo "attn_implementation=${SMOKE_ATTN_IMPLEMENTATION:-sdpa}"
 echo "max_mean_absolute_logprob_delta=${SMOKE_MAX_MEAN_ABSOLUTE_LOGPROB_DELTA:-unset}"
@@ -414,6 +420,7 @@ setsid accelerate launch \
   --token-jvp-response-micro-batch-size "${SMOKE_TOKEN_JVP_RESPONSE_MICRO_BATCH_SIZE:-1}" \
   --token-jvp-logprob-position-chunk-size "${SMOKE_TOKEN_JVP_LOGPROB_POSITION_CHUNK_SIZE:-256}" \
   --token-credit-max "${SMOKE_TOKEN_CREDIT_MAX:-1.0}" \
+  --token-credit-parameterization "${SMOKE_TOKEN_CREDIT_PARAMETERIZATION:-scaled_arctan}" \
   --token-meta-gradient-mode "${SMOKE_TOKEN_META_GRADIENT_MODE:-gradient_alignment}" \
   --confidence-micro-batch-size "${SMOKE_CONFIDENCE_MICRO_BATCH_SIZE:-1}" \
   --max-new-tokens "${SMOKE_MAX_NEW_TOKENS:-128}" \

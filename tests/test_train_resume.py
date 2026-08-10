@@ -202,7 +202,7 @@ def test_token_credit_definition_is_strict_on_resume(tmp_path) -> None:
     )
     _initialize_or_validate_run(legacy, accelerator=accelerator)
     saved = json.loads((output / "run_config.json").read_text())
-    assert saved["token_credit_parameterization"] == "scaled_tanh_v1"
+    assert saved["token_credit_parameterization"] == "scaled_arctan_v1"
     assert saved["token_credit_cross_trajectory_normalization"] is False
 
     changed = Namespace(
@@ -216,3 +216,22 @@ def test_token_credit_definition_is_strict_on_resume(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="token_credit_max"):
         _initialize_or_validate_run(changed, accelerator=accelerator)
+
+
+def test_tanh_token_credit_ablation_is_saved_explicitly(tmp_path) -> None:
+    output = tmp_path / "token-tanh-run"
+    accelerator = SimpleNamespace(num_processes=4, is_main_process=True)
+    args = Namespace(
+        output_dir=output,
+        resume_from_checkpoint=None,
+        max_steps=1,
+        save_steps=1,
+        eval_steps=0,
+        token_meta_coefficient=1.0,
+        token_credit_parameterization="scaled_tanh",
+    )
+
+    _initialize_or_validate_run(args, accelerator=accelerator)
+
+    saved = json.loads((output / "run_config.json").read_text())
+    assert saved["token_credit_parameterization"] == "scaled_tanh_v1"

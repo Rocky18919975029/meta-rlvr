@@ -32,13 +32,46 @@ from .data import (
     rank_shard,
 )
 from .losses import (
+    DEFAULT_TOKEN_CREDIT_PARAMETERIZATION,
     TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION,
-    TOKEN_CREDIT_PARAMETERIZATION,
+    TOKEN_CREDIT_PARAMETERIZATION_VERSIONS,
+    maximum_token_credit_derivative,
+    token_credit_derivatives,
 )
 from .models import load_confidence_model, load_policy_with_lora
 from .rollout import TransformersRolloutEngine, VLLMHybridRolloutEngine
 from .types import RolloutGroup
 from .verifier import DAPOMathVerifier, VerificationBatch
+
+
+_OUTER_METRIC_COUNT = 27
+_TOKEN_DERIVATIVE_DIAGNOSTIC_COUNT = 3
+_TOKEN_DERIVATIVE_HISTOGRAM_BINS = 2048
+_TOKEN_DERIVATIVE_SUM_INDEX = _OUTER_METRIC_COUNT
+_TOKEN_DERIVATIVE_COUNT_INDEX = _OUTER_METRIC_COUNT + 1
+_TOKEN_SATURATION_COUNT_INDEX = _OUTER_METRIC_COUNT + 2
+_TOKEN_DERIVATIVE_HISTOGRAM_START = (
+    _OUTER_METRIC_COUNT + _TOKEN_DERIVATIVE_DIAGNOSTIC_COUNT
+)
+
+
+def _histogram_quantile(
+    histogram: torch.Tensor,
+    *,
+    quantile: float,
+    maximum: float,
+) -> float:
+    if not 0 <= quantile <= 1:
+        raise ValueError("quantile must be in [0, 1].")
+    count = histogram.sum()
+    if count.item() <= 0:
+        return 0.0
+    target = quantile * (count.item() - 1)
+    index = int(
+        torch.searchsorted(histogram.cumsum(0), target, right=True).item()
+    )
+    index = min(index, histogram.numel() - 1)
+    return maximum * (index + 0.5) / histogram.numel()
 
 
 @dataclass(frozen=True)
@@ -202,7 +235,16 @@ def parse_args() -> argparse.Namespace:
         "--token-credit-max",
         type=float,
         default=1.0,
-        help="Maximum absolute token credit in A=max*tanh(logit).",
+        help="Maximum absolute token credit.",
+    )
+    parser.add_argument(
+        "--token-credit-parameterization",
+        choices=["scaled_arctan", "scaled_tanh"],
+        default=DEFAULT_TOKEN_CREDIT_PARAMETERIZATION,
+        help=(
+            "Independent per-token credit map. scaled_arctan is the default; "
+            "scaled_tanh preserves the original ablation."
+        ),
     )
     parser.add_argument(
         "--token-meta-gradient-mode",
@@ -663,10 +705,17 @@ def _serializable_run_config(args: argparse.Namespace, *, world_size: int) -> di
     }
     if float(serializable.get("token_meta_coefficient", 0.0)) <= 0:
         serializable.pop("token_credit_max", None)
+        serializable.pop("token_credit_parameterization", None)
         serializable.pop("token_meta_gradient_mode", None)
     else:
         serializable.setdefault("token_meta_gradient_mode", "gradient_alignment")
-        serializable["token_credit_parameterization"] = TOKEN_CREDIT_PARAMETERIZATION
+        parameterization = serializable.get(
+            "token_credit_parameterization",
+            DEFAULT_TOKEN_CREDIT_PARAMETERIZATION,
+        )
+        serializable["token_credit_parameterization"] = (
+            TOKEN_CREDIT_PARAMETERIZATION_VERSIONS[parameterization]
+        )
         serializable["token_credit_cross_trajectory_normalization"] = (
             TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION
         )
@@ -1401,7 +1450,12 @@ def _accumulate_outer_batch(
             "confidence_model is required when gradient synchronization is deferred."
         )
 
-    local_metric_sums = torch.zeros(28, dtype=torch.float32, device=accelerator.device)
+    local_metric_sums = torch.zeros(
+        _TOKEN_DERIVATIVE_HISTOGRAM_START
+        + _TOKEN_DERIVATIVE_HISTOGRAM_BINS,
+        dtype=torch.float32,
+        device=accelerator.device,
+    )
     problem_progress = tqdm(
         total=local_problem_batch_size,
         desc=progress_description,
@@ -1508,6 +1562,8 @@ def _accumulate_outer_batch(
                 torch.stack(problem_losses).sum() / local_problem_batch_size
             )
             accelerator.backward(accumulated_loss)
+        diagnostic_derivatives = []
+        diagnostic_credits = []
         for index, support in enumerate(supports):
             sequence_output = (
                 None if sequence_outputs is None else sequence_outputs[index]
@@ -1552,17 +1608,19 @@ def _accumulate_outer_batch(
                 .abs()
                 .mean()
             )
-            token_credit_saturation = (
-                zero
-                if token_output is None
-                else (
-                    token_output.token_credits.detach()[support.completion_mask].abs()
-                    >= 0.95 * algorithm.token_credit_max
+            if token_output is not None:
+                diagnostic_credits.append(
+                    token_output.token_credits.detach()[support.completion_mask]
                 )
-                .float()
-                .mean()
-            )
-            local_metric_sums += torch.stack(
+                diagnostic_derivatives.append(
+                    token_credit_derivatives(
+                        token_output.token_confidence_logits,
+                        support.completion_mask,
+                        maximum=algorithm.token_credit_max,
+                        parameterization=algorithm.token_credit_parameterization,
+                    )[support.completion_mask]
+                )
+            local_metric_sums[:_OUTER_METRIC_COUNT] += torch.stack(
                 (
                     problem_losses[index].detach(),
                     (
@@ -1655,10 +1713,29 @@ def _accumulate_outer_batch(
                         else torch.any(token_query.correctness_labels == 1).float()
                     ),
                     token_credit_absolute,
-                    token_credit_saturation,
                 )
             )
             problem_progress.update(1)
+        if diagnostic_derivatives:
+            derivatives = torch.cat(diagnostic_derivatives).float()
+            credits = torch.cat(diagnostic_credits).float()
+            derivative_maximum = maximum_token_credit_derivative(
+                maximum=algorithm.token_credit_max,
+                parameterization=algorithm.token_credit_parameterization,
+            )
+            local_metric_sums[_TOKEN_DERIVATIVE_SUM_INDEX] += derivatives.sum()
+            local_metric_sums[_TOKEN_DERIVATIVE_COUNT_INDEX] += derivatives.numel()
+            local_metric_sums[_TOKEN_SATURATION_COUNT_INDEX] += (
+                credits.abs() > 0.95 * algorithm.token_credit_max
+            ).sum()
+            local_metric_sums[_TOKEN_DERIVATIVE_HISTOGRAM_START:] += torch.histc(
+                derivatives,
+                bins=_TOKEN_DERIVATIVE_HISTOGRAM_BINS,
+                min=0.0,
+                max=derivative_maximum,
+            )
+            del derivatives, credits
+        del diagnostic_derivatives, diagnostic_credits
         problem_offset += len(supports)
         del (
             accumulated_loss,
@@ -2100,6 +2177,7 @@ def main() -> None:
             args.token_jvp_logprob_position_chunk_size
         ),
         token_credit_max=args.token_credit_max,
+        token_credit_parameterization=args.token_credit_parameterization,
         token_meta_gradient_mode=args.token_meta_gradient_mode,
     )
     rollout_kwargs: dict[str, object] = {}
@@ -2649,12 +2727,37 @@ def main() -> None:
                 optimizer_moments_offloaded = True
             outer_iterations.set_postfix_str("stage=metrics")
 
-            metrics = accelerator.reduce(local_metric_sums, reduction="sum")
-            metrics = metrics / global_problem_batch_size
+            reduced_metric_sums = accelerator.reduce(
+                local_metric_sums, reduction="sum"
+            )
+            metrics = (
+                reduced_metric_sums[:_OUTER_METRIC_COUNT]
+                / global_problem_batch_size
+            )
             reduced_gradient_norm = accelerator.reduce(
                 gradient_norm.detach(), reduction="mean"
             )
             if accelerator.is_main_process:
+                derivative_count = reduced_metric_sums[
+                    _TOKEN_DERIVATIVE_COUNT_INDEX
+                ].item()
+                derivative_maximum = maximum_token_credit_derivative(
+                    maximum=algorithm.token_credit_max,
+                    parameterization=algorithm.token_credit_parameterization,
+                )
+                derivative_histogram = reduced_metric_sums[
+                    _TOKEN_DERIVATIVE_HISTOGRAM_START:
+                ]
+                derivative_quantiles = {
+                    f"token_credit_derivative_p{int(quantile * 100):02d}": (
+                        _histogram_quantile(
+                            derivative_histogram,
+                            quantile=quantile,
+                            maximum=derivative_maximum,
+                        )
+                    )
+                    for quantile in (0.10, 0.50, 0.90, 0.99)
+                }
                 train_record = {
                     "event": "train_outer",
                     "step": step,
@@ -2695,7 +2798,29 @@ def main() -> None:
                     "query_pass_at_group": metrics[24].item(),
                     "token_query_pass_at_group": metrics[25].item(),
                     "token_credit_abs_mean": metrics[26].item(),
-                    "token_credit_saturation_fraction": metrics[27].item(),
+                    "token_credit_parameterization": (
+                        algorithm.token_credit_parameterization
+                    ),
+                    "token_credit_derivative_mean": (
+                        0.0
+                        if derivative_count == 0
+                        else reduced_metric_sums[
+                            _TOKEN_DERIVATIVE_SUM_INDEX
+                        ].item()
+                        / derivative_count
+                    ),
+                    **derivative_quantiles,
+                    "token_credit_saturation_fraction": (
+                        0.0
+                        if derivative_count == 0
+                        else reduced_metric_sums[
+                            _TOKEN_SATURATION_COUNT_INDEX
+                        ].item()
+                        / derivative_count
+                    ),
+                    "token_credit_derivative_histogram_bins": (
+                        _TOKEN_DERIVATIVE_HISTOGRAM_BINS
+                    ),
                     "confidence_gradient_norm": reduced_gradient_norm.item(),
                     "confidence_learning_rate": confidence_optimizer.param_groups[0][
                         "lr"

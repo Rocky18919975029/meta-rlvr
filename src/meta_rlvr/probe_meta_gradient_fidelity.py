@@ -20,7 +20,11 @@ from .fidelity import (
 )
 from .fidelity_preflight import PROBE_SAMPLING, inspect_fidelity_checkpoint
 from .functional import chunked_token_logprobs, clone_fast_parameters
-from .losses import grpo_policy_loss, group_advantages
+from .losses import (
+    TOKEN_CREDIT_PARAMETERIZATION_VERSIONS,
+    grpo_policy_loss,
+    group_advantages,
+)
 from .models import load_confidence_model, load_policy_with_lora
 from .optim import fast_optimizer_step, initial_fast_optimizer_state
 from .rollout import VLLMHybridRolloutEngine
@@ -157,6 +161,7 @@ def _direct_token_adaptation(
         logits,
         support.completion_mask,
         maximum=token_credit_max,
+        parameterization=algorithm.token_credit_parameterization,
     )
     if not differentiable:
         credits = credits.detach()
@@ -238,6 +243,15 @@ def main() -> None:
     accelerator.wait_for_everyone()
     set_seed(args.seed, device_specific=True)
 
+    inverse_parameterizations = {
+        version: name
+        for name, version in TOKEN_CREDIT_PARAMETERIZATION_VERSIONS.items()
+    }
+    token_credit_parameterization = inverse_parameterizations.get(
+        source_config.get("token_credit_parameterization")
+    )
+    if token_credit_parameterization is None:
+        raise ValueError("Unsupported token-credit checkpoint parameterization.")
     effective = dict(source_config)
     effective.update(
         {
@@ -320,6 +334,7 @@ def main() -> None:
             "token_jvp_logprob_position_chunk_size", 256
         ),
         token_credit_max=args.token_credit_max,
+        token_credit_parameterization=token_credit_parameterization,
     )
     initial_fast = {
         name: value.to(accelerator.device)
@@ -656,7 +671,7 @@ def main() -> None:
             "source_checkpoint_sampling": checkpoint_metadata["source_sampling"],
             "sampling": PROBE_SAMPLING,
             "token_credit": {
-                "parameterization": "maximum * tanh(logit)",
+                "parameterization": token_credit_parameterization,
                 "maximum": args.token_credit_max,
                 "cross_trajectory_normalization": False,
                 "mean": credit_mean,

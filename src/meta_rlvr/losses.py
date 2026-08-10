@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -9,7 +10,14 @@ from torch import Tensor
 from .config import AdvantageConfig, ConfidenceLossConfig, GRPOLossConfig
 
 
-TOKEN_CREDIT_PARAMETERIZATION = "scaled_tanh_v1"
+TOKEN_CREDIT_PARAMETERIZATION_VERSIONS = {
+    "scaled_arctan": "scaled_arctan_v1",
+    "scaled_tanh": "scaled_tanh_v1",
+}
+DEFAULT_TOKEN_CREDIT_PARAMETERIZATION = "scaled_arctan"
+TOKEN_CREDIT_PARAMETERIZATION = TOKEN_CREDIT_PARAMETERIZATION_VERSIONS[
+    DEFAULT_TOKEN_CREDIT_PARAMETERIZATION
+]
 TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION = False
 
 
@@ -155,6 +163,7 @@ def bounded_token_credits(
     completion_mask: Tensor,
     *,
     maximum: float,
+    parameterization: str = DEFAULT_TOKEN_CREDIT_PARAMETERIZATION,
 ) -> Tensor:
     """Map every token logit independently to a bounded signed credit."""
     if logits.ndim != 2:
@@ -167,7 +176,56 @@ def bounded_token_credits(
         raise ValueError("maximum token-credit magnitude must be positive.")
     if not logits.is_floating_point() or not torch.isfinite(logits).all():
         raise ValueError("Token-credit logits must be finite floating-point values.")
-    return maximum * torch.tanh(logits) * completion_mask
+    if parameterization == "scaled_arctan":
+        normalized = (2.0 / math.pi) * torch.atan(logits)
+    elif parameterization == "scaled_tanh":
+        normalized = torch.tanh(logits)
+    else:
+        raise ValueError(
+            f"Unsupported token-credit parameterization: {parameterization}."
+        )
+    return maximum * normalized * completion_mask
+
+
+def token_credit_derivatives(
+    logits: Tensor,
+    completion_mask: Tensor,
+    *,
+    maximum: float,
+    parameterization: str = DEFAULT_TOKEN_CREDIT_PARAMETERIZATION,
+) -> Tensor:
+    """Return dA/dz for diagnostics without constructing an autograd graph."""
+    if logits.ndim != 2 or completion_mask.shape != logits.shape:
+        raise ValueError("Token-credit logits and mask must have shape [K, T].")
+    if completion_mask.dtype != torch.bool:
+        raise TypeError("completion_mask must be torch.bool.")
+    if maximum <= 0:
+        raise ValueError("maximum token-credit magnitude must be positive.")
+    if not logits.is_floating_point():
+        raise TypeError("Token-credit logits must be floating point.")
+    detached = logits.detach().float()
+    if parameterization == "scaled_arctan":
+        derivatives = maximum * (2.0 / math.pi) / (1.0 + detached.square())
+    elif parameterization == "scaled_tanh":
+        tanh_logits = torch.tanh(detached)
+        derivatives = maximum * (1.0 - tanh_logits.square())
+    else:
+        raise ValueError(
+            f"Unsupported token-credit parameterization: {parameterization}."
+        )
+    return derivatives * completion_mask
+
+
+def maximum_token_credit_derivative(
+    *,
+    maximum: float,
+    parameterization: str,
+) -> float:
+    if parameterization == "scaled_arctan":
+        return maximum * (2.0 / math.pi)
+    if parameterization == "scaled_tanh":
+        return maximum
+    raise ValueError(f"Unsupported token-credit parameterization: {parameterization}.")
 
 
 def token_grpo_policy_loss(
