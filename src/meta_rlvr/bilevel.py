@@ -1357,7 +1357,13 @@ class BilevelGRPO:
         parameter_tangents: tuple[Tensor, ...],
     ) -> tuple[Tensor, Tensor]:
         names = tuple(fast_parameters)
-        parameter_values = tuple(fast_parameters[name] for name in names)
+        # The alignment objective treats this policy-side JVP as a fixed
+        # coefficient and differentiates only through the confidence credits.
+        # Detaching the primals/tangents and disabling reverse-mode autograd
+        # preserves the exact forward-mode JVP without retaining a complete
+        # Qwen backward graph for every response.
+        parameter_values = tuple(fast_parameters[name].detach() for name in names)
+        parameter_tangents = tuple(tangent.detach() for tangent in parameter_tangents)
         if len(parameter_values) != len(parameter_tangents):
             raise ValueError("Token JVP tangent count does not match fast parameters.")
         primal = torch.zeros_like(support.old_logprobs)
@@ -1373,7 +1379,7 @@ class BilevelGRPO:
         if input_hook_enabled:
             self.policy.disable_input_require_grads()
         try:
-            with torch.enable_grad():
+            with torch.no_grad():
                 for row_indices in row_batches:
                     selector = torch.tensor(
                         row_indices,
@@ -1405,6 +1411,7 @@ class BilevelGRPO:
                         selector,
                         selected_directional.detach(),
                     )
+                    del selected_primal, selected_directional, selector
         finally:
             if input_hook_enabled:
                 self.policy.enable_input_require_grads()

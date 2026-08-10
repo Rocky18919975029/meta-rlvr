@@ -275,6 +275,70 @@ def test_token_meta_loss_backpropagates_through_exact_jvp() -> None:
     )
 
 
+def test_alignment_jvp_does_not_build_reverse_autograd_graph(monkeypatch) -> None:
+    torch.manual_seed(411)
+    policy = ToyPolicy()
+    confidence = SequenceConfidenceModel(
+        ToyConfidenceBackbone(),
+        hidden_size=5,
+        enable_sequence_head=False,
+        enable_token_head=True,
+    )
+    initial_fast = trainable_parameter_state(policy)
+    support = make_group(policy, torch.tensor([1.0, 0.0, 1.0]))
+    query = make_group(policy, torch.tensor([0.0, 1.0, 1.0]))
+    original_jvp = torch.func.jvp
+    observations = []
+
+    def checked_jvp(function, primals, tangents, **kwargs):
+        observations.append(
+            {
+                "grad_enabled": torch.is_grad_enabled(),
+                "primal_requires_grad": tuple(value.requires_grad for value in primals),
+                "tangent_requires_grad": tuple(
+                    value.requires_grad for value in tangents
+                ),
+            }
+        )
+        return original_jvp(function, primals, tangents, **kwargs)
+
+    monkeypatch.setattr(torch.func, "jvp", checked_jvp)
+    algorithm = BilevelGRPO(
+        policy=policy,
+        confidence_model=confidence,
+        inner_config=InnerLoopConfig(
+            num_iterations=1,
+            optimizer=FastOptimizerConfig(name="sgd", learning_rate=0.1),
+        ),
+        meta_config=MetaLossConfig(
+            meta_coefficient=0.0,
+            token_meta_coefficient=1.0,
+            confidence=ConfidenceLossConfig(
+                bce_coefficient=0.0,
+                ranking_coefficient=0.0,
+            ),
+        ),
+        query_advantage_config=AdvantageConfig(),
+        query_grpo_config=GRPOLossConfig(),
+        token_jvp_response_micro_batch_size=2,
+    )
+    output = algorithm.token_outer_losses_batch((support,), (query,), initial_fast)[0]
+    output.loss.backward()
+
+    assert observations
+    assert all(not observation["grad_enabled"] for observation in observations)
+    assert all(
+        not any(observation["primal_requires_grad"]) for observation in observations
+    )
+    assert all(
+        not any(observation["tangent_requires_grad"]) for observation in observations
+    )
+    assert any(
+        parameter.grad is not None and torch.any(parameter.grad != 0)
+        for parameter in confidence.parameters()
+    )
+
+
 def test_token_unrolled_mode_retains_task_adapter_path() -> None:
     torch.manual_seed(42)
     policy = ToyPolicy()
