@@ -54,6 +54,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--inner-iterations", type=int)
     parser.add_argument("--adaptation-rounds", type=int, default=1)
+    parser.add_argument(
+        "--on-policy-inner-curve",
+        action="store_true",
+        help=(
+            "Reuse support round 1 as step-0 evaluation, skip the redundant base "
+            "query, and evaluate once more after the final inner update."
+        ),
+    )
     parser.add_argument("--inner-learning-rate", type=float)
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--local-rollout-batch-size", type=int, default=8)
@@ -110,6 +118,14 @@ def _validate_args(args: argparse.Namespace) -> None:
     for name in ("adaptation_top_k", "query_top_k"):
         if getattr(args, name) < 0:
             raise ValueError(f"{name} must be non-negative.")
+    if args.on_policy_inner_curve and not (
+        args.support_group_size
+        == args.base_query_group_size
+        == args.adapted_query_group_size
+    ):
+        raise ValueError(
+            "On-policy inner curves require identical support/base/adapted group sizes."
+        )
 
 
 def _adaptation_mode(source_config: dict[str, object]) -> str:
@@ -578,6 +594,10 @@ def main() -> None:
         "model": str(args.model),
         "support_group_size": args.support_group_size,
         "adaptation_rounds": args.adaptation_rounds,
+        "on_policy_inner_curve": args.on_policy_inner_curve,
+        "base_query_source": (
+            "support_round_1" if args.on_policy_inner_curve else "independent_rollout"
+        ),
         "total_support_group_size": (args.support_group_size * args.adaptation_rounds),
         "base_query_group_size": args.base_query_group_size,
         "adapted_query_group_size": args.adapted_query_group_size,
@@ -645,6 +665,7 @@ def main() -> None:
     with rollout_path.open("w", encoding="utf-8") as rollout_stream:
         current_fast_parameters = [initial_fast] * len(local_problems)
         current_optimizer_states: list[FastOptimizerState] | None = None
+        initial_policy_correctness: list[list[float]] | None = None
         confidence_probabilities = [[] for _ in local_problems]
         support_correctness = [[] for _ in local_problems]
         support_seeds_by_round: list[list[int]] = []
@@ -704,6 +725,7 @@ def main() -> None:
             round_confidence_probabilities = []
             round_inner_metrics = []
             round_optimizer_steps = []
+            round_correctness = []
             index_batches = _chunks(
                 list(range(len(verified_supports))),
                 args.local_adaptation_batch_size,
@@ -809,6 +831,7 @@ def main() -> None:
             ):
                 probabilities = round_confidence_probabilities[index]
                 correctness = _correctness(group)
+                round_correctness.append(correctness)
                 confidence_probabilities[index].extend(probabilities)
                 support_correctness[index].extend(correctness)
                 inner_metrics[index].append(round_inner_metrics[index])
@@ -855,38 +878,44 @@ def main() -> None:
                 )
             current_fast_parameters = next_fast_parameters
             current_optimizer_states = next_optimizer_states
+            if round_index == 0:
+                initial_policy_correctness = round_correctness
             del verified_supports, support_verifications
 
         fast_parameters = current_fast_parameters
-
-        base_batches = base_query_engine.generate_batches(
-            problem_batches,
-            [[initial_fast] * len(batch) for batch in problem_batches],
-            show_progress=accelerator.is_main_process,
-            progress_description="checkpoint evaluation base query",
-            seed_batches=_chunks(query_seeds, args.local_rollout_batch_size),
-            compute_old_logprobs=False,
-        )
-        base_groups = [group for batch in base_batches for group in batch]
-        base_correctness = []
-        for problem, group, seed, valid in zip(
-            local_problems, base_groups, query_seeds, valid_flags, strict=True
-        ):
-            group, verification = _verify(group, problem, verifier)
-            if valid:
-                _write_group(
-                    rollout_stream,
-                    checkpoint_step=checkpoint_step,
-                    phase="base_query",
-                    problem=problem,
-                    group=group,
-                    verification=verification,
-                    seed=seed,
-                    max_new_tokens=max_new_tokens,
-                    eos_token_id=policy_bundle.tokenizer.eos_token_id,
-                )
-            base_correctness.append(_correctness(group))
-        del base_groups, base_batches
+        if args.on_policy_inner_curve:
+            if initial_policy_correctness is None:
+                raise RuntimeError("Missing first on-policy rollout correctness.")
+            base_correctness = initial_policy_correctness
+        else:
+            base_batches = base_query_engine.generate_batches(
+                problem_batches,
+                [[initial_fast] * len(batch) for batch in problem_batches],
+                show_progress=accelerator.is_main_process,
+                progress_description="checkpoint evaluation base query",
+                seed_batches=_chunks(query_seeds, args.local_rollout_batch_size),
+                compute_old_logprobs=False,
+            )
+            base_groups = [group for batch in base_batches for group in batch]
+            base_correctness = []
+            for problem, group, seed, valid in zip(
+                local_problems, base_groups, query_seeds, valid_flags, strict=True
+            ):
+                group, verification = _verify(group, problem, verifier)
+                if valid:
+                    _write_group(
+                        rollout_stream,
+                        checkpoint_step=checkpoint_step,
+                        phase="base_query",
+                        problem=problem,
+                        group=group,
+                        verification=verification,
+                        seed=seed,
+                        max_new_tokens=max_new_tokens,
+                        eos_token_id=policy_bundle.tokenizer.eos_token_id,
+                    )
+                base_correctness.append(_correctness(group))
+            del base_groups, base_batches
 
         adapted_batches = adapted_query_engine.generate_batches(
             problem_batches,
@@ -1041,6 +1070,39 @@ def main() -> None:
         reduction="sum",
     )
     if accelerator.is_main_process:
+        support_rounds = _support_round_summaries(
+            support_round_totals,
+            adaptation_mode=adaptation_mode,
+        )
+        result_metrics = _summary_from_totals(
+            totals,
+            support_group_size=(args.support_group_size * args.adaptation_rounds),
+            base_query_group_size=args.base_query_group_size,
+            adapted_query_group_size=args.adapted_query_group_size,
+            adaptation_mode=adaptation_mode,
+        )
+        if args.on_policy_inner_curve:
+            result_metrics["initial_policy_rollout"] = result_metrics["base_query"]
+            # These totals would double-count support round 1 in this mode.
+            result_metrics.pop("base_total")
+            result_metrics.pop("meta_total")
+            result_metrics["on_policy_inner_curve"] = [
+                {
+                    "inner_step": round_summary["round"] - 1,
+                    "group_size": args.support_group_size,
+                    "accuracy": round_summary["accuracy"],
+                    "pass_at_group": round_summary["pass_at_group"],
+                    "responses": round_summary["responses"],
+                    "correct": round_summary["correct"],
+                    "passed_problems": round_summary["passed_problems"],
+                }
+                for round_summary in support_rounds
+            ] + [
+                {
+                    "inner_step": args.adaptation_rounds,
+                    **result_metrics["adapted_query"],
+                }
+            ]
         summary = {
             "event": "checkpoint_evaluation_completed",
             "checkpoint": str(checkpoint),
@@ -1049,22 +1111,19 @@ def main() -> None:
             "dataset_parquet": str(dataset_path),
             "seed": args.seed,
             "adaptation_rounds": args.adaptation_rounds,
+            "on_policy_inner_curve_enabled": args.on_policy_inner_curve,
+            "base_query_source": (
+                "support_round_1"
+                if args.on_policy_inner_curve
+                else "independent_rollout"
+            ),
             "inner_iterations_per_round": inner_config.num_iterations,
             "total_inner_iterations": (
                 args.adaptation_rounds * inner_config.num_iterations
             ),
-            "support_rounds": _support_round_summaries(
-                support_round_totals,
-                adaptation_mode=adaptation_mode,
-            ),
+            "support_rounds": support_rounds,
             "seconds": time.perf_counter() - started,
-            **_summary_from_totals(
-                totals,
-                support_group_size=(args.support_group_size * args.adaptation_rounds),
-                base_query_group_size=args.base_query_group_size,
-                adapted_query_group_size=args.adapted_query_group_size,
-                adaptation_mode=adaptation_mode,
-            ),
+            **result_metrics,
         }
         (output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n",

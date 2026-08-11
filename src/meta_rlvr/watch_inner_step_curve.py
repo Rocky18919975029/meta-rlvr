@@ -48,6 +48,7 @@ def _summarize(
     records: list[dict],
     *,
     expected_problems: int | None = None,
+    on_policy_inner_curve: bool = False,
 ) -> list[dict]:
     groups: dict[tuple[str, int, int], dict[str, object]] = defaultdict(
         lambda: {
@@ -61,13 +62,21 @@ def _summarize(
         phase = record.get("phase")
         if phase == "support":
             round_number = int(record.get("adaptation_round", 1))
-            series = "on_policy_support"
+            series = (
+                "on_policy_rollout"
+                if on_policy_inner_curve
+                else "on_policy_support"
+            )
             inner_step = round_number - 1
         elif phase == "base_query":
+            if on_policy_inner_curve:
+                continue
             series = "paired_query"
             inner_step = 0
         elif phase == "adapted_query":
-            series = "paired_query"
+            series = (
+                "on_policy_rollout" if on_policy_inner_curve else "paired_query"
+            )
             inner_step = int(record.get("adaptation_round", 1))
         else:
             continue
@@ -130,6 +139,11 @@ def _write_outputs(output_dir: Path, records: list[dict]) -> None:
     import matplotlib.pyplot as plt
 
     styles = {
+        "on_policy_rollout": {
+            "label": "On-policy rollout",
+            "marker": "o",
+            "color": "#d62728",
+        },
         "on_policy_support": {
             "label": "On-policy support",
             "marker": "o",
@@ -198,11 +212,12 @@ def main() -> None:
         raise FileNotFoundError(run_dir)
     config_path = run_dir / "evaluation_config.json"
     expected_problems = None
+    on_policy_inner_curve = False
     if config_path.is_file():
-        expected_problems = int(
-            json.loads(config_path.read_text(encoding="utf-8"))[
-                "num_unique_problems"
-            ]
+        evaluation_config = json.loads(config_path.read_text(encoding="utf-8"))
+        expected_problems = int(evaluation_config["num_unique_problems"])
+        on_policy_inner_curve = bool(
+            evaluation_config.get("on_policy_inner_curve", False)
         )
 
     last_signature = None
@@ -210,6 +225,7 @@ def main() -> None:
         records = _summarize(
             _collect_records(run_dir),
             expected_problems=expected_problems,
+            on_policy_inner_curve=on_policy_inner_curve,
         )
         signature = json.dumps(records, sort_keys=True)
         if signature != last_signature:

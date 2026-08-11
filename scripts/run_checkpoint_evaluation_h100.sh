@@ -55,6 +55,9 @@ fi
 if [[ -n "${EVAL_INNER_LEARNING_RATE:-}" ]]; then
   EXTRA_ARGS+=(--inner-learning-rate "${EVAL_INNER_LEARNING_RATE}")
 fi
+if [[ "${EVAL_ON_POLICY_INNER_CURVE:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--on-policy-inner-curve)
+fi
 
 setsid accelerate launch \
   --config_file "${ACCELERATE_CONFIG}" \
