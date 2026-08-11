@@ -386,8 +386,6 @@ def main() -> None:
         is not TOKEN_CREDIT_CROSS_TRAJECTORY_NORMALIZATION
     ):
         raise ValueError("Token-credit checkpoint metadata does not match this code.")
-    if adaptation_mode == "token" and args.adaptation_rounds != 1:
-        raise ValueError("Token checkpoint evaluation currently requires one round.")
     trainer_state = json.loads(
         (checkpoint / "trainer_state.json").read_text(encoding="utf-8")
     )
@@ -739,10 +737,6 @@ def main() -> None:
                             differentiable=False,
                         )
                 else:
-                    if adaptation_mode != "sequence":
-                        raise RuntimeError(
-                            "Continued token adaptation is not enabled here."
-                        )
                     if current_optimizer_states is None:
                         raise RuntimeError("Missing continued inner optimizer state.")
                     device_fast = tuple(
@@ -759,12 +753,19 @@ def main() -> None:
                         )
                         for index in indices
                     )
-                    adaptations = algorithm.continue_adapt_tasks(
-                        device_batch,
-                        device_fast,
-                        device_optimizer_states,
-                        show_progress=False,
-                    )
+                    if adaptation_mode == "sequence":
+                        adaptations = algorithm.continue_adapt_tasks(
+                            device_batch,
+                            device_fast,
+                            device_optimizer_states,
+                            show_progress=False,
+                        )
+                    else:
+                        adaptations = algorithm.continue_adapt_token_tasks(
+                            device_batch,
+                            device_fast,
+                            device_optimizer_states,
+                        )
                     del device_fast, device_optimizer_states
                 for local_index, adaptation in enumerate(adaptations):
                     next_fast_parameters.append(

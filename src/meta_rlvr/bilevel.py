@@ -1238,71 +1238,136 @@ class BilevelGRPO:
             show_progress=False,
             progress_description="token confidence scoring",
         )
-        outputs = []
-        for support, logits in zip(supports, logits_batch, strict=True):
-            if logits.shape != support.completion_mask.shape:
-                raise ValueError("Token confidence logits must match completion_mask.")
-            credits = bounded_token_credits(
+        return tuple(
+            self._adapt_token_task_from_logits(
+                support,
                 logits,
-                support.completion_mask,
-                maximum=self.token_credit_max,
-                parameterization=self.token_credit_parameterization,
+                initial_fast_parameters,
+                differentiable=differentiable,
             )
-            adaptation_credits = credits if differentiable else credits.detach()
-            fast_parameters = clone_fast_parameters(initial_fast_parameters)
+            for support, logits in zip(supports, logits_batch, strict=True)
+        )
+
+    def continue_adapt_token_tasks(
+        self,
+        supports: tuple[RolloutGroup, ...],
+        initial_fast_parameter_groups: tuple[Mapping[str, Tensor], ...],
+        initial_optimizer_states: tuple[FastOptimizerState, ...],
+    ) -> tuple[TokenTaskAdaptation, ...]:
+        """Continue token adaptation after a fresh on-policy support rollout."""
+        if not supports:
+            raise ValueError("Token adaptation requires at least one support group.")
+        if not (
+            len(supports)
+            == len(initial_fast_parameter_groups)
+            == len(initial_optimizer_states)
+        ):
+            raise ValueError(
+                "Every support must have one fast-parameter and optimizer state."
+            )
+        logits_batch = self._token_confidence_logits_batch(
+            supports,
+            differentiable=False,
+            show_progress=False,
+            progress_description="token confidence scoring",
+        )
+        return tuple(
+            self._adapt_token_task_from_logits(
+                support,
+                logits,
+                fast_parameters,
+                initial_optimizer_state=optimizer_state,
+                differentiable=False,
+            )
+            for support, logits, fast_parameters, optimizer_state in zip(
+                supports,
+                logits_batch,
+                initial_fast_parameter_groups,
+                initial_optimizer_states,
+                strict=True,
+            )
+        )
+
+    def _adapt_token_task_from_logits(
+        self,
+        support: RolloutGroup,
+        logits: Tensor,
+        initial_fast_parameters: Mapping[str, Tensor],
+        *,
+        initial_optimizer_state: FastOptimizerState | None = None,
+        differentiable: bool,
+    ) -> TokenTaskAdaptation:
+        if logits.shape != support.completion_mask.shape:
+            raise ValueError("Token confidence logits must match completion_mask.")
+        credits = bounded_token_credits(
+            logits,
+            support.completion_mask,
+            maximum=self.token_credit_max,
+            parameterization=self.token_credit_parameterization,
+        )
+        adaptation_credits = credits if differentiable else credits.detach()
+        fast_parameters = clone_fast_parameters(initial_fast_parameters)
+        if initial_optimizer_state is None:
             optimizer_state = initial_fast_optimizer_state(
                 fast_parameters,
                 self.inner_config.optimizer,
             )
-            inner_outputs = []
-            for _ in range(self.inner_config.num_iterations):
-                if differentiable:
-                    gradients, inner_output = self._token_gradient_operator(
-                        support,
-                        adaptation_credits,
-                        fast_parameters,
-                    )
-                else:
-                    gradients, inner_output = (
-                        self._nondifferentiable_token_inner_gradients(
-                            support,
-                            adaptation_credits,
-                            fast_parameters,
-                        )
-                    )
-                fast_parameters, optimizer_state = fast_optimizer_step(
-                    fast_parameters,
-                    gradients,
-                    optimizer_state,
-                    self.inner_config.optimizer,
-                )
-                if not differentiable:
-                    fast_parameters = {
-                        name: value.detach().requires_grad_(True)
-                        for name, value in fast_parameters.items()
-                    }
-                    optimizer_state = FastOptimizerState(
-                        step=optimizer_state.step,
-                        first_moment={
-                            name: value.detach()
-                            for name, value in optimizer_state.first_moment.items()
-                        },
-                        second_moment={
-                            name: value.detach()
-                            for name, value in optimizer_state.second_moment.items()
-                        },
-                    )
-                inner_outputs.append(inner_output)
-            outputs.append(
-                TokenTaskAdaptation(
-                    fast_parameters=fast_parameters,
-                    optimizer_state=optimizer_state,
-                    token_confidence_logits=logits,
-                    token_credits=credits,
-                    inner_losses=tuple(inner_outputs),
-                )
+        else:
+            optimizer_state = FastOptimizerState(
+                step=initial_optimizer_state.step,
+                first_moment={
+                    name: value.detach().clone()
+                    for name, value in initial_optimizer_state.first_moment.items()
+                },
+                second_moment={
+                    name: value.detach().clone()
+                    for name, value in initial_optimizer_state.second_moment.items()
+                },
             )
-        return tuple(outputs)
+        inner_outputs = []
+        for _ in range(self.inner_config.num_iterations):
+            if differentiable:
+                gradients, inner_output = self._token_gradient_operator(
+                    support,
+                    adaptation_credits,
+                    fast_parameters,
+                )
+            else:
+                gradients, inner_output = self._nondifferentiable_token_inner_gradients(
+                    support,
+                    adaptation_credits,
+                    fast_parameters,
+                )
+            fast_parameters, optimizer_state = fast_optimizer_step(
+                fast_parameters,
+                gradients,
+                optimizer_state,
+                self.inner_config.optimizer,
+            )
+            if not differentiable:
+                fast_parameters = {
+                    name: value.detach().requires_grad_(True)
+                    for name, value in fast_parameters.items()
+                }
+                optimizer_state = FastOptimizerState(
+                    step=optimizer_state.step,
+                    first_moment={
+                        name: value.detach()
+                        for name, value in optimizer_state.first_moment.items()
+                    },
+                    second_moment={
+                        name: value.detach()
+                        for name, value in optimizer_state.second_moment.items()
+                    },
+                )
+            inner_outputs.append(inner_output)
+        return TokenTaskAdaptation(
+            fast_parameters=fast_parameters,
+            optimizer_state=optimizer_state,
+            token_confidence_logits=logits,
+            token_credits=credits,
+            inner_losses=tuple(inner_outputs),
+        )
 
     def _token_outer_loss_from_adaptation(
         self,
